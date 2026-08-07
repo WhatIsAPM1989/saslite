@@ -1,5 +1,10 @@
 # SASLite
 
+> **Downstream repository:** this repository was imported from the official
+> `saslite 0.4.1` source distribution on PyPI and is maintained independently.
+> It is not the public upstream repository of the PyPI maintainer. See
+> [DOWNSTREAM.md](DOWNSTREAM.md) for provenance and the downstream changes.
+
 SASLite is a lightweight local interpreter for a practical subset of the SAS
 language, implemented in Python on top of pandas. It is intended for local data
 checks, small automation workflows, SAS-like examples, and migration/testing
@@ -30,6 +35,10 @@ Critical bug fix for XPT column name handling.
 See [CHANGELOG.md](CHANGELOG.md) for complete release notes.
 
 ## Installation
+
+The PyPI command below installs the original `0.4.1` release. Until this
+downstream publishes a separately named package or release artifact, install a
+checkout of this repository to use the downstream fixes.
 
 ```bash
 pip install saslite
