@@ -188,20 +188,27 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
     except KeyError:
         return StepResult(success=False, error=f"Dataset {data_libref}.{data_name} not found")
 
-    # Apply dataset options (KEEP, DROP, WHERE, RENAME)
-    df = ds.data.copy()
+    # Apply dataset options (KEEP, DROP, WHERE, RENAME).  Keep a Dataset in
+    # parallel with the frame so PROC SORT does not re-infer and lose SAS
+    # attributes (especially for empty data sets and all-missing columns).
+    working_ds = ds.copy()
+    df = working_ds.data
 
     if "KEEP" in data_options:
         keep_vars = [v.upper() for v in data_options["KEEP"]]
         col_map = {c.upper(): c for c in df.columns}
         actual_keep = [col_map[v] for v in keep_vars if v in col_map]
-        df = df[actual_keep]
+        working_ds = working_ds.select_columns(actual_keep)
+        df = working_ds.data
 
     if "DROP" in data_options:
         drop_vars = [v.upper() for v in data_options["DROP"]]
         col_map = {c.upper(): c for c in df.columns}
         actual_drop = [col_map[v] for v in drop_vars if v in col_map]
-        df = df.drop(columns=actual_drop)
+        working_ds = working_ds.select_columns([
+            column for column in df.columns if column not in actual_drop
+        ])
+        df = working_ds.data
 
     if "RENAME" in data_options:
         rename_map = {}
@@ -210,7 +217,8 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
             old_upper = old_name.upper()
             if old_upper in col_map:
                 rename_map[col_map[old_upper]] = new_name.upper()
-        df = df.rename(columns=rename_map)
+        working_ds = working_ds.rename_columns(rename_map)
+        df = working_ds.data
 
     # Get BY variables
     by_vars = []
@@ -272,8 +280,12 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
         out_libref = data_libref
         out_member = data_name
 
-    out_ds = Dataset.from_dataframe(sorted_df, name=out_member, libref=out_libref)
-    out_ds.metadata.sort_keys = resolved_by
+    output_metadata = working_ds.metadata.copy()
+    output_metadata.libref = out_libref
+    output_metadata.member_name = out_member.upper()
+    output_metadata.row_count = len(sorted_df)
+    output_metadata.sort_keys = [str(name) for name in resolved_by]
+    out_ds = Dataset(name=out_member, data=sorted_df, metadata=output_metadata)
     session.put_dataset(out_libref, out_member, out_ds)
 
     return StepResult(

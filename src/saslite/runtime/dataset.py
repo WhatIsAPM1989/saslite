@@ -86,11 +86,12 @@ class Dataset:
 
     def rename_columns(self, mapping: dict[str, str]) -> Dataset:
         """Return new dataset with renamed columns."""
+        logical_mapping = {str(old).upper(): new for old, new in mapping.items()}
         new_meta = self.metadata.copy()
         new_vars: dict[str, VariableMetadata] = {}
         for logical_name, var in new_meta.variables.items():
-            if var.name in mapping:
-                new_name = mapping[var.name]
+            if logical_name in logical_mapping:
+                new_name = logical_mapping[logical_name]
                 var = VariableMetadata(
                     name=new_name,
                     logical_name=new_name.upper(),
@@ -103,9 +104,14 @@ class Dataset:
                 )
             new_vars[var.logical_name] = var
         new_meta.variables = new_vars
+        data_mapping = {
+            column: logical_mapping[str(column).upper()]
+            for column in self.data.columns
+            if str(column).upper() in logical_mapping
+        }
         return Dataset(
             name=self.name,
-            data=self.data.rename(columns=mapping),
+            data=self.data.rename(columns=data_mapping),
             metadata=new_meta,
         )
 
