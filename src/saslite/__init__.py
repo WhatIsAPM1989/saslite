@@ -1,6 +1,11 @@
 """SASLite - Lightweight local SAS language interpreter."""
 
-__version__ = "0.1.2"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("saslite")
+except PackageNotFoundError:
+    __version__ = "0.4.1"
 
 from saslite.api.facade import SasInterpreter
 
