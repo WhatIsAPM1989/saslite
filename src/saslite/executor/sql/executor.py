@@ -1014,8 +1014,15 @@ class SqlExecutor:
                     fn_name = col_node.expr.name.upper()
                     inner_col = None
                     is_star = False
+                    distinct_agg = False
+                    aggregate_arg = None
                     if col_node.expr.args:
                         arg0 = col_node.expr.args[0]
+                        distinct_agg = (isinstance(arg0, FunctionCallNode)
+                                        and arg0.name == "_DISTINCT_")
+                        if distinct_agg:
+                            arg0 = arg0.args[0]
+                        aggregate_arg = arg0
                         if isinstance(arg0, LiteralNode) and arg0.value == "*":
                             is_star = True
                         else:
@@ -1029,17 +1036,27 @@ class SqlExecutor:
                         if actual_col:
                             pandas_agg = self._sas_agg_to_pandas(fn_name)
                             if pandas_agg:
-                                agg_funcs[alias or actual_col] = (actual_col, pandas_agg)
+                                agg_func = pandas_agg
+                                if distinct_agg:
+                                    agg_func = lambda series, fn=pandas_agg: getattr(
+                                        series.drop_duplicates(), fn
+                                    )()
+                                agg_funcs[alias or actual_col] = (actual_col, agg_func)
                     elif col_node.expr.args:
                         # Complex case: min(strip(col)), max(datepart(dt)), etc.
                         # Need to evaluate the inner expression for each row, then aggregate
                         pandas_agg = self._sas_agg_to_pandas(fn_name)
                         if pandas_agg:
-                            complex_agg_funcs[alias] = (col_node.expr, pandas_agg)
+                            complex_agg_funcs[alias] = (
+                                aggregate_arg, pandas_agg, distinct_agg
+                            )
 
         if agg_funcs:
             agg_dict = {alias: pd.NamedAgg(column=col, aggfunc=fn) for alias, (col, fn) in agg_funcs.items()}
             result_df = grouped.agg(**agg_dict).reset_index()
+        elif complex_agg_funcs:
+            result_df = grouped.size().reset_index(name="__size__")
+            result_df = result_df.drop(columns=["__size__"])
         elif not star_count_aliases:
             result_df = grouped.size().reset_index(name="N")
         else:
@@ -1094,7 +1111,7 @@ class SqlExecutor:
 
         # Handle complex aggregate functions (e.g., min(strip(col)))
         if complex_agg_funcs:
-            for alias, (func_node, pandas_agg_name) in complex_agg_funcs.items():
+            for alias, (inner_expr, pandas_agg_name, distinct_agg) in complex_agg_funcs.items():
                 # For each group, evaluate the inner expression and then aggregate
                 agg_results = []
                 for group_key, group_df in grouped:
@@ -1111,8 +1128,6 @@ class SqlExecutor:
                             if fn:
                                 evaluator.register_function(fn_name, fn)
                         try:
-                            # Evaluate the inner expression (the first argument of the aggregate function)
-                            inner_expr = func_node.args[0] if func_node.args else None
                             if inner_expr:
                                 val = evaluator.evaluate(inner_expr)
                                 inner_values.append(val)
@@ -1126,6 +1141,8 @@ class SqlExecutor:
                         if valid_values:
                             # Use pandas Series aggregation method
                             series = pd.Series(valid_values)
+                            if distinct_agg:
+                                series = series.drop_duplicates()
                             agg_result = getattr(series, pandas_agg_name)()
                         else:
                             agg_result = None
