@@ -183,6 +183,30 @@ run;
             for warning in result.steps[-1].warnings
         ))
 
+    def test_array_name_is_not_treated_as_a_missing_input_variable(self) -> None:
+        _, result, _ = self._run(
+            """
+data source;
+  input first second;
+  datalines;
+10 20
+;
+run;
+data result;
+  set source;
+  array values[2] first second;
+  count=dim(values);
+  selected=values[1];
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertFalse(any(
+            "Variable VALUES referenced by DATA step" in warning
+            for warning in result.steps[-1].warnings
+        ))
+
     def test_bare_retain_variable_list_does_not_create_initializers(self) -> None:
         _, result, _ = self._run(
             """

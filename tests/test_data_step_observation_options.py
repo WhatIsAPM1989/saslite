@@ -166,6 +166,37 @@ run;
         self.assertEqual(frame["ID"].tolist(), [2, 3])
         self.assertEqual(frame["amount"].tolist(), [20, 30])
 
+    def test_missing_input_schema_references_warn_even_when_where_removes_all_rows(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data source;
+  input id value;
+  datalines;
+1 10
+2 20
+;
+run;
+data selected;
+  set source(
+    where=(missing_where=1)
+    keep=id missing_keep
+    drop=missing_drop
+  );
+  derived=missing_direct;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        warnings = "\n".join(result.steps[-1].warnings)
+        self.assertIn("MISSING_WHERE referenced by WHERE=", warnings)
+        self.assertIn("MISSING_KEEP referenced by KEEP=", warnings)
+        self.assertIn("MISSING_DROP referenced by DROP=", warnings)
+        self.assertIn("MISSING_DIRECT referenced by DATA step is uninitialized", warnings)
+        self.assertEqual(warnings.count("MISSING_DIRECT referenced by DATA step"), 1)
+        self.assertIn("WORK.SOURCE", warnings)
+
 
 if __name__ == "__main__":
     unittest.main()

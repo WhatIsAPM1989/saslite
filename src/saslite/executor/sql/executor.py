@@ -21,6 +21,7 @@ from saslite.runtime.execution_result import StepResult
 from saslite.executor.expression_eval import ExpressionEvaluator
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
+from saslite.diagnostics.schema import referenced_variables
 from saslite.functions import build_default_registry
 from saslite.runtime.types import is_missing
 
@@ -33,6 +34,7 @@ class SqlExecutor:
         self.reporter = reporter
         self._fn_registry = build_default_registry()
         self._outobs: int | None = None
+        self._schema_warnings: dict[str, str] = {}
 
     def _compute_window_functions(self, columns: list, df: pd.DataFrame,
                                   col_map: dict[str, str]):
@@ -222,11 +224,13 @@ class SqlExecutor:
     def run(self, step: ProcSqlNode) -> StepResult:
         """Execute all SQL statements in a PROC SQL block."""
         combined = StepResult(success=True)
+        self._schema_warnings = {}
         previous_outobs = self._outobs
         raw_outobs = step.options.get("OUTOBS") if step.options else None
         self._outobs = int(raw_outobs) if raw_outobs is not None else None
         try:
             for stmt in step.statements:
+                warning_keys_before = set(self._schema_warnings)
                 if isinstance(stmt, SelectNode):
                     result = self._execute_select(stmt)
                 elif isinstance(stmt, SetOperationNode):
@@ -241,6 +245,12 @@ class SqlExecutor:
                     result = self._execute_delete(stmt)
                 else:
                     continue
+
+                result.warnings.extend(
+                    message
+                    for key, message in self._schema_warnings.items()
+                    if key not in warning_keys_before
+                )
 
                 combined.output_messages.extend(result.output_messages)
                 combined.notes.extend(result.notes)
@@ -258,6 +268,45 @@ class SqlExecutor:
             return StepResult(success=False, error=str(e))
         finally:
             self._outobs = previous_outobs
+
+    @staticmethod
+    def _table_display_name(table: FromTableNode) -> str:
+        if table.select is not None:
+            return f"derived table {table.alias}" if table.alias else "derived table"
+        return f"{table.libref}.{table.name}".upper()
+
+    def _select_source_names(self, sel: SelectNode) -> list[str]:
+        names: list[str] = []
+        for item in sel.from_clause:
+            table = item if isinstance(item, FromTableNode) else getattr(item, "table", None)
+            if isinstance(table, FromTableNode):
+                names.append(self._table_display_name(table))
+        return list(dict.fromkeys(names))
+
+    def _validate_sql_references(
+        self,
+        expressions: list[Any],
+        context: str,
+        df: pd.DataFrame,
+        col_map: dict[str, str],
+        sources: list[str],
+        allowed_names: set[str] | None = None,
+    ) -> None:
+        allowed = {name.upper() for name in (allowed_names or set())}
+        for variable in sorted(set().union(*(
+            referenced_variables(expression) for expression in expressions
+        ))):
+            logical_name = variable.upper()
+            if logical_name in allowed or self._resolve_col(variable, col_map) is not None:
+                continue
+            source_text = ", ".join(sources) if sources else "the query input"
+            key = f"{context.upper()}:{source_text.upper()}:{logical_name}"
+            self._schema_warnings.setdefault(
+                key,
+                f"Variable {logical_name} referenced by {context} is absent from "
+                f"input dataset(s) {source_text}. SASLite used missing-value "
+                "semantics; check the local fixture schema.",
+            )
 
     def _execute_select(
         self,
@@ -296,6 +345,55 @@ class SqlExecutor:
 
         # Build column resolution map: upper_name -> actual_col_name
         col_map = self._build_col_map(df, has_joins)
+        source_names = self._select_source_names(sel)
+        select_expressions = [
+            column.expr for column in sel.columns
+            if isinstance(column, SelectColumnNode)
+        ]
+        self._validate_sql_references(
+            select_expressions, "SELECT", df, col_map, source_names
+        )
+        if sel.where_clause:
+            condition = (
+                sel.where_clause.condition
+                if hasattr(sel.where_clause, "condition")
+                else sel.where_clause
+            )
+            self._validate_sql_references(
+                [condition], "WHERE", df, col_map, source_names
+            )
+        for join_node in join_nodes:
+            if join_node.on_condition is not None:
+                self._validate_sql_references(
+                    [join_node.on_condition], "JOIN ON", df, col_map, source_names
+                )
+        select_aliases = {
+            column.alias
+            for column in sel.columns
+            if isinstance(column, SelectColumnNode) and column.alias
+        }
+        if sel.group_by:
+            self._validate_sql_references(
+                sel.group_by, "GROUP BY", df, col_map, source_names, select_aliases
+            )
+        if sel.having_clause:
+            condition = (
+                sel.having_clause.condition
+                if hasattr(sel.having_clause, "condition")
+                else sel.having_clause
+            )
+            self._validate_sql_references(
+                [condition], "HAVING", df, col_map, source_names, select_aliases
+            )
+        if sel.order_by:
+            self._validate_sql_references(
+                [item.expr for item in sel.order_by if isinstance(item, OrderItemNode)],
+                "ORDER BY",
+                df,
+                col_map,
+                source_names,
+                select_aliases,
+            )
 
         # ── Pre-compute EXISTS / scalar subqueries as DataFrame columns ──
         # Collect all subqueries from SELECT list and WHERE clause
@@ -1803,19 +1901,40 @@ class SqlExecutor:
             ds = self.session.get_dataset(ft.libref, ft.name)
             df = ds.data.copy()
 
-
+        source_name = self._table_display_name(ft)
         for opt in ft.ds_options:
             if isinstance(opt, dict):
                 if "KEEP" in opt:
                     keep_cols = [c.upper() for c in opt["KEEP"]]
+                    self._validate_sql_references(
+                        [VariableNode(name=name) for name in keep_cols],
+                        "KEEP=",
+                        df,
+                        self._build_col_map(df, False),
+                        [source_name],
+                    )
                     actual = [c for c in df.columns if c.upper() in keep_cols]
                     df = df[actual] if actual else df
                 elif "DROP" in opt:
                     drop_cols = [c.upper() for c in opt["DROP"]]
+                    self._validate_sql_references(
+                        [VariableNode(name=name) for name in drop_cols],
+                        "DROP=",
+                        df,
+                        self._build_col_map(df, False),
+                        [source_name],
+                    )
                     actual = [c for c in df.columns if c.upper() not in drop_cols]
                     df = df[actual] if actual else df
                 elif "WHERE" in opt:
                     cond = opt["WHERE"]
+                    self._validate_sql_references(
+                        [cond],
+                        "WHERE=",
+                        df,
+                        self._build_col_map(df, False),
+                        [source_name],
+                    )
                     mask = self._eval_where(cond, df)
                     df = df[mask].reset_index(drop=True)
 

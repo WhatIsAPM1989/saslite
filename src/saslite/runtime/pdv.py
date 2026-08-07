@@ -108,6 +108,15 @@ class PDV:
         # note is about variables with no such source at all; it is not a
         # path-sensitive warning every time a condition leaves a value missing.
         self._produced_variables: set[str] = set()
+        self._input_sources: list[str] = []
+
+    def set_input_sources(self, names: list[str]) -> None:
+        """Describe input data sets for actionable missing-schema warnings."""
+        self._input_sources = list(dict.fromkeys(name.upper() for name in names))
+
+    def has_compile_time_source(self, name: str) -> bool:
+        """Whether an input or executable statement can initialize a name."""
+        return name.upper() in self._produced_variables
 
     def add_variable(self, name: str, metadata: VariableMetadata) -> PDVVariable:
         """Add a variable to the PDV."""
@@ -163,19 +172,28 @@ class PDV:
         if var is None:
             if key in self._produced_variables:
                 return MISSING_NUMERIC
+            source_text = self._input_source_text()
             self.record_runtime_diagnostic(
                 f"uninitialized:{key}",
-                f"Variable {name} is uninitialized. SASLite used a numeric "
-                "missing value; initialize the variable before reading it.",
+                f"Variable {name} is uninitialized{source_text}. SASLite used "
+                "a numeric missing value; check the local fixture schema or "
+                "initialize the variable before reading it.",
             )
             return MISSING_NUMERIC
         if key not in self._produced_variables:
+            source_text = self._input_source_text()
             self.record_runtime_diagnostic(
                 f"uninitialized:{key}",
-                f"Variable {var.metadata.name} is uninitialized. SASLite used "
-                "its missing value; initialize the variable before reading it.",
+                f"Variable {var.metadata.name} is uninitialized{source_text}. "
+                "SASLite used its missing value; check the local fixture schema "
+                "or initialize the variable before reading it.",
             )
         return var.value
+
+    def _input_source_text(self) -> str:
+        if not self._input_sources:
+            return ""
+        return " and is absent from input dataset(s) " + ", ".join(self._input_sources)
 
     def set(self, name: str, value: Any) -> None:
         """Set variable value."""
@@ -265,6 +283,10 @@ class PDV:
                 f"{event['message']} First occurrence at {location}.{repeated}"
             )
         return warnings
+
+    def has_runtime_diagnostic(self, key: str) -> bool:
+        """Whether a diagnostic key was observed during iteration."""
+        return key in self._runtime_diagnostics
 
     def record_runtime_diagnostic(self, key: str, message: str) -> None:
         """Aggregate a warning-worthy SAS DATA-step log condition."""

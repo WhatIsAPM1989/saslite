@@ -15,6 +15,7 @@ from saslite.ast.data_step import (
     ArrayNode, InputNode, InfileNode,
     SubstrAssignNode, PutNode, UpdateDataNode, CallSymputNode,
     CallMissingNode, ArrayAssignNode, SumStatementNode, LengthNode, AttribNode,
+    PutItemNode,
 )
 from saslite.ast.expressions import ArrayRefNode, VariableNode
 from saslite.ast.proc import ByNode
@@ -26,6 +27,7 @@ from saslite.runtime.types import is_missing, sas_bool
 from saslite.executor.expression_eval import ExpressionEvaluator
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
+from saslite.diagnostics.schema import referenced_variables
 from saslite.functions import build_default_registry
 
 
@@ -68,9 +70,13 @@ class DataStepExecutor:
         self.session = session
         self.reporter = reporter
         self._fn_registry = build_default_registry()
+        self._schema_warnings: dict[str, str] = {}
+        self._pending_data_step_schema: dict[str, str] = {}
 
     def run(self, step: DataStepNode) -> StepResult:
         """Execute the DATA step."""
+        self._schema_warnings = {}
+        self._pending_data_step_schema = {}
         target_full = step.target.upper()
         if target_full == "_NULL_":
             target_full = ""
@@ -164,6 +170,8 @@ class DataStepExecutor:
 
             # Build PDV
             pdv = self._build_pdv(step, input_datasets)
+            pdv.set_input_sources(input_ds_names)
+            self._validate_data_step_references(step.statements, pdv, input_ds_names)
 
             # Detect BY variables for FIRST./LAST. tracking
             by_vars: list[str] = []
@@ -353,6 +361,99 @@ class DataStepExecutor:
                         pdv.mark_produced(name)
 
         return pdv
+
+    def _record_missing_schema_variable(
+        self,
+        variable: str,
+        context: str,
+        dataset_name: str,
+    ) -> None:
+        key = f"{context.upper()}:{dataset_name.upper()}:{variable.upper()}"
+        status = " is uninitialized and" if context == "DATA step" else " is"
+        self._schema_warnings.setdefault(
+            key,
+            f"Variable {variable.upper()} referenced by {context}{status} absent "
+            f"from input dataset(s) {dataset_name.upper()}. SASLite used "
+            "missing-value semantics; check the local fixture schema.",
+        )
+
+    def _validate_data_step_references(
+        self,
+        statements: list[Any],
+        pdv: PDV,
+        input_names: list[str],
+    ) -> None:
+        """Diagnose source reads before iteration, including zero-row inputs."""
+        if not input_names:
+            return
+        expressions: list[Any] = []
+        array_names: set[str] = set()
+
+        def collect(items: list[Any]) -> None:
+            for stmt in items:
+                if isinstance(stmt, AssignNode):
+                    expressions.append(stmt.expr)
+                elif isinstance(stmt, IfNode):
+                    expressions.append(stmt.condition)
+                    if stmt.then_stmt is not None:
+                        collect([stmt.then_stmt])
+                    if stmt.else_stmt is not None:
+                        collect([stmt.else_stmt])
+                elif isinstance(stmt, DoNode):
+                    expressions.extend([
+                        stmt.start, stmt.end, stmt.by,
+                        stmt.while_cond, stmt.until_cond,
+                    ])
+                    collect(stmt.body)
+                elif isinstance(stmt, WhereNode):
+                    expressions.append(stmt.condition)
+                elif isinstance(stmt, RetainNode):
+                    expressions.extend(value for _name, value in stmt.items if value is not None)
+                elif isinstance(stmt, SubstrAssignNode):
+                    expressions.extend([stmt.start, stmt.length, stmt.expr])
+                elif isinstance(stmt, ArrayAssignNode):
+                    expressions.extend([stmt.index, stmt.expr])
+                elif isinstance(stmt, SumStatementNode):
+                    expressions.append(stmt.expr)
+                elif isinstance(stmt, ArrayNode):
+                    array_names.add(stmt.name.upper())
+                    expressions.extend(stmt.initial_values)
+                elif isinstance(stmt, CallSymputNode):
+                    expressions.extend([stmt.macro_var, stmt.value])
+                elif isinstance(stmt, PutNode):
+                    for item in stmt.items:
+                        if isinstance(item, PutItemNode):
+                            expressions.append(item.expr)
+                        elif not isinstance(item, str):
+                            expressions.append(item)
+                elif isinstance(stmt, ByNode):
+                    expressions.extend(VariableNode(name=name) for name in stmt.variables)
+
+        collect(statements)
+        sources = ", ".join(input_names)
+        automatic_prefixes = ("FIRST.", "LAST.")
+        for variable in sorted(set().union(*(
+            referenced_variables(expression) for expression in expressions
+        ))):
+            logical_name = variable.upper()
+            if (
+                logical_name in {"_N_", "_ERROR_", "_NULL_"}
+                or logical_name in array_names
+                or logical_name.startswith(automatic_prefixes)
+                or pdv.has_compile_time_source(logical_name)
+            ):
+                continue
+            self._record_missing_schema_variable(
+                logical_name, "DATA step", sources
+            )
+            self._pending_data_step_schema[logical_name] = sources
+
+    def _finalize_data_step_schema_warnings(self, pdv: PDV) -> None:
+        """Keep static warnings only when no runtime read could report them."""
+        for variable, sources in self._pending_data_step_schema.items():
+            if pdv.has_runtime_diagnostic(f"uninitialized:{variable}"):
+                key = f"DATA STEP:{sources.upper()}:{variable}"
+                self._schema_warnings.pop(key, None)
 
     def _mark_produced_variables(self, statements: list[Any], pdv: PDV) -> None:
         """Record variables that an executable statement can initialize."""
@@ -758,6 +859,7 @@ class DataStepExecutor:
         warnings: list[str] | None = None,
     ) -> StepResult:
         """Materialize every DATA target using named and broadcast OUTPUT rows."""
+        self._finalize_data_step_schema_warnings(pdv)
         targets = [step.target, *step.extra_targets]
         declared = {
             key
@@ -809,7 +911,7 @@ class DataStepExecutor:
             dataset_name=primary_name or None,
             rows_affected=total_rows,
             notes=notes,
-            warnings=warnings or [],
+            warnings=[*(warnings or []), *self._schema_warnings.values()],
         )
 
     def _build_output_dataset(
@@ -965,6 +1067,12 @@ class DataStepExecutor:
             if not isinstance(opt, dict) or "WHERE" not in opt:
                 continue
             expression = opt["WHERE"]
+            available = {str(column).upper() for column in ds.data.columns}
+            for variable in sorted(referenced_variables(expression)):
+                if variable.upper() not in available:
+                    self._record_missing_schema_variable(
+                        variable, "WHERE=", ds.metadata.qualified_name
+                    )
             selected = self._evaluate_where_mask(ds.data, expression)
             ds.data = ds.data.loc[selected].reset_index(drop=True)
             ds.metadata.row_count = len(ds.data)
@@ -982,10 +1090,22 @@ class DataStepExecutor:
                 ds = ds.rename_columns(rename)
             if "KEEP" in opt:
                 keep_cols = [c.upper() for c in opt["KEEP"]]
+                available = {str(column).upper() for column in ds.data.columns}
+                for variable in keep_cols:
+                    if variable not in available:
+                        self._record_missing_schema_variable(
+                            variable, "KEEP=", ds.metadata.qualified_name
+                        )
                 actual = [c for c in ds.data.columns if c.upper() in keep_cols]
                 ds = ds.select_columns(actual)
             if "DROP" in opt:
                 drop_cols = [c.upper() for c in opt["DROP"]]
+                available = {str(column).upper() for column in ds.data.columns}
+                for variable in drop_cols:
+                    if variable not in available:
+                        self._record_missing_schema_variable(
+                            variable, "DROP=", ds.metadata.qualified_name
+                        )
                 actual = [c for c in ds.data.columns if c.upper() not in drop_cols]
                 ds = ds.select_columns(actual)
         return ds
@@ -1061,6 +1181,14 @@ class DataStepExecutor:
         # Build the PDV from input metadata and declarations so character
         # LENGTH checks also apply to values loaded by MERGE.
         pdv = self._build_pdv(step, datasets)
+        pdv.set_input_sources([
+            dataset.metadata.qualified_name for dataset in datasets
+        ])
+        self._validate_data_step_references(
+            step.statements,
+            pdv,
+            [dataset.metadata.qualified_name for dataset in datasets],
+        )
         for col in left_df.columns:
             pdv.ensure_variable(col)
 
