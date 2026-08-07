@@ -141,6 +141,47 @@ class NestedMacroDefinitionTests(unittest.TestCase):
         )
         self.assertIsNone(sas._macro.get_var("value"))
 
+    def test_global_declaration_inside_macro_persists_after_invocation(self) -> None:
+        sas, log = self._interpreter()
+        initialized = sas.execute(
+            """
+            %macro initialize;
+                %if not %symexist(partial_2arm) %then %do;
+                    %global partial_2arm;
+                    %let partial_2arm=N;
+                %end;
+            %mend initialize;
+            %initialize;
+            """
+        )
+        reported = sas.execute("%put VALUE=&partial_2arm;")
+
+        self.assertTrue(initialized.success, initialized.error)
+        self.assertTrue(reported.success, reported.error)
+        self.assertEqual(sas._macro.get_var("partial_2arm"), "N")
+        self.assertEqual(log.getvalue(), "VALUE=N\n")
+
+    def test_symexist_and_not_leave_existing_global_unchanged(self) -> None:
+        sas, log = self._interpreter()
+        result = sas.execute(
+            """
+            %global mode;
+            %let mode=existing;
+            %macro initialize;
+                %if not %symexist(mode) %then %do;
+                    %global mode;
+                    %let mode=replaced;
+                %end;
+            %mend initialize;
+            %initialize;
+            %put MODE=&mode;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas._macro.get_var("mode"), "existing")
+        self.assertEqual(log.getvalue(), "MODE=existing\n")
+
     def test_nested_if_do_else_blocks_choose_only_matching_branch(self) -> None:
         sas, log = self._interpreter()
         defined = sas.execute(

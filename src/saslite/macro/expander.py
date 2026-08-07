@@ -25,7 +25,9 @@ class MacroExpander:
     _QUOTED_AMPERSAND = "\ue000"
     _QUOTED_PERCENT = "\ue001"
     _MACRO_SCOPE_KEYWORDS = (
-        "IF", "THEN", "ELSE", "DO", "END", "TO", "BY", "WHILE", "UNTIL",
+        # Modern SAS accepts %IF and %DO control flow in open code.  Only the
+        # following statements inherently require a macro-local scope or
+        # return target.
         "GOTO", "RETURN", "LOCAL", "MEND",
     )
 
@@ -119,6 +121,7 @@ class MacroExpander:
 
         # Step 2: Process %MACRO/%MEND definitions
         source = self._process_macro_definitions(source)
+        source = self._process_global_declarations(source)
 
         # Macro control statements are valid only inside a macro definition.
         # Definitions have been removed from the open-code stream above, while
@@ -625,7 +628,12 @@ class MacroExpander:
                     if op.strip() == "LT":
                         return left < right
         # If no operator, check if non-empty / non-zero
-        val = condition.strip().strip("'\"")
+        condition = condition.strip()
+        not_match = re.match(r"^NOT\b(.*)$", condition, flags=re.IGNORECASE | re.DOTALL)
+        if not_match is not None:
+            inner = self._eval_macro_condition(not_match.group(1).strip())
+            return None if inner is None else not inner
+        val = condition.strip("'\"")
         return val not in ("", "0", ".", "FALSE")
 
     def _expand_macro_invocations(self, source: str) -> str:
@@ -756,6 +764,7 @@ class MacroExpander:
             body = self._process_macro_definitions(body)
             body = self._process_macro_functions(body)
             body = self._process_eval(body)
+            body = self._process_global_declarations(body)
             body = self._process_let_statements(body)
             body = self._substitute_vars(body)
             body = self._process_conditionals(body)
@@ -807,7 +816,20 @@ class MacroExpander:
             ):
                 value = value[1:-1]
             if self._macro_scopes:
-                self._macro_scopes[-1][var_name] = value
+                target_scope = next(
+                    (
+                        scope
+                        for scope in reversed(self._macro_scopes)
+                        if var_name in scope
+                    ),
+                    None,
+                )
+                if target_scope is not None:
+                    target_scope[var_name] = value
+                elif var_name in self._global_vars:
+                    self._global_vars[var_name] = value
+                else:
+                    self._macro_scopes[-1][var_name] = value
             else:
                 self._local_vars[var_name] = value
             self._log_symbolgen(var_name, value)
@@ -820,6 +842,20 @@ class MacroExpander:
             flags=re.IGNORECASE,
         )
         return source
+
+    def _process_global_declarations(self, source: str) -> str:
+        """Declare persistent macro variables and remove %GLOBAL statements."""
+        def declare(match: re.Match) -> str:
+            for name in re.findall(r"[A-Za-z_]\w*", match.group(1)):
+                self._global_vars.setdefault(name.upper(), "")
+            return ""
+
+        return re.sub(
+            r"%\s*GLOBAL\s+([^;]*);",
+            declare,
+            source,
+            flags=re.IGNORECASE,
+        )
 
     def _substitute_vars(self, source: str) -> str:
         """Substitute &var references with their values.
@@ -998,6 +1034,7 @@ class MacroExpander:
             source = self._process_macro_functions(source)
             source = self._process_do_loops(source)
             source = self._process_eval(source)
+            source = self._process_global_declarations(source)
             source = self._process_let_statements(source)
             source = self._process_macro_functions(source)
             source = self._substitute_vars(source)
@@ -1057,8 +1094,10 @@ class MacroExpander:
 
     # ── Macro character functions & %SYSFUNC ──────────
 
-    _MACRO_FUNC_NAMES = ("UPCASE", "LOWCASE", "SCAN", "SUBSTR", "LENGTH",
-                         "INDEX", "SUPERQ", "SYSFUNC")
+    _MACRO_FUNC_NAMES = (
+        "UPCASE", "LOWCASE", "SCAN", "SUBSTR", "LENGTH", "INDEX",
+        "SUPERQ", "SYMEXIST", "SYSFUNC",
+    )
 
     def _process_macro_functions(self, source: str) -> str:
         """Expand %UPCASE/%LOWCASE/%SCAN/%SUBSTR/%LENGTH/%INDEX/%SYSFUNC.
@@ -1133,6 +1172,9 @@ class MacroExpander:
             if value is None:
                 return ""
             return self._quote_macro_value(value)
+
+        if func == "SYMEXIST":
+            return "1" if self.get_var(raw_args.strip()) is not None else "0"
 
         raw_args = self._substitute_vars(raw_args)
         if "&" in raw_args:

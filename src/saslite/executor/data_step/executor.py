@@ -11,7 +11,8 @@ from saslite.ast.data_step import (
     DataStepNode, SetNode, AssignNode, IfNode, DoNode,
     OutputNode, DeleteNode, StopNode, RetainNode, WhereNode,
     KeepNode, DropNode, RenameNode, DatasetRefNode,
-    FormatNode, LabelNode, MergeNode, ArrayNode, InputNode, InfileNode,
+    FormatNode, FormatResetNode, InformatResetNode, LabelNode, MergeNode,
+    ArrayNode, InputNode, InfileNode,
     SubstrAssignNode, PutNode, UpdateDataNode, CallSymputNode,
     CallMissingNode, ArrayAssignNode, SumStatementNode, LengthNode, AttribNode,
 )
@@ -325,6 +326,12 @@ class DataStepExecutor:
                             variable.metadata.length = int(value)
                         except (TypeError, ValueError):
                             pass
+            elif isinstance(stmt, FormatResetNode):
+                for variable in pdv.variables.values():
+                    variable.metadata.format = None
+            elif isinstance(stmt, InformatResetNode):
+                for variable in pdv.variables.values():
+                    variable.metadata.informat = None
 
         # SAS decides whether a variable is uninitialized from the compiled
         # DATA step, not from the branch taken by an individual observation.
@@ -481,7 +488,10 @@ class DataStepExecutor:
                 # WHERE filters are applied during iteration
                 pass
 
-            elif isinstance(stmt, (FormatNode, LabelNode, LengthNode, AttribNode)):
+            elif isinstance(stmt, (
+                FormatNode, FormatResetNode, InformatResetNode,
+                LabelNode, LengthNode, AttribNode,
+            )):
                 pass  # Metadata-only or applied during build_pdv
 
     def _execute_single(self, stmt: Any, ctx: DataStepContext) -> None:
@@ -768,7 +778,7 @@ class DataStepExecutor:
         notes: list[str] = []
         total_rows = 0
         primary_name = ""
-        for target in targets:
+        for target_index, target in enumerate(targets):
             if target.upper() == "_NULL_":
                 continue
             libref, member = self._split_output_target(target)
@@ -784,6 +794,7 @@ class DataStepExecutor:
                 pdv,
                 input_datasets,
                 in_flag_names,
+                step.target_options if target_index == 0 else {},
             )
             self.session.put_dataset(libref, member, out_ds)
             primary_name = primary_name or full_name
@@ -810,6 +821,7 @@ class DataStepExecutor:
         pdv: PDV,
         input_datasets: list[Dataset],
         in_flag_names: set[str],
+        output_options: dict[str, Any],
     ) -> Dataset:
         if rows:
             df = pd.DataFrame(rows)
@@ -848,6 +860,14 @@ class DataStepExecutor:
         # KEEP/DROP select the compile-time (pre-RENAME) variable names in
         # SAS, regardless of the textual order of the statements.  RENAME is
         # an output operation and must therefore run after selection.
+        if "WHERE" in output_options:
+            selected = self._evaluate_where_mask(
+                out_ds.data,
+                output_options["WHERE"],
+            )
+            out_ds.data = out_ds.data.loc[selected].reset_index(drop=True)
+            out_ds.metadata.row_count = len(out_ds.data)
+
         for stmt in step.statements:
             if isinstance(stmt, KeepNode):
                 keep = {name.upper() for name in stmt.variables}
@@ -862,9 +882,24 @@ class DataStepExecutor:
                     if str(column).upper() not in drop
                 ])
 
+        if "KEEP" in output_options:
+            keep = {str(name).upper() for name in output_options["KEEP"]}
+            out_ds = out_ds.select_columns([
+                column for column in out_ds.data.columns
+                if str(column).upper() in keep
+            ])
+        if "DROP" in output_options:
+            drop = {str(name).upper() for name in output_options["DROP"]}
+            out_ds = out_ds.select_columns([
+                column for column in out_ds.data.columns
+                if str(column).upper() not in drop
+            ])
+
         for stmt in step.statements:
             if isinstance(stmt, RenameNode):
                 out_ds = out_ds.rename_columns(stmt.mapping)
+        if "RENAME" in output_options:
+            out_ds = out_ds.rename_columns(output_options["RENAME"])
 
         for stmt in step.statements:
             if isinstance(stmt, FormatNode):
@@ -875,6 +910,14 @@ class DataStepExecutor:
                 metadata_items = [(name, "LENGTH", value) for name, value in stmt.items]
             elif isinstance(stmt, AttribNode):
                 metadata_items = stmt.items
+            elif isinstance(stmt, FormatResetNode):
+                for variable in out_ds.metadata.variables.values():
+                    variable.format = None
+                continue
+            elif isinstance(stmt, InformatResetNode):
+                for variable in out_ds.metadata.variables.values():
+                    variable.informat = None
+                continue
             else:
                 continue
             for name, attribute, value in metadata_items:
@@ -894,8 +937,7 @@ class DataStepExecutor:
                         pass
         return out_ds
 
-    @staticmethod
-    def _apply_dataset_options(ds, options):
+    def _apply_dataset_options(self, ds, options):
         """Apply input data set options before DATA-step iteration."""
         if not options:
             return ds
@@ -917,6 +959,16 @@ class DataStepExecutor:
         ds.data = ds.data.iloc[firstobs - 1:stop].reset_index(drop=True)
         ds.metadata.row_count = len(ds.data)
 
+        # WHERE= is evaluated against the source row before KEEP/DROP/RENAME
+        # alter its available variables.
+        for opt in options:
+            if not isinstance(opt, dict) or "WHERE" not in opt:
+                continue
+            expression = opt["WHERE"]
+            selected = self._evaluate_where_mask(ds.data, expression)
+            ds.data = ds.data.loc[selected].reset_index(drop=True)
+            ds.metadata.row_count = len(ds.data)
+
         for opt in options:
             if not isinstance(opt, dict):
                 continue
@@ -937,6 +989,29 @@ class DataStepExecutor:
                 actual = [c for c in ds.data.columns if c.upper() not in drop_cols]
                 ds = ds.select_columns(actual)
         return ds
+
+    def _evaluate_where_mask(
+        self,
+        frame: pd.DataFrame,
+        expression: Any,
+    ) -> list[bool]:
+        """Evaluate a data-set WHERE= expression against each source row."""
+        selected: list[bool] = []
+        for row in frame.to_dict(orient="records"):
+            values = {str(name).upper(): value for name, value in row.items()}
+            evaluator = ExpressionEvaluator(
+                var_getter=lambda name, current=values: current.get(name.upper()),
+                session=self.session,
+            )
+            for function_name in self._fn_registry.names:
+                function = self._fn_registry.get(function_name)
+                if function is not None:
+                    evaluator.register_function(function_name, function)
+            try:
+                selected.append(sas_bool(evaluator.evaluate(expression)))
+            except Exception:
+                selected.append(False)
+        return selected
 
     @staticmethod
     def _dataset_in_flag(ref: DatasetRefNode) -> str:
