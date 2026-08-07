@@ -53,6 +53,9 @@ class Session:
             "MPRINT": False,
             "SYMBOLGEN": False,
             "MLOGIC": False,
+            # SAS character lengths are byte lengths. DATA-step overflow
+            # diagnostics use this codec and preserve the full Python value.
+            "ENCODING": "utf-8",
         }
         self._debug_output: list[str] = []
         # Automatic macro variables
