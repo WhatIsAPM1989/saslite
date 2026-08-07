@@ -9,6 +9,8 @@ library limitations (pyreadstat does not support sas7bdat write).
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import warnings
 from pathlib import Path
@@ -32,6 +34,7 @@ _MEMBER_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,31}$")
 # Table names: up to 8 characters
 _XPT_COLUMN_NAME_MAX_LENGTH = 32
 _XPT_TABLE_NAME_MAX_LENGTH = 8
+_XPT_NAME_MAP_SUFFIX = ".saslite-columns.json"
 
 
 def _member_name(name: str) -> str:
@@ -102,6 +105,103 @@ def _prepare_dataframe_for_xpt(df: pd.DataFrame, warn_truncation: bool = True) -
         )
 
     return result
+
+
+def _prepare_dataframe_with_name_map(
+    df: pd.DataFrame,
+    warn_truncation: bool = True,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """Prepare XPT names and retain aliases required by pyreadstat.
+
+    SAS permits a leading underscore in a variable name, while pyreadstat's
+    XPT writer rejects it. Such names receive collision-free physical aliases;
+    the physical-to-logical mapping is persisted next to the XPT file.
+    """
+    result = _prepare_dataframe_for_xpt(df, warn_truncation=warn_truncation)
+    used = {str(column).upper() for column in result.columns}
+    aliases: dict[str, str] = {}
+    columns: list[str] = []
+    next_alias = 1
+
+    for original, prepared in zip(df.columns, result.columns):
+        physical = str(prepared)
+        if not physical[:1].isalpha():
+            while True:
+                candidate = f"SASL{next_alias:04d}"
+                next_alias += 1
+                if candidate not in used:
+                    break
+            used.add(candidate)
+            physical = candidate
+            aliases[physical] = str(original)
+        columns.append(physical)
+
+    result.columns = columns
+    if aliases:
+        warnings.warn(
+            "pyreadstat cannot write XPT variable names beginning with an "
+            "underscore. SASLite stored physical aliases and an adjacent "
+            f"{_XPT_NAME_MAP_SUFFIX} mapping; external readers that ignore "
+            "the mapping will see the physical aliases.",
+            UserWarning,
+            stacklevel=3,
+        )
+    return result, aliases
+
+
+def _name_map_path(path: Path) -> Path:
+    return path.with_name(path.name + _XPT_NAME_MAP_SUFFIX)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_name_map(path: Path, aliases: dict[str, str]) -> None:
+    mapping_path = _name_map_path(path)
+    if not aliases:
+        if mapping_path.exists():
+            mapping_path.unlink()
+        return
+    payload = {
+        "version": 1,
+        "xpt_sha256": _file_sha256(path),
+        "physical_to_logical": aliases,
+    }
+    temporary = mapping_path.with_name(mapping_path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(mapping_path)
+
+
+def _read_name_map(path: Path, columns: list[object]) -> dict[str, str]:
+    mapping_path = _name_map_path(path)
+    if not mapping_path.exists():
+        return {}
+    try:
+        payload = json.loads(mapping_path.read_text(encoding="utf-8"))
+        if payload.get("version") != 1:
+            raise ValueError("unsupported mapping version")
+        if payload.get("xpt_sha256") != _file_sha256(path):
+            raise ValueError("XPT fingerprint does not match")
+        aliases = payload.get("physical_to_logical")
+        if not isinstance(aliases, dict):
+            raise ValueError("physical_to_logical must be an object")
+        available = {str(column) for column in columns}
+        if not set(aliases).issubset(available):
+            raise ValueError("mapped physical columns are absent from the XPT file")
+        restored = [aliases.get(str(column), str(column)) for column in columns]
+        if len(restored) != len(set(name.upper() for name in restored)):
+            raise ValueError("mapping would create duplicate logical columns")
+        return {str(key): str(value) for key, value in aliases.items()}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid SASLite XPT column mapping {mapping_path}: {exc}") from exc
 
 
 class _RelaxedSAS7BDATReader(SAS7BDATReader):
@@ -366,22 +466,47 @@ class SasBackend:
         # Try XPT path first
         xpt_path = self._xpt_path(member)
         if xpt_path.exists():
-            df, _ = pyreadstat.read_xport(str(xpt_path))
-            return Dataset.from_dataframe(df, name=member, libref=self._libref)
+            df, metadata = pyreadstat.read_xport(str(xpt_path))
+            return self._dataset_from_xpt(df, metadata, member, xpt_path)
 
         # Try sas7bdat path
         sas7bdat_path = self._sas7bdat_path(member)
         if sas7bdat_path.exists():
             # Try reading as XPT first (since we write XPT with .sas7bdat extension)
             try:
-                df, _ = pyreadstat.read_xport(str(sas7bdat_path))
-                return Dataset.from_dataframe(df, name=member, libref=self._libref)
+                df, metadata = pyreadstat.read_xport(str(sas7bdat_path))
+                return self._dataset_from_xpt(df, metadata, member, sas7bdat_path)
             except Exception:
                 # If XPT read fails, try as actual sas7bdat format
                 df = _read_sas7bdat(sas7bdat_path)
                 return Dataset.from_dataframe(df, name=member, libref=self._libref)
 
         return None
+
+    def _dataset_from_xpt(
+        self,
+        df: pd.DataFrame,
+        metadata: object,
+        member: str,
+        path: Path,
+    ) -> Dataset:
+        aliases = _read_name_map(path, list(df.columns))
+        if aliases:
+            df = df.rename(columns=aliases)
+        dataset = Dataset.from_dataframe(df, name=member, libref=self._libref)
+        labels = getattr(metadata, "column_names_to_labels", {}) or {}
+        formats = getattr(metadata, "original_variable_types", {}) or {}
+        for column in df.columns:
+            variable = dataset.metadata.get_variable(str(column))
+            if variable is None:
+                continue
+            physical = next(
+                (name for name, logical in aliases.items() if logical == str(column)),
+                str(column),
+            )
+            variable.label = labels.get(physical) or None
+            variable.format = formats.get(physical) or None
+        return dataset
 
     def write(self, name: str, dataset: Dataset) -> None:
         """Write dataset to disk in the configured format.
@@ -405,9 +530,29 @@ class SasBackend:
             path = self._base / f"{member}.sas7bdat"
 
         # Always use XPT format for writing (due to library limitations)
-        df = _prepare_dataframe_for_xpt(dataset.data, warn_truncation=self._warn_truncation)
+        df, aliases = _prepare_dataframe_with_name_map(
+            dataset.data,
+            warn_truncation=self._warn_truncation,
+        )
         table_name = member[:_XPT_TABLE_NAME_MAX_LENGTH]
-        pyreadstat.write_xport(df, str(path), table_name=table_name)
+        column_labels: dict[str, str] = {}
+        variable_formats: dict[str, str] = {}
+        for original, prepared in zip(dataset.data.columns, df.columns):
+            metadata = dataset.metadata.get_variable(str(original))
+            if metadata is None:
+                continue
+            if metadata.label:
+                column_labels[str(prepared)] = metadata.label
+            if metadata.format:
+                variable_formats[str(prepared)] = metadata.format
+        pyreadstat.write_xport(
+            df,
+            str(path),
+            table_name=table_name,
+            column_labels=column_labels or None,
+            variable_format=variable_formats or None,
+        )
+        _write_name_map(path, aliases)
 
     def exists(self, name: str) -> bool:
         member = _member_name(name)
@@ -420,6 +565,9 @@ class SasBackend:
             if path.exists():
                 path.unlink()
                 deleted = True
+            mapping_path = _name_map_path(path)
+            if mapping_path.exists():
+                mapping_path.unlink()
         return deleted
 
     def list_datasets(self) -> list[str]:

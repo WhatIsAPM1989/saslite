@@ -23,6 +23,10 @@ class StorageRouter:
     def get_backend(self, libref: str) -> StorageBackend | None:
         return self._backends.get(libref.upper())
 
+    def list_libraries(self) -> list[str]:
+        """List registered library references in deterministic order."""
+        return sorted(self._backends)
+
     def resolve(self, libref: str, name: str) -> tuple[StorageBackend, str]:
         """Resolve a libref.name reference to (backend, name)."""
         libref_upper = libref.upper()

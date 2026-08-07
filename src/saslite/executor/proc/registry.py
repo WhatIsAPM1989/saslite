@@ -8,9 +8,13 @@ from typing import Any
 import pandas as pd
 
 from saslite.ast.proc import ProcNode, VarListNode, ByNode, ClassNode, FreqTableSpec
+from saslite.ast.data_step import DatasetRefNode
+from saslite.executor.expression_eval import ExpressionEvaluator
+from saslite.functions import build_default_registry
 from saslite.runtime.dataset import Dataset
 from saslite.runtime.execution_result import StepResult
 from saslite.runtime.formatting import csv_dataframe
+from saslite.runtime.types import sas_bool
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
 
@@ -326,7 +330,10 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
     out_name = proc.options.get("OUT", "")
     noprint = proc.options.get("NOPRINT", False)
     maxdec = proc.options.get("MAXDEC", None)
-    stat_names = [k for k in proc.options if k in ("N", "MEAN", "SUM", "MIN", "MAX", "STD", "MEDIAN")]
+    stat_names = [
+        key for key in proc.options
+        if key in ("N", "MEAN", "SUM", "MIN", "MAX", "STD", "MEDIAN", "Q1", "Q3")
+    ]
 
     if not data_name:
         return StepResult(success=False, error="PROC MEANS requires DATA=")
@@ -368,8 +375,11 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
         return StepResult(success=False, error="No valid numeric variables found")
 
     # Which stats to compute
+    q1 = lambda series: series.quantile(0.25)
+    q3 = lambda series: series.quantile(0.75)
     agg_map = {"N": "count", "MEAN": "mean", "SUM": "sum", "MIN": "min",
-               "MAX": "max", "STD": "std", "MEDIAN": "median"}
+               "MAX": "max", "STD": "std", "MEDIAN": "median",
+               "Q1": q1, "P25": q1, "Q3": q3, "P75": q3}
     if stat_names:
         aggs = {c: [agg_map[s] for s in stat_names if s in agg_map] for c in valid_cols}
     else:
@@ -423,6 +433,8 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
                         col_stats[sn] = ds.data[vc].std()
                     elif fn == "median":
                         col_stats[sn] = ds.data[vc].median()
+                    elif callable(fn):
+                        col_stats[sn] = fn(ds.data[vc])
                 parts.append(pd.Series(col_stats, name=vc))
             stats_df = pd.DataFrame(parts)
         else:
@@ -452,7 +464,7 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
                     fn = agg_map.get(stat_name)
                     if fn:
                         for vc in valid_cols:
-                            row[new_name] = getattr(block[vc], fn)()
+                            row[new_name] = fn(block[vc]) if callable(fn) else getattr(block[vc], fn)()
                 rows.append(row)
         else:
             row = {}
@@ -460,7 +472,7 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
                 fn = agg_map.get(stat_name)
                 if fn:
                     for vc in valid_cols:
-                        row[new_name] = getattr(ds.data[vc], fn)()
+                        row[new_name] = fn(ds.data[vc]) if callable(fn) else getattr(ds.data[vc], fn)()
             rows.append(row)
         out_stmt_name = output_stmt["out"]
         if "." in out_stmt_name:
@@ -746,6 +758,16 @@ def handle_proc_datasets(proc: ProcNode, session: Session, reporter: Reporter) -
         libref = libref.split(".", 1)[0]
 
     notes = []
+    if proc.options.get("KILL"):
+        backend = session.storage.get_backend(libref)
+        if backend is None:
+            return StepResult(success=False, error=f"Library {libref} is not defined")
+        deleted = list(backend.list_datasets())
+        for name in deleted:
+            backend.delete(name)
+        if deleted:
+            notes.append(f"Deleted all {len(deleted)} members from {libref}.")
+
     for stmt in proc.statements:
         if isinstance(stmt, list):
             for s in stmt:
@@ -877,43 +899,148 @@ def handle_proc_import(proc: ProcNode, session: Session, reporter: Reporter) -> 
 
 def handle_proc_export(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
     """PROC EXPORT — export data to file."""
-    data_name = proc.options.get("DATA", "")
+    data_ref = proc.options.get("DATA", "")
     outfile = proc.options.get("OUTFILE", "")
     dbms = proc.options.get("DBMS", "CSV").lower()
     delimiter = proc.options.get("DELIMITER", ",")
+    replace = bool(proc.options.get("REPLACE", False))
+    use_labels = bool(proc.options.get("LABEL", False))
+    sheet_name = str(proc.options.get("SHEET", "Sheet1"))
 
-    if not data_name:
+    if not data_ref:
         return StepResult(success=False, error="PROC EXPORT requires DATA=")
     if not outfile:
         return StepResult(success=False, error="PROC EXPORT requires OUTFILE=")
 
     try:
-        if "." in data_name:
-            parts = data_name.split(".", 1)
-            ds = session.get_dataset(parts[0], parts[1])
+        if isinstance(data_ref, DatasetRefNode):
+            data_libref = data_ref.libref
+            data_member = data_ref.name
+            data_options = data_ref.options
         else:
-            ds = session.get_dataset("WORK", data_name)
+            data_name = str(data_ref)
+            if "." in data_name:
+                data_libref, data_member = data_name.split(".", 1)
+            else:
+                data_libref, data_member = "WORK", data_name
+            data_options = []
+        display_name = f"{data_libref}.{data_member}"
+        ds = session.get_dataset(data_libref, data_member)
+        ds = _apply_export_dataset_options(ds, data_options, session)
 
         import os
         filepath = outfile
         if not os.path.isabs(filepath):
             filepath = os.path.abspath(filepath)
 
+        if os.path.exists(filepath) and not replace:
+            return StepResult(
+                success=False,
+                error=(
+                    f"Output file already exists: {filepath}. "
+                    "Specify REPLACE to overwrite it."
+                ),
+            )
+
+        export_df = ds.data.copy()
+        if use_labels:
+            label_mapping = {}
+            for column in export_df.columns:
+                metadata = ds.metadata.get_variable(str(column))
+                if metadata is not None and metadata.label:
+                    label_mapping[column] = metadata.label
+            if label_mapping:
+                export_df = export_df.rename(columns=label_mapping)
+
         if dbms == "csv" or dbms == "dlm":
             csv_dataframe(ds).to_csv(filepath, sep=delimiter, index=False)
         elif dbms == "tab":
             csv_dataframe(ds).to_csv(filepath, sep="\t", index=False)
         elif dbms == "xlsx" or dbms == "excel":
-            ds.data.to_excel(filepath, index=False)
+            try:
+                export_df.to_excel(filepath, index=False, sheet_name=sheet_name)
+                from openpyxl import load_workbook
+                from openpyxl.utils import get_column_letter
+
+                workbook = load_workbook(filepath)
+                worksheet = workbook[sheet_name]
+                for index, column in enumerate(export_df.columns, 1):
+                    values = [str(column), *export_df.iloc[:, index - 1].fillna("").astype(str)]
+                    width = min(max(len(value) for value in values) + 2, 60)
+                    worksheet.column_dimensions[get_column_letter(index)].width = width
+                workbook.save(filepath)
+            except ImportError:
+                return StepResult(
+                    success=False,
+                    error=(
+                        f"Cannot export {filepath}: Excel export requires the "
+                        "optional dependency openpyxl. "
+                        "Install SASLite with the excel extra: pip install "
+                        "'saslite[excel]'"
+                    ),
+                )
         else:
             return StepResult(success=False, error=f"Unsupported DBMS type: {dbms}")
 
         return StepResult(
             success=True,
             rows_affected=ds.nrow,
-            notes=[f"Dataset {data_name} exported to {outfile} ({ds.nrow} observations)."],
+            notes=[f"Dataset {display_name} exported to {filepath} ({ds.nrow} observations)."],
         )
     except KeyError:
-        return StepResult(success=False, error=f"Dataset {data_name} not found")
+        return StepResult(success=False, error=f"Dataset {data_ref} not found")
     except Exception as e:
         return StepResult(success=False, error=f"PROC EXPORT error: {e}")
+
+
+def _apply_export_dataset_options(
+    ds: Dataset,
+    options: list[Any],
+    session: Session,
+) -> Dataset:
+    """Apply input data set options before PROC EXPORT writes the file."""
+    result = ds.copy()
+    registry = build_default_registry()
+
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        if "KEEP" in option:
+            keep = {str(name).upper() for name in option["KEEP"]}
+            result = result.select_columns([
+                column for column in result.data.columns
+                if str(column).upper() in keep
+            ])
+        if "DROP" in option:
+            drop = {str(name).upper() for name in option["DROP"]}
+            result = result.select_columns([
+                column for column in result.data.columns
+                if str(column).upper() not in drop
+            ])
+        if "RENAME" in option:
+            columns = {str(column).upper(): column for column in result.data.columns}
+            rename = {
+                columns[str(old).upper()]: new
+                for old, new in option["RENAME"].items()
+                if str(old).upper() in columns
+            }
+            result = result.rename_columns(rename)
+        if "WHERE" in option:
+            condition = option["WHERE"]
+            columns = {str(column).upper(): column for column in result.data.columns}
+            mask: list[bool] = []
+            for _, row in result.data.iterrows():
+                evaluator = ExpressionEvaluator(
+                    var_getter=lambda name, current=row: current.get(
+                        columns.get(name.upper(), name)
+                    ),
+                    session=session,
+                )
+                for function_name in registry.names:
+                    function = registry.get(function_name)
+                    if function is not None:
+                        evaluator.register_function(function_name, function)
+                mask.append(sas_bool(evaluator.evaluate(condition)))
+            result.data = result.data.loc[mask].reset_index(drop=True)
+
+    return result

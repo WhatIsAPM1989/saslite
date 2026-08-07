@@ -10,6 +10,7 @@ from typing import Any
 import pandas as pd
 
 from saslite.ast.proc import ProcNode, VarListNode, ByNode, ClassNode
+from saslite.ast.data_step import DatasetRefNode
 from saslite.runtime.dataset import Dataset
 from saslite.runtime.execution_result import StepResult
 from saslite.session.session import Session
@@ -44,9 +45,16 @@ def _col_map(df: pd.DataFrame) -> dict[str, str]:
 def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
     """PROC TRANSPOSE — rotate dataset (rows ↔ columns)."""
     data_name = proc.options.get("DATA", "")
-    out_name = proc.options.get("OUT", "")
+    out_option = proc.options.get("OUT", "")
+    if isinstance(out_option, DatasetRefNode):
+        out_name = f"{out_option.libref}.{out_option.name}"
+        out_options = out_option.options
+    else:
+        out_name = out_option
+        out_options = []
     prefix = str(proc.options.get("PREFIX", "COL"))
     name_col = str(proc.options.get("NAME", "_NAME_")).upper()
+    label_col = str(proc.options.get("LABEL", "")).upper()
 
     if not data_name:
         return StepResult(success=False, error="PROC TRANSPOSE requires DATA=")
@@ -80,6 +88,9 @@ def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) 
         out_rows = []
         for vc in var_cols:
             row: dict[str, Any] = {name_col: vc}
+            if label_col:
+                metadata = ds.metadata.get_variable(str(vc))
+                row[label_col] = metadata.label if metadata and metadata.label else vc
             if id_col is not None:
                 for _, src in block.iterrows():
                     col_label = str(src[id_col])
@@ -90,7 +101,15 @@ def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) 
             out_rows.append(row)
         return pd.DataFrame(out_rows)
 
-    if by_cols:
+    if df.empty:
+        empty_columns: dict[str, pd.Series] = {
+            column: pd.Series(dtype=df[column].dtype) for column in by_cols
+        }
+        empty_columns[name_col] = pd.Series(dtype="object")
+        if label_col:
+            empty_columns[label_col] = pd.Series(dtype="object")
+        result = pd.DataFrame(empty_columns)
+    elif by_cols:
         parts = []
         for key, block in df.groupby(by_cols, sort=False):
             t = _transpose_block(block)
@@ -101,22 +120,42 @@ def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) 
             parts.append(t)
         result = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
         # Keep BY columns first, then _NAME_, then data columns
-        ordered = by_cols + [name_col] + [c for c in result.columns
-                                          if c not in by_cols and c != name_col]
+        transpose_metadata = [name_col] + ([label_col] if label_col else [])
+        ordered = by_cols + transpose_metadata + [
+            c for c in result.columns
+            if c not in by_cols and c not in transpose_metadata
+        ]
         result = result[[c for c in ordered if c in result.columns]]
     else:
         result = _transpose_block(df)
 
     out_libref, out_member = _split_name(out_name) if out_name else _split_name(data_name)
     out_ds = Dataset.from_dataframe(result, name=out_member, libref=out_libref)
+    for option in out_options:
+        if not isinstance(option, dict):
+            continue
+        if "KEEP" in option:
+            keep = {str(column).upper() for column in option["KEEP"]}
+            out_ds = out_ds.select_columns([
+                column for column in out_ds.data.columns
+                if str(column).upper() in keep
+            ])
+        if "DROP" in option:
+            drop = {str(column).upper() for column in option["DROP"]}
+            out_ds = out_ds.select_columns([
+                column for column in out_ds.data.columns
+                if str(column).upper() not in drop
+            ])
+        if "RENAME" in option:
+            out_ds = out_ds.rename_columns(option["RENAME"])
     session.put_dataset(out_libref, out_member, out_ds)
 
     return StepResult(
         success=True,
         dataset_name=f"{out_libref}.{out_member}",
-        rows_affected=len(result),
-        notes=[f"Dataset {out_libref}.{out_member} created with {len(result)} observations "
-               f"and {len(result.columns)} variables."],
+        rows_affected=out_ds.nrow,
+        notes=[f"Dataset {out_libref}.{out_member} created with {out_ds.nrow} observations "
+               f"and {out_ds.ncol} variables."],
     )
 
 

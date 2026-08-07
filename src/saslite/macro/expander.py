@@ -22,6 +22,8 @@ class MacroExpander:
     """Macro expander for %LET, &var, %MACRO/%MEND, and macro invocation."""
 
     _OPEN_CODE_MACRO_ERROR = "Macro code is not allowed in open code."
+    _QUOTED_AMPERSAND = "\ue000"
+    _QUOTED_PERCENT = "\ue001"
     _MACRO_SCOPE_KEYWORDS = (
         "IF", "THEN", "ELSE", "DO", "END", "TO", "BY", "WHILE", "UNTIL",
         "GOTO", "RETURN", "LOCAL", "MEND",
@@ -30,9 +32,12 @@ class MacroExpander:
     def __init__(self, session: Any | None = None) -> None:
         self._global_vars: dict[str, str] = {}
         self._local_vars: dict[str, str] = {}
+        self._macro_scopes: list[dict[str, str]] = []
         self._macros: dict[str, MacroDef] = {}
         self._put_output: list[str] = []
         self._session = session
+        self._dataset_handles: dict[int, Any] = {}
+        self._next_dataset_handle = 1
         self._init_automatic_vars()
 
     def _init_automatic_vars(self) -> None:
@@ -52,10 +57,17 @@ class MacroExpander:
             self._global_vars["SYSSCP"] = "LIN X64"
 
     def set_var(self, name: str, value: str) -> None:
-        self._local_vars[name.upper()] = value
+        key = name.upper()
+        if self._macro_scopes:
+            self._macro_scopes[-1][key] = value
+        else:
+            self._local_vars[key] = value
 
     def get_var(self, name: str) -> str | None:
         key = name.upper()
+        for scope in reversed(self._macro_scopes):
+            if key in scope:
+                return scope[key]
         if key in self._local_vars:
             return self._local_vars[key]
         if key in self._global_vars:
@@ -153,7 +165,7 @@ class MacroExpander:
         # Step 10: Final &var substitution pass
         source = self._substitute_vars(source)
 
-        return source
+        return self._unquote_macro_value(source)
 
     def _remove_comments(self, source: str) -> str:
         """Remove /* ... */ block comments, %* ... ; macro comments, and
@@ -253,31 +265,165 @@ class MacroExpander:
         return parts
 
     def _process_macro_definitions(self, source: str) -> str:
-        """Find and extract %MACRO ... %MEND blocks."""
-        # Match %MACRO name[(params)] ... %MEND [name];
-        pattern = r"%\s*MACRO\s+(\w+)(?:\s*\(([^)]*)\))?\s*;(.*?)%\s*MEND(?:\s+\w+)?\s*;"
-        result = source
-        for match in re.finditer(pattern, source, flags=re.IGNORECASE | re.DOTALL):
-            name = match.group(1).upper()
-            params_str = match.group(2) or ""
-            body = match.group(3)
-            params: list[str] = []
-            defaults: dict[str, str] = {}
-            for p in params_str.split(","):
-                p = p.strip()
-                if not p:
+        """Extract top-level macro definitions with balanced nesting.
+
+        A non-greedy regular expression pairs an outer ``%MACRO`` with the
+        first ``%MEND`` it sees.  That truncates an outer definition when its
+        body declares a helper macro.  Scan macro tokens and pair them by
+        depth instead; nested definitions remain in the outer body until the
+        outer macro is invoked.
+        """
+        masked = self._mask_quoted_text(source)
+        macro_head = re.compile(r"%\s*MACRO\s+(\w+)", re.IGNORECASE)
+        macro_token = re.compile(r"%\s*(MACRO|MEND)\b", re.IGNORECASE)
+        chunks: list[str] = []
+        cursor = 0
+        search_at = 0
+
+        while True:
+            head = macro_head.search(masked, search_at)
+            if head is None:
+                chunks.append(source[cursor:])
+                break
+
+            name = head.group(1).upper()
+            header_end, params_str = self._parse_macro_header(
+                source,
+                masked,
+                head.end(),
+                name,
+            )
+
+            depth = 1
+            token_at = header_end
+            closing_start: int | None = None
+            closing_end: int | None = None
+            while depth:
+                token = macro_token.search(masked, token_at)
+                if token is None:
+                    raise SyntaxError(f"Unclosed %MACRO {name} definition")
+                token_kind = token.group(1).upper()
+                if token_kind == "MACRO":
+                    depth += 1
+                    token_at = token.end()
                     continue
-                if "=" in p:
-                    pname, pdefault = p.split("=", 1)
-                    pname = pname.strip().upper()
-                    params.append(pname)
-                    defaults[pname] = pdefault.strip()
-                else:
-                    params.append(p.upper())
-            self._macros[name] = MacroDef(name=name, params=params, body=body,
-                                          defaults=defaults)
-            result = result.replace(match.group(0), "")
-        return result
+
+                depth -= 1
+                if depth:
+                    token_at = token.end()
+                    continue
+
+                closing_start = token.start()
+                closing_end = self._parse_mend_end(masked, token.end(), name)
+
+            assert closing_start is not None and closing_end is not None
+            self._register_macro(
+                name,
+                params_str,
+                source[header_end:closing_start],
+            )
+            chunks.append(source[cursor:head.start()])
+            cursor = closing_end
+            search_at = closing_end
+
+        return "".join(chunks)
+
+    @staticmethod
+    def _mask_quoted_text(source: str) -> str:
+        """Replace quoted text with spaces while preserving string offsets."""
+        masked = list(source)
+        quote: str | None = None
+        i = 0
+        while i < len(source):
+            ch = source[i]
+            if quote is None:
+                if ch in ("'", '"'):
+                    quote = ch
+                    masked[i] = " "
+                i += 1
+                continue
+
+            masked[i] = " "
+            if ch == quote:
+                if i + 1 < len(source) and source[i + 1] == quote:
+                    masked[i + 1] = " "
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+        return "".join(masked)
+
+    @staticmethod
+    def _parse_macro_header(
+        source: str,
+        masked: str,
+        position: int,
+        name: str,
+    ) -> tuple[int, str]:
+        """Return the body start and raw parameter list for a definition."""
+        while position < len(masked) and masked[position].isspace():
+            position += 1
+
+        params_str = ""
+        if position < len(masked) and masked[position] == "(":
+            params_start = position + 1
+            depth = 1
+            position += 1
+            while position < len(masked) and depth:
+                if masked[position] == "(":
+                    depth += 1
+                elif masked[position] == ")":
+                    depth -= 1
+                position += 1
+            if depth:
+                raise SyntaxError(f"Unclosed parameter list for %MACRO {name}")
+            params_str = source[params_start:position - 1]
+            while position < len(masked) and masked[position].isspace():
+                position += 1
+
+        if position >= len(masked) or masked[position] != ";":
+            raise SyntaxError(f"Expected ';' after %MACRO {name}")
+        return position + 1, params_str
+
+    @staticmethod
+    def _parse_mend_end(masked: str, position: int, macro_name: str) -> int:
+        """Consume optional name and the semicolon in ``%MEND [name];``."""
+        while position < len(masked) and masked[position].isspace():
+            position += 1
+        named = re.match(r"\w+", masked[position:])
+        if named is not None:
+            closing_name = named.group(0)
+            position += named.end()
+            if closing_name.upper() != macro_name:
+                raise SyntaxError(
+                    f"%MEND {closing_name} does not match %MACRO {macro_name}"
+                )
+            while position < len(masked) and masked[position].isspace():
+                position += 1
+        if position >= len(masked) or masked[position] != ";":
+            raise SyntaxError(f"Expected ';' after %MEND for {macro_name}")
+        return position + 1
+
+    def _register_macro(self, name: str, params_str: str, body: str) -> None:
+        params: list[str] = []
+        defaults: dict[str, str] = {}
+        for parameter in self._split_args_depth0(params_str):
+            parameter = parameter.strip()
+            if not parameter:
+                continue
+            if "=" in parameter:
+                param_name, default = parameter.split("=", 1)
+                param_name = param_name.strip().upper()
+                params.append(param_name)
+                defaults[param_name] = default.strip()
+            else:
+                params.append(parameter.upper())
+        self._macros[name] = MacroDef(
+            name=name,
+            params=params,
+            body=body,
+            defaults=defaults,
+        )
 
     def _reject_open_code_macro_statements(self, source: str) -> None:
         """Reject macro control statements outside %MACRO/%MEND definitions."""
@@ -312,7 +458,7 @@ class MacroExpander:
 
     def _process_conditionals(self, source: str) -> str:
         """Process %IF ... %THEN ... %ELSE ... %DO ... %END; conditionals."""
-        max_iterations = 20
+        max_iterations = 100
         for _ in range(max_iterations):
             new_source = self._process_conditionals_once(source)
             if new_source == source:
@@ -321,34 +467,93 @@ class MacroExpander:
         return source
 
     def _process_conditionals_once(self, source: str) -> str:
-        """Single pass of %IF/%THEN/%ELSE processing."""
-        # Pattern for %IF ... %THEN %DO ... %END [%ELSE %DO ... %END]
-        # First handle %IF ... %THEN %DO ... %END [%ELSE %DO ... %END]
-        do_pattern = (
-            r"%\s*IF\s+(.*?)\s+%\s*THEN\s+%\s*DO\s*;"
-            r"(.*?)%\s*END\s*;"
-            r"(?:\s*%\s*ELSE\s+%\s*DO\s*;(.*?)%\s*END\s*;)?"
+        """Evaluate the first conditional using balanced macro DO/END pairs."""
+        masked = self._mask_quoted_text(source)
+        if_match = re.search(r"%\s*IF\b", masked, flags=re.IGNORECASE)
+        if if_match is None:
+            return source
+        then_match = re.search(
+            r"%\s*THEN\b",
+            masked[if_match.end():],
+            flags=re.IGNORECASE,
         )
-        source = re.sub(
-            do_pattern,
-            lambda m: self._eval_conditional(m),
-            source,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
+        if then_match is None:
+            return source
+        then_start = if_match.end() + then_match.start()
+        then_end = if_match.end() + then_match.end()
+        condition = source[if_match.end():then_start].strip()
 
-        # Pattern for %IF ... %THEN single_statement;
-        # (no %DO/%END, just a single statement)
-        single_pattern = (
-            r"%\s*IF\s+(.*?)\s+%\s*THEN\s+([^;]+;)"
-            r"(?:\s*%\s*ELSE\s+([^;]+;))?"
-        )
-        source = re.sub(
-            single_pattern,
-            lambda m: self._eval_conditional_single(m),
+        then_body, branch_end = self._parse_macro_conditional_branch(
             source,
-            flags=re.IGNORECASE | re.DOTALL,
+            masked,
+            then_end,
         )
-        return source
+        else_body = ""
+        conditional_end = branch_end
+        else_at = self._skip_whitespace(masked, branch_end)
+        else_match = re.match(r"%\s*ELSE\b", masked[else_at:], re.IGNORECASE)
+        if else_match is not None:
+            else_body, conditional_end = self._parse_macro_conditional_branch(
+                source,
+                masked,
+                else_at + else_match.end(),
+            )
+
+        chosen = then_body if self._eval_macro_condition(condition) else else_body
+        chosen = self._process_conditionals(chosen)
+        return source[:if_match.start()] + chosen + source[conditional_end:]
+
+    @staticmethod
+    def _skip_whitespace(source: str, position: int) -> int:
+        while position < len(source) and source[position].isspace():
+            position += 1
+        return position
+
+    def _parse_macro_conditional_branch(
+        self,
+        source: str,
+        masked: str,
+        position: int,
+    ) -> tuple[str, int]:
+        """Return branch text and end offset for block or single statement."""
+        branch_start = self._skip_whitespace(masked, position)
+        do_match = re.match(r"%\s*DO\b[^;]*;", masked[branch_start:], re.IGNORECASE)
+        if do_match is not None:
+            content_start = branch_start + do_match.end()
+            end_start, end_after = self._find_matching_macro_end(
+                masked,
+                content_start,
+            )
+            return source[content_start:end_start], end_after
+
+        semicolon = masked.find(";", branch_start)
+        if semicolon < 0:
+            raise SyntaxError("Macro %IF branch is missing a semicolon")
+        return source[branch_start:semicolon + 1], semicolon + 1
+
+    @staticmethod
+    def _find_matching_macro_end(masked: str, position: int) -> tuple[int, int]:
+        """Pair a macro %DO block with its depth-matched %END statement."""
+        token_re = re.compile(r"%\s*(DO|END)\b", re.IGNORECASE)
+        depth = 1
+        search_at = position
+        while True:
+            token = token_re.search(masked, search_at)
+            if token is None:
+                raise SyntaxError("Macro %DO block has no matching %END")
+            if token.group(1).upper() == "DO":
+                depth += 1
+                search_at = token.end()
+                continue
+            depth -= 1
+            if depth:
+                search_at = token.end()
+                continue
+            end_after = token.end()
+            end_after = MacroExpander._skip_whitespace(masked, end_after)
+            if end_after >= len(masked) or masked[end_after] != ";":
+                raise SyntaxError("Expected ';' after macro %END")
+            return token.start(), end_after + 1
 
     def _eval_conditional(self, match: re.Match) -> str:
         """Evaluate a %IF/%THEN/%DO conditional and return the chosen branch."""
@@ -411,6 +616,11 @@ class MacroExpander:
         max_iterations = 20  # Prevent infinite loops
         for _ in range(max_iterations):
             expanded = self._expand_once(source)
+            # Invoking an outer macro can emit a helper definition from its
+            # body. Register that helper before the next expansion pass, while
+            # leaving its body (including macro conditionals) unevaluated
+            # until the helper itself is invoked.
+            expanded = self._process_macro_definitions(expanded)
             if expanded == source:
                 break
             source = expanded
@@ -458,7 +668,7 @@ class MacroExpander:
         skip_keywords = {"LET", "MACRO", "MEND", "IF", "THEN", "ELSE", "DO", "END",
                          "PUT", "INCLUDE", "GOTO", "RETURN", "EVAL", "SYSEVALF",
                          "UPCASE", "LOWCASE", "SCAN", "SUBSTR", "LENGTH", "INDEX",
-                         "SYSFUNC", "TO", "BY"}
+                         "SUPERQ", "SYSFUNC", "TO", "BY"}
 
         # First expand %name(args);
         def replacer_with_args(match: re.Match) -> str:
@@ -486,12 +696,7 @@ class MacroExpander:
                         local_vars[macro.params[pos_idx]] = arg.strip("'\"")
                     pos_idx += 1
             # Expand body with local vars
-            body = macro.body
-            for var_name, var_val in local_vars.items():
-                body = re.sub(rf"&{re.escape(var_name)}\b\.?", var_val, body, flags=re.IGNORECASE)
-            # Also substitute global/local vars
-            body = self._substitute_vars(body)
-            return self._apply_return_goto(body)
+            return self._expand_invoked_macro(macro, local_vars)
 
         source = re.sub(pattern_with_args, replacer_with_args, source, flags=re.IGNORECASE)
 
@@ -503,11 +708,73 @@ class MacroExpander:
             if macro_name not in self._macros:
                 return match.group(0)
             macro = self._macros[macro_name]
-            body = self._substitute_vars(macro.body)
-            return self._apply_return_goto(body)
+            return self._expand_invoked_macro(macro, dict(macro.defaults))
 
         source = re.sub(pattern_no_args, replacer_no_args, source, flags=re.IGNORECASE)
         return source
+
+    def _expand_invoked_macro(
+        self,
+        macro: MacroDef,
+        parameter_values: dict[str, str],
+    ) -> str:
+        """Expand one macro invocation inside an isolated local scope."""
+        scope = {name.upper(): value for name, value in parameter_values.items()}
+        self._macro_scopes.append(scope)
+        try:
+            body = self._process_local_declarations(macro.body, scope)
+            # Capture parameter values textually, including references inside
+            # a nested helper definition. Other locals must remain unresolved
+            # until their %LET statements have executed below.
+            for name, value in parameter_values.items():
+                body = re.sub(
+                    rf"&{re.escape(name)}\b\.?",
+                    value,
+                    body,
+                    flags=re.IGNORECASE,
+                )
+            # Extract nested helper definitions before processing %IF/%PUT in
+            # the outer body; their control statements execute only when the
+            # helper itself is invoked.
+            body = self._process_macro_definitions(body)
+            body = self._process_macro_functions(body)
+            body = self._process_eval(body)
+            body = self._process_let_statements(body)
+            body = self._substitute_vars(body)
+            body = self._process_conditionals(body)
+            # Expand iterative %DO only after false conditional branches have
+            # been discarded; otherwise their %END tokens can be consumed as
+            # if they closed the surrounding %IF block.
+            body = self._process_do_loops(body)
+            body = self._process_macro_functions(body)
+            body = self._process_eval(body)
+            body = self._process_let_statements(body)
+            body = self._substitute_vars(body)
+            body = self._process_conditionals(body)
+            body = self._process_put_statements(body)
+            body = self._expand_macro_invocations(body)
+            return self._apply_return_goto(body)
+        finally:
+            self._macro_scopes.pop()
+
+    @staticmethod
+    def _process_local_declarations(
+        body: str,
+        scope: dict[str, str],
+    ) -> str:
+        """Declare blank macro locals and remove their %LOCAL statements."""
+        def declare(match: re.Match) -> str:
+            for name in re.findall(r"[A-Za-z_]\w*", match.group(1)):
+                # Macro parameters are already local and retain their values.
+                scope.setdefault(name.upper(), "")
+            return ""
+
+        return re.sub(
+            r"%\s*LOCAL\s+([^;]*);",
+            declare,
+            body,
+            flags=re.IGNORECASE,
+        )
 
     def _process_let_statements(self, source: str) -> str:
         """Find and process %LET statements, return source without them."""
@@ -519,7 +786,10 @@ class MacroExpander:
                 value.startswith('"') and value.endswith('"')
             ):
                 value = value[1:-1]
-            self._local_vars[var_name] = value
+            if self._macro_scopes:
+                self._macro_scopes[-1][var_name] = value
+            else:
+                self._local_vars[var_name] = value
             self._log_symbolgen(var_name, value)
             return ""  # Remove the %LET statement
 
@@ -591,6 +861,7 @@ class MacroExpander:
                 # Evaluate any %EVAL expressions
                 output = self._process_eval(output)
 
+            output = self._unquote_macro_value(output)
             self._put_output.append(output)
             if self._session:
                 self._session.add_debug_output(f"PUT: {output}")
@@ -680,7 +951,7 @@ class MacroExpander:
     # ── Macro character functions & %SYSFUNC ──────────
 
     _MACRO_FUNC_NAMES = ("UPCASE", "LOWCASE", "SCAN", "SUBSTR", "LENGTH",
-                         "INDEX", "SYSFUNC")
+                         "INDEX", "SUPERQ", "SYSFUNC")
 
     def _process_macro_functions(self, source: str) -> str:
         """Expand %UPCASE/%LOWCASE/%SCAN/%SUBSTR/%LENGTH/%INDEX/%SYSFUNC.
@@ -747,6 +1018,15 @@ class MacroExpander:
         Returns None when the arguments still contain unresolved &var
         references, so expansion can be retried after %LET processing.
         """
+        if func == "SUPERQ":
+            # SUPERQ takes a variable *name*, not an &reference, and masks
+            # macro triggers in the returned value from further rescanning.
+            name = raw_args.strip()
+            value = self.get_var(name)
+            if value is None:
+                return ""
+            return self._quote_macro_value(value)
+
         raw_args = self._substitute_vars(raw_args)
         if "&" in raw_args:
             return None
@@ -797,6 +1077,20 @@ class MacroExpander:
             return text[start_idx:start_idx + length]
         return ""
 
+    @classmethod
+    def _quote_macro_value(cls, value: str) -> str:
+        return str(value).replace("&", cls._QUOTED_AMPERSAND).replace(
+            "%",
+            cls._QUOTED_PERCENT,
+        )
+
+    @classmethod
+    def _unquote_macro_value(cls, value: str) -> str:
+        return str(value).replace(cls._QUOTED_AMPERSAND, "&").replace(
+            cls._QUOTED_PERCENT,
+            "%",
+        )
+
     _sysfunc_registry = None
 
     def _eval_sysfunc(self, raw_args: str) -> str:
@@ -831,7 +1125,15 @@ class MacroExpander:
                     args.append(part)
 
         try:
-            result = reg.call(fn_name, args)
+            metadata_fn = getattr(
+                self,
+                f"_sysfunc_{fn_name.lower()}",
+                None,
+            )
+            if metadata_fn is not None:
+                result = metadata_fn(*args)
+            else:
+                result = reg.call(fn_name, args)
         except NameError:
             raise
         except Exception:
@@ -841,6 +1143,156 @@ class MacroExpander:
         if isinstance(result, float) and result.is_integer():
             return str(int(result))
         return str(result)
+
+    # ── Dataset metadata functions ────────────────────
+
+    def _sysfunc_exist(self, dataset_name: Any, member_type: Any = "DATA") -> int:
+        """Return one when a session dataset exists, otherwise zero."""
+        if self._session is None:
+            return 0
+        requested_type = str(member_type).strip().strip("'\"").upper()
+        if requested_type not in {"", "DATA", "ANY"}:
+            # SASLite does not currently model catalog entries or views.
+            return 0
+        reference = self._split_dataset_reference(dataset_name)
+        if reference is None:
+            return 0
+        libref, member = reference
+        try:
+            return int(self._session.dataset_exists(libref, member))
+        except (KeyError, OSError, ValueError):
+            return 0
+
+    def _sysfunc_open(self, dataset_name: Any, mode: Any = "I") -> int:
+        """OPEN a session dataset and return a stable, positive handle.
+
+        SAS accepts a one-level member name as WORK.member and a two-level
+        name as libref.member.  Access modes are currently read-only from the
+        macro system's perspective, but are accepted for source compatibility.
+        """
+        del mode
+        if self._session is None:
+            return 0
+
+        reference = self._split_dataset_reference(dataset_name)
+        if reference is None:
+            return 0
+        libref, member = reference
+        try:
+            dataset = self._session.get_dataset(libref, member)
+        except (KeyError, OSError, ValueError):
+            return 0
+
+        handle = self._next_dataset_handle
+        self._next_dataset_handle += 1
+        self._dataset_handles[handle] = dataset
+        return handle
+
+    @staticmethod
+    def _split_dataset_reference(dataset_name: Any) -> tuple[str, str] | None:
+        reference = str(dataset_name).strip().strip("'\"")
+        # Metadata functions address the member itself when dataset options
+        # such as WHERE= or KEEP= are present.
+        reference = reference.split("(", 1)[0].strip()
+        if not reference:
+            return None
+        if "." in reference:
+            libref, member = reference.split(".", 1)
+        else:
+            libref, member = "WORK", reference
+        if not libref.strip() or not member.strip():
+            return None
+        return libref.strip(), member.strip()
+
+    def _sysfunc_close(self, handle: Any) -> int:
+        """CLOSE a dataset handle; zero denotes success as in SAS."""
+        handle_number = self._coerce_handle(handle)
+        if handle_number is None or handle_number not in self._dataset_handles:
+            return 1
+        del self._dataset_handles[handle_number]
+        return 0
+
+    def _sysfunc_varnum(self, handle: Any, variable_name: Any) -> int:
+        dataset = self._dataset_for_handle(handle)
+        if dataset is None:
+            return 0
+        wanted = str(variable_name).strip().strip("'\"").upper()
+        for number, column_name in enumerate(dataset.columns, start=1):
+            if str(column_name).upper() == wanted:
+                return number
+        return 0
+
+    def _sysfunc_varname(self, handle: Any, variable_number: Any) -> str:
+        dataset = self._dataset_for_handle(handle)
+        number = self._coerce_positive_int(variable_number)
+        if dataset is None or number is None or number > len(dataset.columns):
+            return ""
+        return str(dataset.columns[number - 1])
+
+    def _sysfunc_vartype(self, handle: Any, variable_number: Any) -> str:
+        dataset = self._dataset_for_handle(handle)
+        variable = self._variable_for_number(dataset, variable_number)
+        if variable is None:
+            return ""
+        return "C" if variable.dtype == "character" else "N"
+
+    def _sysfunc_varlabel(self, handle: Any, variable_number: Any) -> str:
+        dataset = self._dataset_for_handle(handle)
+        variable = self._variable_for_number(dataset, variable_number)
+        if variable is None:
+            return ""
+        return variable.label or ""
+
+    def _sysfunc_attrn(self, handle: Any, attribute_name: Any) -> int | str:
+        dataset = self._dataset_for_handle(handle)
+        if dataset is None:
+            return ""
+        attribute = str(attribute_name).strip().strip("'\"").upper()
+        if attribute in {"NOBS", "NLOBS", "NLOBSF"}:
+            return dataset.nrow
+        if attribute == "NVARS":
+            return dataset.ncol
+        return ""
+
+    @staticmethod
+    def _coerce_positive_int(value: Any) -> int | None:
+        try:
+            number = int(float(value))
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
+    def _coerce_handle(self, value: Any) -> int | None:
+        return self._coerce_positive_int(value)
+
+    def _dataset_for_handle(self, handle: Any) -> Any | None:
+        handle_number = self._coerce_handle(handle)
+        if handle_number is None:
+            return None
+        return self._dataset_handles.get(handle_number)
+
+    @staticmethod
+    def _variable_for_number(dataset: Any | None, variable_number: Any) -> Any | None:
+        if dataset is None:
+            return None
+        try:
+            number = int(float(variable_number))
+        except (TypeError, ValueError):
+            return None
+        if number < 1 or number > len(dataset.columns):
+            return None
+        column_name = str(dataset.columns[number - 1])
+        variable = dataset.metadata.get_variable(column_name)
+        if variable is not None:
+            return variable
+        # A backend may not retain complete metadata.  Preserve useful SAS
+        # behavior by inferring type for that individual column.
+        from saslite.runtime.metadata import make_variable
+        from saslite.runtime.dataset import _infer_sas_dtype
+        return make_variable(
+            column_name,
+            dtype=_infer_sas_dtype(dataset.data[column_name]),
+        )
 
     @staticmethod
     def _split_args_depth0(inner: str) -> list[str]:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pandas as pd
+
 from saslite.runtime.dataset import Dataset
 from saslite.storage.path_resolver import StorageRouter
 from saslite.storage.memory import MemoryBackend
@@ -102,6 +104,70 @@ class Session:
     def dataset_exists(self, libref: str, name: str) -> bool:
         backend, ds_name = self.storage.resolve(libref, name)
         return backend.exists(ds_name)
+
+    def dictionary_columns(self) -> Dataset:
+        """Build the read-only DICTIONARY.COLUMNS view for this session."""
+        rows: list[dict[str, Any]] = []
+        for libref in self.storage.list_libraries():
+            backend = self.storage.get_backend(libref)
+            if backend is None:
+                continue
+            for member_name in backend.list_datasets():
+                try:
+                    dataset = backend.read(member_name)
+                except (OSError, ValueError):
+                    # One unreadable member must not hide metadata for every
+                    # other registered library.
+                    continue
+                if dataset is None:
+                    continue
+                for varnum, column_name in enumerate(dataset.columns, start=1):
+                    variable = dataset.metadata.get_variable(str(column_name))
+                    dtype = variable.dtype if variable is not None else "character"
+                    is_character = dtype == "character"
+                    length = variable.length if variable is not None else None
+                    if length is None:
+                        if is_character:
+                            series = dataset.data[column_name]
+                            nonmissing = series.dropna().astype(str)
+                            length = max((len(value) for value in nonmissing), default=1)
+                        else:
+                            length = 8
+                    rows.append(
+                        {
+                            "LIBNAME": libref.upper(),
+                            "MEMNAME": str(member_name).upper(),
+                            "NAME": (
+                                variable.name
+                                if variable is not None
+                                else str(column_name)
+                            ),
+                            "TYPE": "char" if is_character else "num",
+                            "LENGTH": int(length),
+                            "VARNUM": varnum,
+                            "LABEL": (
+                                variable.label or ""
+                                if variable is not None
+                                else ""
+                            ),
+                            "FORMAT": (
+                                variable.format or ""
+                                if variable is not None
+                                else ""
+                            ),
+                        }
+                    )
+
+        columns = [
+            "LIBNAME", "MEMNAME", "NAME", "TYPE",
+            "LENGTH", "VARNUM", "LABEL", "FORMAT",
+        ]
+        frame = pd.DataFrame(rows, columns=columns)
+        return Dataset.from_dataframe(
+            frame,
+            name="COLUMNS",
+            libref="DICTIONARY",
+        )
 
     def add_debug_output(self, message: str) -> None:
         """Add a debug message to the output log."""
