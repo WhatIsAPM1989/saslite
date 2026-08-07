@@ -142,6 +142,18 @@ class FormatNode(Node):
 
 
 @dataclass
+class FormatResetNode(Node):
+    """FORMAT _ALL_ — clear formats from all DATA-step variables."""
+    pass
+
+
+@dataclass
+class InformatResetNode(Node):
+    """INFORMAT _ALL_ — clear informats from all DATA-step variables."""
+    pass
+
+
+@dataclass
 class LabelNode(Node):
     """LABEL statement."""
     items: list[tuple[str, str]] = field(default_factory=list)

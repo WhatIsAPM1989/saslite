@@ -17,7 +17,8 @@ from saslite.ast.program import ProgramNode, FilenameNode, LibnameNode, OptionsN
 from saslite.ast.data_step import (
     DataStepNode, SetNode, DatasetRefNode, AssignNode, IfNode, DoNode,
     OutputNode, DeleteNode, StopNode, RetainNode, WhereNode, KeepNode,
-    DropNode, RenameNode, FormatNode, LabelNode, MergeNode, ArrayNode,
+    DropNode, RenameNode, FormatNode, FormatResetNode, InformatResetNode,
+    LabelNode, MergeNode, ArrayNode,
     InputNode, InfileNode, SubstrAssignNode, LengthNode, AttribNode, PutNode,
     UpdateDataNode, CallSymputNode,
 )
@@ -386,23 +387,56 @@ class SasTransformer(Transformer):
     def data_step(self, items: list[Any]) -> DataStepNode:
         # With keep_all_tokens, items include DATA, dataset_target+, ;, data_stmt*, RUN, ;
         targets: list[str] = []
+        target_options: dict[str, Any] = {}
         statements = []
         for item in items:
             if isinstance(item, Token):
                 continue  # Skip keyword/punctuation tokens
             if isinstance(item, VariableNode) and not statements:
                 targets.append(item.name)
+            elif isinstance(item, DatasetRefNode) and not statements:
+                qualified = (
+                    f"{item.libref}.{item.name}"
+                    if item.libref.upper() != "WORK"
+                    else item.name
+                )
+                targets.append(qualified)
+                if len(targets) == 1:
+                    for option in item.options:
+                        target_options.update(option)
             elif hasattr(item, '__class__') and item.__class__.__name__ == 'DataStepNode':
                 # Shouldn't happen, but handle it
                 pass
             elif item is not None:
                 statements.append(item)
         target = targets[0] if targets else "_NULL_"
-        return DataStepNode(target=target, statements=statements,
-                            extra_targets=targets[1:])
+        return DataStepNode(
+            target=target,
+            target_options=target_options,
+            statements=statements,
+            extra_targets=targets[1:],
+        )
 
     def dataset_target(self, items: list[Any]) -> Any:
-        return items[0]
+        name_node = next(
+            (
+                item for item in items
+                if isinstance(item, VariableNode)
+            ),
+            VariableNode(name=""),
+        )
+        options = [item for item in items if isinstance(item, dict)]
+        if not options:
+            return name_node
+        name = name_node.name
+        if "." in name:
+            libref, member = name.split(".", 1)
+            return DatasetRefNode(
+                name=member.upper(),
+                libref=libref.upper(),
+                options=options,
+            )
+        return DatasetRefNode(name=name.upper(), options=options)
 
     def set_stmt(self, items: list[Any]) -> SetNode:
         datasets = [item for item in items if item is not None and not isinstance(item, Token)]
@@ -1056,6 +1090,12 @@ class SasTransformer(Transformer):
             elif isinstance(item, tuple):
                 result_items.append(item)
         return FormatNode(items=result_items)
+
+    def format_reset_stmt(self, items: list[Any]) -> FormatResetNode:
+        return FormatResetNode()
+
+    def informat_reset_stmt(self, items: list[Any]) -> InformatResetNode:
+        return InformatResetNode()
 
     def format_group(self, items: list[Any]) -> list[tuple[str, str]]:
         names: list[str] = []

@@ -56,7 +56,7 @@ option_value: NAME | NUMBER | STRING
 
 data_step: "DATA"i dataset_target (","? dataset_target)* ";" data_stmt* "RUN"i ";"
 
-dataset_target: qualified_name
+dataset_target: qualified_name ("(" (dataset_option)* ")")?
               | "_NULL_"i
 
 qualified_name: NAME "." NAME
@@ -84,6 +84,8 @@ data_stmt: set_stmt ";"
          | keep_stmt ";"
          | drop_stmt ";"
          | rename_stmt ";"
+         | format_reset_stmt ";"
+         | informat_reset_stmt ";"
          | format_stmt ";"
          | label_stmt ";"
          | length_stmt ";"
@@ -143,6 +145,8 @@ drop_stmt: "DROP"i name_list
 rename_stmt: "RENAME"i (rename_pair)+
 rename_pair: NAME "=" NAME
 format_stmt: "FORMAT"i (format_group)+
+format_reset_stmt: "FORMAT"i "_ALL_"i
+informat_reset_stmt: "INFORMAT"i "_ALL_"i
 format_group: NAME+ format_spec
 label_stmt: "LABEL"i (label_item)+
 label_item: NAME "=" STRING
