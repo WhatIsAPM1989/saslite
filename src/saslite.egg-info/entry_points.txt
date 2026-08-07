@@ -1,0 +1,4 @@
+[console_scripts]
+saslite = saslite.cli.main:main
+saslite-desktop = saslite.gui.desktop:main
+saslite-gui = saslite.gui.app:main

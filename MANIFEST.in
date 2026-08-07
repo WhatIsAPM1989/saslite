@@ -1,0 +1,9 @@
+include README.md
+include LICENSE
+include DOCS.md
+recursive-include examples *.sas
+recursive-include src/saslite/parser/grammar *.lark
+recursive-include src/saslite/gui/static *.html
+global-exclude *.py[cod]
+global-exclude __pycache__
+global-exclude .DS_Store
