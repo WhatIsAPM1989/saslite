@@ -102,6 +102,12 @@ class PDV:
         self._by_state: ByState = ByState()
         self._character_encoding = character_encoding
         self._character_overflows: dict[str, dict[str, Any]] = {}
+        self._runtime_diagnostics: dict[str, dict[str, Any]] = {}
+        # Names that the DATA-step compiler knows can receive a value from an
+        # input data set or an executable statement.  SAS's "uninitialized"
+        # note is about variables with no such source at all; it is not a
+        # path-sensitive warning every time a condition leaves a value missing.
+        self._produced_variables: set[str] = set()
 
     def add_variable(self, name: str, metadata: VariableMetadata) -> PDVVariable:
         """Add a variable to the PDV."""
@@ -120,6 +126,10 @@ class PDV:
             )
             self.add_variable(key, meta)
         return self.variables[key]
+
+    def mark_produced(self, name: str) -> None:
+        """Mark a variable as having a compile-time source of values."""
+        self._produced_variables.add(name.upper())
 
     def set_by_vars(self, by_vars: list[str]) -> None:
         """Set BY variables for FIRST./LAST. tracking."""
@@ -151,7 +161,20 @@ class PDV:
 
         var = self.variables.get(key)
         if var is None:
+            if key in self._produced_variables:
+                return MISSING_NUMERIC
+            self.record_runtime_diagnostic(
+                f"uninitialized:{key}",
+                f"Variable {name} is uninitialized. SASLite used a numeric "
+                "missing value; initialize the variable before reading it.",
+            )
             return MISSING_NUMERIC
+        if key not in self._produced_variables:
+            self.record_runtime_diagnostic(
+                f"uninitialized:{key}",
+                f"Variable {var.metadata.name} is uninitialized. SASLite used "
+                "its missing value; initialize the variable before reading it.",
+            )
         return var.value
 
     def set(self, name: str, value: Any) -> None:
@@ -224,10 +247,73 @@ class PDV:
             )
         return warnings
 
+    def runtime_warnings(self) -> list[str]:
+        """Return aggregated DATA-step diagnostics in first-occurrence order."""
+        warnings: list[str] = []
+        for event in self._runtime_diagnostics.values():
+            location = (
+                f"_N_={event['first_n']}"
+                if event["first_n"] > 0
+                else "initialization"
+            )
+            repeated = (
+                f" The condition occurred {event['count']} times."
+                if event["count"] > 1
+                else ""
+            )
+            warnings.append(
+                f"{event['message']} First occurrence at {location}.{repeated}"
+            )
+        return warnings
+
+    def record_runtime_diagnostic(self, key: str, message: str) -> None:
+        """Aggregate a warning-worthy SAS DATA-step log condition."""
+        event = self._runtime_diagnostics.get(key)
+        if event is None:
+            self._runtime_diagnostics[key] = {
+                "message": message,
+                "first_n": self._n,
+                "count": 1,
+            }
+        else:
+            event["count"] += 1
+
     def _assign_value(self, variable: PDVVariable, value: Any) -> None:
         self._record_character_overflow(variable, value)
+        self._record_assignment_conversion(variable, value)
         variable.value = value
         variable.initialized = True
+
+    def _record_assignment_conversion(
+        self,
+        variable: PDVVariable,
+        value: Any,
+    ) -> None:
+        if is_missing(value):
+            return
+        name = variable.metadata.name
+        dtype = variable.metadata.dtype
+        if dtype == "numeric" and isinstance(value, str):
+            self.record_runtime_diagnostic(
+                f"conversion:char-to-num:{variable.metadata.logical_name}",
+                "Automatic character-to-numeric conversion risk for variable "
+                f"{name}: assigned {self._preview(value)} to a numeric variable. "
+                "SAS would convert it; SASLite preserved the original value for "
+                "validation. Use INPUT() explicitly.",
+            )
+        elif dtype == "character" and isinstance(value, (int, float)):
+            self.record_runtime_diagnostic(
+                f"conversion:num-to-char:{variable.metadata.logical_name}",
+                "Automatic numeric-to-character conversion risk for variable "
+                f"{name}: assigned {self._preview(value)} to a character variable. "
+                "SAS would convert it; SASLite preserved the original value for "
+                "validation. Use PUT() explicitly.",
+            )
+
+    @staticmethod
+    def _preview(value: Any) -> str:
+        preview = repr(value)
+        return preview if len(preview) <= 82 else preview[:79] + "..."
 
     def _record_character_overflow(
         self,
@@ -253,9 +339,7 @@ class PDV:
         key = variable.metadata.logical_name
         event = self._character_overflows.get(key)
         if event is None:
-            preview = repr(value)
-            if len(preview) > 82:
-                preview = preview[:79] + "..."
+            preview = self._preview(value)
             self._character_overflows[key] = {
                 "name": variable.metadata.name,
                 "limit": limit,

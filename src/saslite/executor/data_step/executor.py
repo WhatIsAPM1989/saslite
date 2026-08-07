@@ -15,7 +15,7 @@ from saslite.ast.data_step import (
     SubstrAssignNode, PutNode, UpdateDataNode, CallSymputNode,
     CallMissingNode, ArrayAssignNode, SumStatementNode, LengthNode, AttribNode,
 )
-from saslite.ast.expressions import ArrayRefNode
+from saslite.ast.expressions import ArrayRefNode, VariableNode
 from saslite.ast.proc import ByNode
 from saslite.runtime.pdv import PDV
 from saslite.runtime.dataset import Dataset
@@ -259,7 +259,11 @@ class DataStepExecutor:
                 pdv,
                 input_datasets,
                 in_flag_names,
-                [*set_length_warnings, *pdv.character_length_warnings()],
+                [
+                    *set_length_warnings,
+                    *pdv.character_length_warnings(),
+                    *pdv.runtime_warnings(),
+                ],
             )
 
         except Exception as e:
@@ -276,6 +280,7 @@ class DataStepExecutor:
             for logical_name, var_meta in ds.metadata.variables.items():
                 if logical_name not in pdv.variables:
                     pdv.add_variable(logical_name, deepcopy(var_meta))
+                pdv.mark_produced(logical_name)
 
         # Compile declarative statements into the PDV even when the step has
         # no input observations. This is what gives zero-row output data sets
@@ -321,6 +326,11 @@ class DataStepExecutor:
                         except (TypeError, ValueError):
                             pass
 
+        # SAS decides whether a variable is uninitialized from the compiled
+        # DATA step, not from the branch taken by an individual observation.
+        # Record every executable source before the implicit loop starts.
+        self._mark_produced_variables(step.statements, pdv)
+
         # Process RETAIN statements
         for stmt in step.statements:
             if isinstance(stmt, RetainNode):
@@ -333,8 +343,34 @@ class DataStepExecutor:
                     if init_val is not None:
                         val = ExpressionEvaluator(pdv.get).evaluate(init_val)
                         pdv.set(name, val)
+                        pdv.mark_produced(name)
 
         return pdv
+
+    def _mark_produced_variables(self, statements: list[Any], pdv: PDV) -> None:
+        """Record variables that an executable statement can initialize."""
+        for stmt in statements:
+            if isinstance(stmt, (AssignNode, SumStatementNode, SubstrAssignNode)):
+                pdv.mark_produced(stmt.target)
+            elif isinstance(stmt, DoNode):
+                if stmt.var:
+                    pdv.mark_produced(stmt.var)
+                self._mark_produced_variables(stmt.body, pdv)
+            elif isinstance(stmt, IfNode):
+                if stmt.then_stmt is not None:
+                    self._mark_produced_variables([stmt.then_stmt], pdv)
+                if stmt.else_stmt is not None:
+                    self._mark_produced_variables([stmt.else_stmt], pdv)
+            elif isinstance(stmt, CallMissingNode):
+                for variable in stmt.variables:
+                    if isinstance(variable, VariableNode):
+                        pdv.mark_produced(variable.name)
+            elif isinstance(stmt, InputNode):
+                for name in stmt.variables:
+                    pdv.mark_produced(name)
+            elif isinstance(stmt, ArrayNode) and stmt.initial_values:
+                for name in stmt.variables[:len(stmt.initial_values)]:
+                    pdv.mark_produced(name)
 
     @staticmethod
     def _set_length_warnings(set_groups: list[list[Dataset]]) -> list[str]:
@@ -809,6 +845,9 @@ class DataStepExecutor:
                 target_meta.informat = source_meta.informat
                 target_meta.label = source_meta.label
 
+        # KEEP/DROP select the compile-time (pre-RENAME) variable names in
+        # SAS, regardless of the textual order of the statements.  RENAME is
+        # an output operation and must therefore run after selection.
         for stmt in step.statements:
             if isinstance(stmt, KeepNode):
                 keep = {name.upper() for name in stmt.variables}
@@ -822,7 +861,9 @@ class DataStepExecutor:
                     column for column in out_ds.data.columns
                     if str(column).upper() not in drop
                 ])
-            elif isinstance(stmt, RenameNode):
+
+        for stmt in step.statements:
+            if isinstance(stmt, RenameNode):
                 out_ds = out_ds.rename_columns(stmt.mapping)
 
         for stmt in step.statements:
@@ -991,7 +1032,11 @@ class DataStepExecutor:
             pdv,
             datasets,
             in_flag_names or set(),
-            [*merge_warnings, *pdv.character_length_warnings()],
+            [
+                *merge_warnings,
+                *pdv.character_length_warnings(),
+                *pdv.runtime_warnings(),
+            ],
         )
 
     @staticmethod
@@ -1577,6 +1622,7 @@ class DataStepContext:
                 if pdv.variables.get(name.upper()) is not None
                 else None
             ),
+            diagnostic_callback=pdv.record_runtime_diagnostic,
         )
         self.arrays: dict[str, list[str]] = {}  # array_name → [var_names]
         # Register functions

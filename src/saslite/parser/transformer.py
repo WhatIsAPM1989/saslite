@@ -996,7 +996,9 @@ class SasTransformer(Transformer):
         items_list = _non_tokens(items)
         result_items = []
         for item in items_list:
-            if isinstance(item, tuple):
+            if isinstance(item, list):
+                result_items.extend(item)
+            elif isinstance(item, tuple):
                 result_items.append(item)
             elif isinstance(item, VariableNode):
                 result_items.append((item.name, None))
@@ -1004,9 +1006,22 @@ class SasTransformer(Transformer):
                 result_items.append((item, None))
         return RetainNode(items=result_items)
 
-    def retain_item(self, items: list[Any]) -> tuple[str, Any | None]:
+    def retain_item(
+        self,
+        items: list[Any],
+    ) -> tuple[str, Any | None] | list[tuple[str, Any | None]]:
         name = _get_name(items[0])
-        value = items[1] if len(items) > 1 else None
+        non_tokens = _non_tokens(items)
+        value = non_tokens[1] if len(non_tokens) > 1 else None
+        has_equals = any(
+            isinstance(item, Token) and str(item) == "=" for item in items
+        )
+        # Earley's resolution of ``retain first second third`` can group the
+        # first two bare names as ``NAME expr``.  A bare variable name is not
+        # an initial value in SAS; split that ambiguous form back into two
+        # retained variables.  ``retain first=second`` remains explicit.
+        if isinstance(value, VariableNode) and not has_equals:
+            return [(name, None), (value.name, None)]
         return (name, value)
 
     def where_stmt(self, items: list[Any]) -> WhereNode:
