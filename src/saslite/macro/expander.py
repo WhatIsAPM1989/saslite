@@ -32,7 +32,7 @@ class MacroExpander:
     def __init__(self, session: Any | None = None) -> None:
         self._global_vars: dict[str, str] = {}
         self._local_vars: dict[str, str] = {}
-        self._macro_scopes: list[dict[str, str]] = []
+        self._macro_scopes: list[dict[str, str | None]] = []
         self._macros: dict[str, MacroDef] = {}
         self._put_output: list[str] = []
         self._session = session
@@ -499,7 +499,14 @@ class MacroExpander:
                 else_at + else_match.end(),
             )
 
-        chosen = then_body if self._eval_macro_condition(condition) else else_body
+        condition_result = self._eval_macro_condition(condition)
+        if condition_result is None:
+            # A macro variable populated by a preceding executable step (for
+            # example SELECT INTO or CALL SYMPUTX) is not available yet.  Keep
+            # the complete conditional intact so staged execution can retry
+            # it after that step has run.
+            return source
+        chosen = then_body if condition_result else else_body
         chosen = self._process_conditionals(chosen)
         return source[:if_match.start()] + chosen + source[conditional_end:]
 
@@ -573,10 +580,20 @@ class MacroExpander:
             return then_body
         return else_body
 
-    def _eval_macro_condition(self, condition: str) -> bool:
+    def _eval_macro_condition(self, condition: str) -> bool | None:
         """Evaluate a macro-level condition like 'X = 1' or 'X NE Y'."""
         # Substitute any remaining &vars
         condition = self._substitute_vars(condition)
+
+        # Runtime-created macro variables deliberately remain unresolved
+        # during the first expansion pass.  Likewise, a macro function whose
+        # arguments are not ready is retained for a later staged pass.
+        if re.search(r"&[A-Za-z_]\w*", condition) or re.search(
+            r"%\s*(?:SYSEVALF|EVAL|SYSFUNC)\s*\(",
+            condition,
+            flags=re.IGNORECASE,
+        ):
+            return None
 
         # Handle comparison operators
         for op in ("<>", " NE ", " GE ", " LE ", " GT ", " LT ", ">=", "<=", "=", ">", "<"):
@@ -760,13 +777,16 @@ class MacroExpander:
     @staticmethod
     def _process_local_declarations(
         body: str,
-        scope: dict[str, str],
+        scope: dict[str, str | None],
     ) -> str:
         """Declare blank macro locals and remove their %LOCAL statements."""
         def declare(match: re.Match) -> str:
             for name in re.findall(r"[A-Za-z_]\w*", match.group(1)):
                 # Macro parameters are already local and retain their values.
-                scope.setdefault(name.upper(), "")
+                # None means declared but not assigned.  It must shadow a
+                # same-named outer/global value without resolving ``&name``
+                # to an empty string: an executable step may assign it later.
+                scope.setdefault(name.upper(), None)
             return ""
 
         return re.sub(
@@ -886,67 +906,154 @@ class MacroExpander:
         return source
 
     def _process_do_loops_once(self, source: str) -> str:
-        """Single pass of %DO loop expansion."""
-        # Pattern: %DO var = start %TO end [%BY step]; body %END;
-        pattern = (
-            r"%\s*DO\s+(\w+)\s*=\s*(.*?)\s+%\s*TO\s+(.*?)"
-            r"(?:\s+%\s*BY\s+(.*?))?\s*;(.*?)%\s*END\s*;"
+        """Expand the first iterative %DO using a balanced %DO/%END pair."""
+        masked = self._mask_quoted_text(source)
+        head = re.search(
+            r"%\s*DO\s+(\w+)\s*=",
+            masked,
+            flags=re.IGNORECASE,
         )
+        if head is None:
+            return source
 
-        def expand_loop(match: re.Match) -> str:
-            var_name = match.group(1).upper()
-            start_str = self._substitute_vars(match.group(2).strip())
-            end_str = self._substitute_vars(match.group(3).strip())
-            by_str = match.group(4)
-            body = match.group(5)
-
-            # Process %EVAL in start/end
-            start_str = self._process_eval(start_str)
-            end_str = self._process_eval(end_str)
-
-            try:
-                start = int(float(start_str))
-                end = int(float(end_str))
-            except (ValueError, TypeError):
-                return match.group(0)  # Can't expand, leave as-is
-
-            by = 1
-            if by_str:
-                by_str = self._substitute_vars(by_str.strip())
-                by_str = self._process_eval(by_str)
-                try:
-                    by = int(float(by_str))
-                except (ValueError, TypeError):
-                    by = 1
-            if by == 0:
-                by = 1
-
-            # Expand the loop
-            result_parts = []
-            i = start
-            while (i <= end if by > 0 else i >= end):
-                # Substitute &var with current value in body
-                expanded_body = re.sub(
-                    rf"&{re.escape(var_name)}\b",
-                    str(i),
-                    body,
-                    flags=re.IGNORECASE,
-                )
-                # Also process nested constructs
-                expanded_body = self._substitute_vars(expanded_body)
-                expanded_body = self._process_eval(expanded_body)
-                result_parts.append(expanded_body)
-                i += by
-
-            return "".join(result_parts)
-
-        source = re.sub(
-            pattern,
-            expand_loop,
-            source,
+        header_end = masked.find(";", head.end())
+        if header_end < 0:
+            return source
+        bounds = source[head.end():header_end]
+        bounds_match = re.match(
+            r"\s*(.*?)\s+%\s*TO\b(.*?)(?:\s+%\s*BY\b(.*))?\s*$",
+            bounds,
             flags=re.IGNORECASE | re.DOTALL,
         )
-        return source
+        if bounds_match is None:
+            return source
+
+        body_start = header_end + 1
+        try:
+            body_end, loop_end = self._find_matching_macro_end(masked, body_start)
+        except SyntaxError:
+            return source
+
+        start_str = self._process_eval(
+            self._substitute_vars(bounds_match.group(1).strip())
+        )
+        end_str = self._process_eval(
+            self._substitute_vars(bounds_match.group(2).strip())
+        )
+        try:
+            start = int(float(start_str))
+            end = int(float(end_str))
+        except (ValueError, TypeError):
+            return source
+
+        by = 1
+        by_str = bounds_match.group(3)
+        if by_str:
+            by_str = self._process_eval(self._substitute_vars(by_str.strip()))
+            try:
+                by = int(float(by_str))
+            except (ValueError, TypeError):
+                by = 1
+        if by == 0:
+            by = 1
+
+        body = source[body_start:body_end]
+        result_parts: list[str] = []
+        value = start
+        while value <= end if by > 0 else value >= end:
+            expanded_body = re.sub(
+                rf"&{re.escape(head.group(1))}\b\.?",
+                str(value),
+                body,
+                flags=re.IGNORECASE,
+            )
+            result_parts.append(expanded_body)
+            value += by
+
+        return source[:head.start()] + "".join(result_parts) + source[loop_end:]
+
+    def expand_macro_fragment(self, source: str) -> str:
+        """Expand a continuation known to originate inside an invoked macro.
+
+        This differs from :meth:`expand` only in allowing macro control
+        statements at the fragment boundary.  It is intentionally used by
+        the interpreter's staged runtime, never for user open code.
+        """
+        # A previous invocation may have left a same-named value in the
+        # session.  Within this fragment, an explicit runtime assignment must
+        # happen before its later references resolve, so temporarily hide the
+        # stale value while the fragment is structurally expanded.
+        runtime_names = self._runtime_assigned_macro_names(source)
+        missing = object()
+        saved_local = {
+            name: self._local_vars.pop(name, missing) for name in runtime_names
+        }
+        saved_global = {
+            name: self._global_vars.pop(name, missing) for name in runtime_names
+        }
+        try:
+            source = self._remove_comments(source)
+            source = self._quote_format_literals(source)
+            source = self._process_macro_definitions(source)
+            source = self._process_macro_functions(source)
+            source = self._process_do_loops(source)
+            source = self._process_eval(source)
+            source = self._process_let_statements(source)
+            source = self._process_macro_functions(source)
+            source = self._substitute_vars(source)
+            source = self._process_conditionals(source)
+            source = self._process_put_statements(source)
+            source = self._expand_macro_invocations(source)
+            source = self._process_macro_functions(source)
+            source = self._process_do_loops(source)
+            source = self._process_eval(source)
+            source = self._process_let_statements(source)
+            source = self._substitute_vars(source)
+            source = self._process_conditionals(source)
+            source = self._process_put_statements(source)
+            source = self._substitute_vars(source)
+            return self._unquote_macro_value(source)
+        finally:
+            for name, value in saved_local.items():
+                if value is not missing and name not in self._local_vars:
+                    self._local_vars[name] = value
+            for name, value in saved_global.items():
+                if value is not missing and name not in self._global_vars:
+                    self._global_vars[name] = value
+
+    @staticmethod
+    def _runtime_assigned_macro_names(source: str) -> set[str]:
+        """Collect runtime targets assigned before their first reference."""
+        assignments: dict[str, int] = {}
+        for match in re.finditer(
+            r"\bCALL\s+SYMPUTX?\s*\(\s*(['\"])([A-Za-z_]\w*)\1\s*,",
+            source,
+            flags=re.IGNORECASE,
+        ):
+            name = match.group(2).upper()
+            assignments[name] = min(assignments.get(name, match.start()), match.start())
+        for into in re.finditer(
+            r"\bINTO\b(.*?)\bFROM\b",
+            source,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            for name in re.findall(r":\s*([A-Za-z_]\w*)", into.group(1)):
+                key = name.upper()
+                assignments[key] = min(
+                    assignments.get(key, into.start()),
+                    into.start(),
+                )
+
+        deferred: set[str] = set()
+        for name, assignment_at in assignments.items():
+            reference = re.search(
+                rf"&{re.escape(name)}(?:\.|\b)",
+                source,
+                flags=re.IGNORECASE,
+            )
+            if reference is not None and assignment_at < reference.start():
+                deferred.add(name)
+        return deferred
 
     # ── Macro character functions & %SYSFUNC ──────────
 

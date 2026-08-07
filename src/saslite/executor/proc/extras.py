@@ -437,8 +437,33 @@ def handle_proc_copy(proc: ProcNode, session: Session, reporter: Reporter) -> St
 
 
 def handle_proc_format(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
-    """PROC FORMAT — define custom value formats (VALUE statement)."""
-    defined = []
+    """PROC FORMAT — define custom formats from CNTLIN= and VALUE statements."""
+    defined: list[str] = []
+    warnings: list[str] = []
+
+    cntlin = proc.options.get("CNTLIN")
+    if cntlin:
+        if isinstance(cntlin, DatasetRefNode):
+            libref, member = cntlin.libref, cntlin.name
+        else:
+            libref, member = _split_name(cntlin)
+        try:
+            control = session.get_dataset(libref, member)
+        except KeyError:
+            return StepResult(
+                success=False,
+                error=f"CNTLIN dataset {libref.upper()}.{member.upper()} does not exist",
+            )
+        try:
+            cntlin_defined, cntlin_warnings = _load_cntlin_formats(
+                session,
+                control.data,
+            )
+        except ValueError as exc:
+            return StepResult(success=False, error=str(exc))
+        defined.extend(cntlin_defined)
+        warnings.extend(cntlin_warnings)
+
     for stmt in proc.statements:
         if not (isinstance(stmt, dict) and stmt.get("action") == "value"):
             continue
@@ -455,12 +480,115 @@ def handle_proc_format(proc: ProcNode, session: Session, reporter: Reporter) -> 
         defined.append(key.upper())
 
     if not defined:
-        return StepResult(success=False, error="PROC FORMAT requires at least one VALUE statement")
+        return StepResult(
+            success=False,
+            error="PROC FORMAT requires CNTLIN= data or at least one VALUE statement",
+        )
 
     return StepResult(
         success=True,
         notes=[f"Format(s) defined: {', '.join(defined)}"],
+        warnings=warnings,
     )
+
+
+def _load_cntlin_formats(
+    session: Session,
+    frame: pd.DataFrame,
+) -> tuple[list[str], list[str]]:
+    """Load the commonly used CNTLIN control columns into the session catalog."""
+    columns = {str(column).upper(): column for column in frame.columns}
+    required = [name for name in ("FMTNAME", "START", "LABEL") if name not in columns]
+    if required:
+        raise ValueError(
+            "PROC FORMAT CNTLIN= requires column(s): " + ", ".join(required)
+        )
+
+    def value(row: pd.Series, name: str, default: Any = "") -> Any:
+        column = columns.get(name)
+        if column is None:
+            return default
+        result = row[column]
+        try:
+            if pd.isna(result):
+                return default
+        except (TypeError, ValueError):
+            pass
+        return result
+
+    defined: list[str] = []
+    warnings: list[str] = []
+    skipped_types: set[str] = set()
+    initialized: set[str] = set()
+    for _, row in frame.iterrows():
+        fmt_name = str(value(row, "FMTNAME")).strip()
+        if not fmt_name:
+            continue
+        raw_type = str(value(row, "TYPE", "N")).strip().upper() or "N"
+        if raw_type[:1] not in {"C", "N"}:
+            skipped_types.add(raw_type)
+            continue
+
+        is_char = raw_type.startswith("C") or fmt_name.startswith("$")
+        fmt_name = fmt_name.lstrip("$").upper()
+        key = f"${fmt_name}" if is_char else fmt_name
+        if key not in initialized:
+            session._formats[key] = {"char": is_char, "ranges": []}
+            initialized.add(key)
+        if key not in defined:
+            defined.append(key)
+
+        label = str(value(row, "LABEL"))
+        hlo = str(value(row, "HLO")).strip().upper()
+        start = value(row, "START", None)
+        end = value(row, "END", start)
+        if end is None or end == "":
+            end = start
+
+        if "O" in hlo:
+            range_key = ("other", None, None)
+        elif is_char:
+            lower = "" if "L" in hlo else str(start)
+            upper = None if "H" in hlo else str(end)
+            range_key = (
+                ("exact", lower, None)
+                if upper is not None and lower == upper
+                else ("range", lower, upper)
+            )
+        else:
+            lower = float("-inf") if "L" in hlo else _cntlin_number(start)
+            upper = float("inf") if "H" in hlo else _cntlin_number(end)
+            range_key = (
+                ("exact", lower, None)
+                if lower == upper
+                else ("range", lower, upper)
+            )
+
+        session._formats[key]["ranges"].append({
+            "keys": [range_key],
+            "label": label,
+            "sexcl": str(value(row, "SEXCL", "N")).strip().upper() == "Y",
+            "eexcl": str(value(row, "EEXCL", "N")).strip().upper() == "Y",
+        })
+
+    if skipped_types:
+        warnings.append(
+            "Unsupported CNTLIN TYPE values skipped: " + ", ".join(sorted(skipped_types))
+        )
+    return defined, warnings
+
+
+def _cntlin_number(value: Any) -> float:
+    """Convert a CNTLIN numeric boundary, including LOW/HIGH spellings."""
+    text = str(value).strip().upper()
+    if text == "LOW":
+        return float("-inf")
+    if text == "HIGH":
+        return float("inf")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
 
 
 def apply_custom_format(session: Session, fmt_name: str, value: Any) -> str | None:
@@ -477,7 +605,7 @@ def apply_custom_format(session: Session, fmt_name: str, value: Any) -> str | No
                 other_label = label
             elif kind == "exact":
                 if fmt["char"]:
-                    if str(value) == str(lo):
+                    if str(value).rstrip() == str(lo).rstrip():
                         return label
                 else:
                     try:
@@ -487,8 +615,21 @@ def apply_custom_format(session: Session, fmt_name: str, value: Any) -> str | No
                         pass
             elif kind == "range":
                 try:
-                    v = float(value)
-                    if (lo is None or v >= lo) and (hi is None or v <= hi):
+                    if fmt["char"]:
+                        v = str(value).rstrip()
+                        lower = None if lo is None else str(lo).rstrip()
+                        upper = None if hi is None else str(hi).rstrip()
+                    else:
+                        v = float(value)
+                        lower = lo
+                        upper = hi
+                    lower_ok = lower is None or (
+                        v > lower if rng.get("sexcl") else v >= lower
+                    )
+                    upper_ok = upper is None or (
+                        v < upper if rng.get("eexcl") else v <= upper
+                    )
+                    if lower_ok and upper_ok:
                         return label
                 except (TypeError, ValueError):
                     pass

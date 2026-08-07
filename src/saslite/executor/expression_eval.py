@@ -18,8 +18,10 @@ class ExpressionEvaluator:
     """Evaluates expression AST nodes against a variable context."""
 
     def __init__(self, var_getter: Callable[[str], Any] | None = None,
-                 session: Any = None) -> None:
+                 session: Any = None,
+                 variable_metadata_getter: Callable[[str], Any] | None = None) -> None:
         self._get_var = var_getter or (lambda name: None)
+        self._get_variable_metadata = variable_metadata_getter or (lambda name: None)
         self._functions: dict[str, Callable] = {}
         self._session = session
         self._arrays: dict[str, list] = {}
@@ -168,6 +170,37 @@ class ExpressionEvaluator:
 
     def _eval_func_call(self, node: FunctionCallNode) -> Any:
         name = node.name.upper()
+        if name == "VLABEL":
+            if len(node.args) != 1 or not isinstance(node.args[0], VariableNode):
+                raise ExecutionError("VLABEL requires a variable reference")
+            variable_name = node.args[0].name
+            metadata = self._get_variable_metadata(variable_name)
+            if metadata is None:
+                raise ExecutionError(f"VLABEL: variable {variable_name} not found")
+            return metadata.label or metadata.name
+
+        if name == "VVALUE":
+            if len(node.args) != 1 or not isinstance(node.args[0], VariableNode):
+                raise ExecutionError("VVALUE requires a variable reference")
+            variable_name = node.args[0].name
+            metadata = self._get_variable_metadata(variable_name)
+            if metadata is None:
+                raise ExecutionError(f"VVALUE: variable {variable_name} not found")
+            value = self.evaluate(node.args[0])
+            format_name = metadata.format
+            if format_name and self._session is not None:
+                from saslite.executor.proc.extras import apply_custom_format
+                formatted = apply_custom_format(self._session, format_name, value)
+                if formatted is not None:
+                    return formatted
+            if format_name:
+                put_function = self._functions.get("PUT")
+                if put_function is not None:
+                    return put_function(value, format_name)
+            if is_missing(value):
+                return ""
+            return str(value)
+
         if name == "IN":
             # Special handling for IN operator
             if len(node.args) < 2:
@@ -200,7 +233,6 @@ class ExpressionEvaluator:
             if len(node.args) < 1:
                 raise ExecutionError("DIM requires an array name")
             # The argument should be a variable node representing the array name
-            from saslite.ast.expressions import VariableNode
             if isinstance(node.args[0], VariableNode):
                 array_name = node.args[0].name.upper()
                 if array_name in self._array_vars:

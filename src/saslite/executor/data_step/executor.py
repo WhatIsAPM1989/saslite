@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import pandas as pd
@@ -252,118 +253,14 @@ class DataStepExecutor:
                         # Implicit OUTPUT
                         eval_ctx.output_rows.append(pdv.snapshot_output_row())
 
-            # Build output dataset
-            output_rows = eval_ctx.output_rows
-            if output_rows:
-                df = pd.DataFrame(output_rows)
-            else:
-                # A zero-observation DATA step still has its compiled PDV
-                # schema (notably when SET reads an empty input data set).
-                df = pd.DataFrame(columns=[
-                    variable.metadata.name for variable in pdv.variables.values()
-                ])
-
-            # IN= variables exist in the PDV for conditional processing but,
-            # like SAS automatic variables, are not written to the output data set.
-            if in_flag_names:
-                df = df.drop(columns=[
-                    column for column in df.columns
-                    if str(column).upper() in in_flag_names
-                ], errors="ignore")
-
-            out_ds = Dataset.from_dataframe(df, name=target_name, libref=target_libref)
-
-            # A SAS SET statement carries variable attributes into the output
-            # PDV. Preserve metadata from the first contributing input data set;
-            # explicit FORMAT/LABEL/LENGTH/ATTRIB statements below may override
-            # these inherited values.
-            for column in out_ds.data.columns:
-                target_meta = out_ds.metadata.get_variable(str(column))
-                if target_meta is None:
-                    continue
-                for input_ds in input_datasets:
-                    source_meta = input_ds.metadata.get_variable(str(column))
-                    if source_meta is None:
-                        continue
-                    target_meta.length = source_meta.length
-                    target_meta.format = source_meta.format
-                    target_meta.informat = source_meta.informat
-                    target_meta.label = source_meta.label
-                    break
-
-            # Apply KEEP/DROP/RENAME
-            for stmt in step.statements:
-                if isinstance(stmt, KeepNode):
-                    keep_cols = [c.upper() for c in stmt.variables]
-                    actual = [c for c in df.columns if c.upper() in keep_cols]
-                    out_ds = out_ds.select_columns(actual)
-                elif isinstance(stmt, DropNode):
-                    drop_cols = [c.upper() for c in stmt.variables]
-                    actual = [c for c in df.columns if c.upper() not in drop_cols]
-                    out_ds = out_ds.select_columns(actual)
-                elif isinstance(stmt, RenameNode):
-                    out_ds = out_ds.rename_columns(stmt.mapping)
-
-            # Apply FORMAT metadata
-            if format_items:
-                for var_name, fmt in format_items:
-                    key = var_name.upper()
-                    if key in out_ds.metadata.variables:
-                        out_ds.metadata.variables[key].format = fmt
-
-            # Apply LABEL metadata
-            if label_items:
-                for var_name, lbl in label_items:
-                    key = var_name.upper()
-                    if key in out_ds.metadata.variables:
-                        out_ds.metadata.variables[key].label = lbl
-
-            # Apply LENGTH metadata
-            for stmt in step.statements:
-                if isinstance(stmt, LengthNode):
-                    for var_name, length in stmt.items:
-                        key = var_name.upper()
-                        if key in out_ds.metadata.variables:
-                            if length is not None:
-                                out_ds.metadata.variables[key].length = length
-
-            # Apply ATTRIB metadata
-            for stmt in step.statements:
-                if isinstance(stmt, AttribNode):
-                    for item in stmt.items:
-                        # item is (var_name, attr_type, attr_value)
-                        var_name, attr_type, attr_value = item
-                        key = var_name.upper()
-                        if key in out_ds.metadata.variables:
-                            var_meta = out_ds.metadata.variables[key]
-                            if attr_type == "FORMAT":
-                                var_meta.format = attr_value
-                            elif attr_type == "LABEL":
-                                var_meta.label = attr_value
-                            elif attr_type == "LENGTH":
-                                try:
-                                    var_meta.length = int(attr_value)
-                                except (ValueError, TypeError):
-                                    pass
-                            elif attr_type == "INFORMAT":
-                                var_meta.informat = attr_value
-
-            # Store output
-            if target_name:
-                self.session.put_dataset(target_libref, target_name, out_ds)
-                return StepResult(
-                    success=True,
-                    dataset_name=f"{target_libref}.{target_name}",
-                    rows_affected=out_ds.nrow,
-                    notes=[f"Dataset {target_libref}.{target_name} created with {out_ds.nrow} observations and {out_ds.ncol} variables."],
-                    warnings=set_length_warnings,
-                )
-            else:
-                return StepResult(
-                    success=True,
-                    rows_affected=0,
-                    warnings=set_length_warnings,
-                )
+            return self._store_declared_outputs(
+                step,
+                eval_ctx,
+                pdv,
+                input_datasets,
+                in_flag_names,
+                set_length_warnings,
+            )
 
         except Exception as e:
             return StepResult(success=False, error=str(e))
@@ -376,7 +273,51 @@ class DataStepExecutor:
         for ds in inputs:
             for logical_name, var_meta in ds.metadata.variables.items():
                 if logical_name not in pdv.variables:
-                    pdv.add_variable(logical_name, var_meta)
+                    pdv.add_variable(logical_name, deepcopy(var_meta))
+
+        # Compile declarative statements into the PDV even when the step has
+        # no input observations. This is what gives zero-row output data sets
+        # their schema and variable attributes.
+        for stmt in step.statements:
+            if isinstance(stmt, LengthNode):
+                for name, length in stmt.items:
+                    dtype = (
+                        "character"
+                        if name.upper() in stmt.character_variables
+                        else "numeric"
+                    )
+                    variable = pdv.ensure_variable(name, dtype=dtype)
+                    if length is not None:
+                        variable.metadata.length = length
+            elif isinstance(stmt, FormatNode):
+                for name, format_name in stmt.items:
+                    dtype = "character" if str(format_name).startswith("$") else "numeric"
+                    variable = pdv.ensure_variable(name, dtype=dtype)
+                    variable.metadata.format = format_name
+            elif isinstance(stmt, LabelNode):
+                for name, label in stmt.items:
+                    variable = pdv.ensure_variable(name)
+                    variable.metadata.label = label
+            elif isinstance(stmt, AttribNode):
+                for name, attribute, value in stmt.items:
+                    dtype = (
+                        "character"
+                        if attribute in ("FORMAT", "INFORMAT")
+                        and str(value).startswith("$")
+                        else "numeric"
+                    )
+                    variable = pdv.ensure_variable(name, dtype=dtype)
+                    if attribute == "FORMAT":
+                        variable.metadata.format = value
+                    elif attribute == "INFORMAT":
+                        variable.metadata.informat = value
+                    elif attribute == "LABEL":
+                        variable.metadata.label = value
+                    elif attribute == "LENGTH":
+                        try:
+                            variable.metadata.length = int(value)
+                        except (TypeError, ValueError):
+                            pass
 
         # Process RETAIN statements
         for stmt in step.statements:
@@ -724,6 +665,11 @@ class DataStepExecutor:
 
     def _register_array(self, stmt: ArrayNode, ctx: DataStepContext) -> None:
         """Register an ARRAY statement — link array name to variable list."""
+        if stmt.temporary:
+            values = [ctx.evaluator.evaluate(value) for value in stmt.initial_values]
+            ctx.evaluator.register_array(stmt.name, values)
+            return
+
         var_names = [v.upper() for v in stmt.variables]
         ctx.arrays[stmt.name.upper()] = var_names
         # Register variable list for DIM() and OF arr[*] expansion
@@ -741,19 +687,204 @@ class DataStepExecutor:
             make_array_accessor(stmt.name, var_names, ctx.pdv),
         )
 
+        for variable, initial_value in zip(var_names, stmt.initial_values):
+            ctx.pdv.set(variable, ctx.evaluator.evaluate(initial_value))
+
     def _resolve_ds_name(self, ref: DatasetRefNode) -> str:
         return f"{ref.libref.upper()}.{ref.name.upper()}"
 
     @staticmethod
+    def _split_output_target(target: str) -> tuple[str, str]:
+        full = target.upper()
+        if "." in full:
+            return tuple(full.split(".", 1))  # type: ignore[return-value]
+        return "WORK", full
+
+    def _store_declared_outputs(
+        self,
+        step: DataStepNode,
+        ctx: DataStepContext,
+        pdv: PDV,
+        input_datasets: list[Dataset],
+        in_flag_names: set[str],
+        warnings: list[str] | None = None,
+    ) -> StepResult:
+        """Materialize every DATA target using named and broadcast OUTPUT rows."""
+        targets = [step.target, *step.extra_targets]
+        declared = {
+            key
+            for target in targets
+            if target.upper() != "_NULL_"
+            for key in (
+                target.upper(),
+                self._split_output_target(target)[1],
+            )
+        }
+        unknown = sorted(set(ctx.target_rows) - declared)
+        if unknown:
+            return StepResult(
+                success=False,
+                error=f"OUTPUT target(s) not declared in DATA statement: {', '.join(unknown)}",
+            )
+
+        notes: list[str] = []
+        total_rows = 0
+        primary_name = ""
+        for target in targets:
+            if target.upper() == "_NULL_":
+                continue
+            libref, member = self._split_output_target(target)
+            full_name = f"{libref}.{member}"
+            rows = list(ctx.output_rows)
+            for key in {target.upper(), member, full_name}:
+                rows.extend(ctx.target_rows.get(key, []))
+            out_ds = self._build_output_dataset(
+                rows,
+                member,
+                libref,
+                step,
+                pdv,
+                input_datasets,
+                in_flag_names,
+            )
+            self.session.put_dataset(libref, member, out_ds)
+            primary_name = primary_name or full_name
+            total_rows += out_ds.nrow
+            notes.append(
+                f"Dataset {full_name} created with {out_ds.nrow} observations "
+                f"and {out_ds.ncol} variables."
+            )
+
+        return StepResult(
+            success=True,
+            dataset_name=primary_name or None,
+            rows_affected=total_rows,
+            notes=notes,
+            warnings=warnings or [],
+        )
+
+    def _build_output_dataset(
+        self,
+        rows: list[dict[str, Any]],
+        member: str,
+        libref: str,
+        step: DataStepNode,
+        pdv: PDV,
+        input_datasets: list[Dataset],
+        in_flag_names: set[str],
+    ) -> Dataset:
+        if rows:
+            df = pd.DataFrame(rows)
+        else:
+            df = pd.DataFrame(columns=[
+                variable.metadata.name for variable in pdv.variables.values()
+            ])
+        if in_flag_names:
+            df = df.drop(columns=[
+                column for column in df.columns
+                if str(column).upper() in in_flag_names
+            ], errors="ignore")
+
+        out_ds = Dataset.from_dataframe(df, name=member, libref=libref)
+        for column in out_ds.data.columns:
+            target_meta = out_ds.metadata.get_variable(str(column))
+            if target_meta is None:
+                continue
+            for input_ds in input_datasets:
+                source_meta = input_ds.metadata.get_variable(str(column))
+                if source_meta is not None:
+                    target_meta.length = source_meta.length
+                    target_meta.format = source_meta.format
+                    target_meta.informat = source_meta.informat
+                    target_meta.label = source_meta.label
+                    break
+            pdv_variable = pdv.variables.get(str(column).upper())
+            if pdv_variable is not None:
+                source_meta = pdv_variable.metadata
+                target_meta.dtype = source_meta.dtype
+                target_meta.length = source_meta.length
+                target_meta.format = source_meta.format
+                target_meta.informat = source_meta.informat
+                target_meta.label = source_meta.label
+
+        for stmt in step.statements:
+            if isinstance(stmt, KeepNode):
+                keep = {name.upper() for name in stmt.variables}
+                out_ds = out_ds.select_columns([
+                    column for column in out_ds.data.columns
+                    if str(column).upper() in keep
+                ])
+            elif isinstance(stmt, DropNode):
+                drop = {name.upper() for name in stmt.variables}
+                out_ds = out_ds.select_columns([
+                    column for column in out_ds.data.columns
+                    if str(column).upper() not in drop
+                ])
+            elif isinstance(stmt, RenameNode):
+                out_ds = out_ds.rename_columns(stmt.mapping)
+
+        for stmt in step.statements:
+            if isinstance(stmt, FormatNode):
+                metadata_items = [(name, "FORMAT", value) for name, value in stmt.items]
+            elif isinstance(stmt, LabelNode):
+                metadata_items = [(name, "LABEL", value) for name, value in stmt.items]
+            elif isinstance(stmt, LengthNode):
+                metadata_items = [(name, "LENGTH", value) for name, value in stmt.items]
+            elif isinstance(stmt, AttribNode):
+                metadata_items = stmt.items
+            else:
+                continue
+            for name, attribute, value in metadata_items:
+                variable = out_ds.metadata.get_variable(name)
+                if variable is None or value is None:
+                    continue
+                if attribute == "FORMAT":
+                    variable.format = value
+                elif attribute == "LABEL":
+                    variable.label = value
+                elif attribute == "INFORMAT":
+                    variable.informat = value
+                elif attribute == "LENGTH":
+                    try:
+                        variable.length = int(value)
+                    except (TypeError, ValueError):
+                        pass
+        return out_ds
+
+    @staticmethod
     def _apply_dataset_options(ds, options):
-        """Apply RENAME=, KEEP=, DROP= dataset options."""
+        """Apply input data set options before DATA-step iteration."""
         if not options:
             return ds
+
+        firstobs = 1
+        obs: int | None = None
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            if "FIRSTOBS" in opt:
+                firstobs = int(opt["FIRSTOBS"])
+            if "OBS" in opt:
+                obs = int(opt["OBS"])
+
+        # SAS observation numbers are one-based and OBS= is inclusive. Apply
+        # the range once, independently of the textual order of other options.
+        ds = ds.copy()
+        stop = obs if obs is not None else None
+        ds.data = ds.data.iloc[firstobs - 1:stop].reset_index(drop=True)
+        ds.metadata.row_count = len(ds.data)
+
         for opt in options:
             if not isinstance(opt, dict):
                 continue
             if "RENAME" in opt:
-                ds = ds.rename_columns(opt["RENAME"])
+                columns = {str(column).upper(): column for column in ds.data.columns}
+                rename = {
+                    columns[str(old).upper()]: new
+                    for old, new in opt["RENAME"].items()
+                    if str(old).upper() in columns
+                }
+                ds = ds.rename_columns(rename)
             if "KEEP" in opt:
                 keep_cols = [c.upper() for c in opt["KEEP"]]
                 actual = [c for c in ds.data.columns if c.upper() in keep_cols]
@@ -762,14 +893,6 @@ class DataStepExecutor:
                 drop_cols = [c.upper() for c in opt["DROP"]]
                 actual = [c for c in ds.data.columns if c.upper() not in drop_cols]
                 ds = ds.select_columns(actual)
-        if "KEEP" in options:
-            keep_cols = [c.upper() for c in options["KEEP"]]
-            actual = [c for c in ds.data.columns if c.upper() in keep_cols]
-            ds = ds.select_columns(actual)
-        if "DROP" in options:
-            drop_cols = [c.upper() for c in options["DROP"]]
-            actual = [c for c in ds.data.columns if c.upper() not in drop_cols]
-            ds = ds.select_columns(actual)
         return ds
 
     @staticmethod
@@ -798,47 +921,11 @@ class DataStepExecutor:
             return StepResult(success=False, error="MERGE requires at least one dataset")
 
         if by_vars and len(datasets) >= 2:
-            # Match-merge: join on BY variables
-            left_df = datasets[0].data.copy()
-            for ds in datasets[1:]:
-                right_df = ds.data.copy()
-                # Case-insensitive column matching for BY vars
-                left_by = []
-                right_by = []
-                for bv in by_vars:
-                    lv = self._find_col(left_df, bv)
-                    rv = self._find_col(right_df, bv)
-                    if lv and rv:
-                        left_by.append(lv)
-                        right_by.append(rv)
-
-                if left_by and right_by:
-                    # Columns to merge (exclude BY from right to avoid duplicates)
-                    right_cols = [c for c in right_df.columns if c not in right_by]
-                    # SAS MERGE: when both datasets contribute the same non-BY
-                    # variable, the LATER (right) dataset's value wins. Merge with
-                    # the left side suffixed, then coalesce right-over-left.
-                    overlap_cols = [c for c in right_cols if c in left_df.columns]
-                    left_df = left_df.merge(
-                        right_df[right_by + right_cols],
-                        left_on=left_by, right_on=right_by,
-                        how="outer", suffixes=("_x", ""),
-                    )
-                    for c in overlap_cols:
-                        xcol = f"{c}_x"
-                        if xcol in left_df.columns and c in left_df.columns:
-                            # right value (c) wins; fall back to left (_x) when right is missing
-                            left_df[c] = left_df[c].where(left_df[c].notna(), left_df[xcol])
-                            left_df = left_df.drop(columns=[xcol])
-                else:
-                    # No matching BY columns, concatenate columns
-                    right_df = right_df.drop(columns=right_by, errors="ignore")
-                    min_rows = min(len(left_df), len(right_df))
-                    left_df = pd.concat(
-                        [left_df.iloc[:min_rows].reset_index(drop=True),
-                         right_df.iloc[:min_rows].reset_index(drop=True)],
-                        axis=1,
-                    )
+            left_df = self._match_merge_frames(datasets, by_vars)
+            for flag_name in in_flag_names or set():
+                actual = self._find_col(left_df, flag_name)
+                if actual is not None:
+                    left_df[actual] = left_df[actual].fillna(0)
         elif len(datasets) >= 2:
             # One-to-one merge (no BY)
             dfs = [ds.data.copy() for ds in datasets]
@@ -893,79 +980,116 @@ class DataStepExecutor:
             if not pdv.delete_flag and not has_explicit_output:
                 eval_ctx.output_rows.append(pdv.snapshot_output_row())
 
-        # Build output
-        if eval_ctx.output_rows:
-            df = pd.DataFrame(eval_ctx.output_rows)
-        else:
-            df = pd.DataFrame(columns=[
-                variable.metadata.name for variable in pdv.variables.values()
-            ])
+        return self._store_declared_outputs(
+            step,
+            eval_ctx,
+            pdv,
+            datasets,
+            in_flag_names or set(),
+        )
 
-        if in_flag_names:
-            df = df.drop(columns=[
-                column for column in df.columns
-                if str(column).upper() in in_flag_names
-            ], errors="ignore")
+    def _match_merge_frames(
+        self,
+        datasets: list[Dataset],
+        by_vars: list[str],
+    ) -> pd.DataFrame:
+        """SAS-style match merge without pandas suffix columns.
 
-        out_ds = Dataset.from_dataframe(df, name=target_name, libref=target_libref)
+        Rows with the same BY values are aligned by their position within the
+        group. Shorter inputs retain their last observation for the remainder
+        of that BY group. When inputs share a non-BY variable, the later input
+        in the MERGE statement overwrites the PDV value, including with a
+        missing value.
+        """
+        keys = [name.upper() for name in by_vars]
+        occurrence = "__SASLITE_MERGE_ROW__"
+        prepared: list[pd.DataFrame] = []
 
-        # Apply KEEP/DROP/RENAME
-        for stmt in step.statements:
-            if isinstance(stmt, KeepNode):
-                keep_cols = [c.upper() for c in stmt.variables]
-                actual = [c for c in df.columns if c.upper() in keep_cols]
-                out_ds = out_ds.select_columns(actual)
-            elif isinstance(stmt, DropNode):
-                drop_cols = [c.upper() for c in stmt.variables]
-                actual = [c for c in df.columns if c.upper() not in drop_cols]
-                out_ds = out_ds.select_columns(actual)
-            elif isinstance(stmt, RenameNode):
-                out_ds = out_ds.rename_columns(stmt.mapping)
+        for dataset in datasets:
+            frame = dataset.data.copy()
+            column_map = {str(column).upper(): column for column in frame.columns}
+            missing = [name for name in keys if name not in column_map]
+            if missing:
+                raise ValueError(
+                    f"BY variable(s) {', '.join(missing)} not found in "
+                    f"dataset {dataset.name}"
+                )
+            frame = frame.rename(columns={column_map[name]: name for name in keys})
+            frame[occurrence] = frame.groupby(
+                keys,
+                sort=False,
+                dropna=False,
+            ).cumcount()
+            prepared.append(frame)
 
-        # Apply FORMAT/LABEL metadata
-        for stmt in step.statements:
-            if isinstance(stmt, FormatNode):
-                for var_name, fmt in stmt.items:
-                    key = var_name.upper()
-                    if key in out_ds.metadata.variables:
-                        out_ds.metadata.variables[key].format = fmt
-            elif isinstance(stmt, LabelNode):
-                for var_name, lbl in stmt.items:
-                    key = var_name.upper()
-                    if key in out_ds.metadata.variables:
-                        out_ds.metadata.variables[key].label = lbl
-            elif isinstance(stmt, LengthNode):
-                for var_name, length in stmt.items:
-                    key = var_name.upper()
-                    if key in out_ds.metadata.variables and length is not None:
-                        out_ds.metadata.variables[key].length = length
-            elif isinstance(stmt, AttribNode):
-                for item in stmt.items:
-                    var_name, attr_type, attr_value = item
-                    key = var_name.upper()
-                    if key in out_ds.metadata.variables:
-                        var_meta = out_ds.metadata.variables[key]
-                        if attr_type == "FORMAT":
-                            var_meta.format = attr_value
-                        elif attr_type == "LABEL":
-                            var_meta.label = attr_value
-                        elif attr_type == "LENGTH":
-                            try:
-                                var_meta.length = int(attr_value)
-                            except (ValueError, TypeError):
-                                pass
-                        elif attr_type == "INFORMAT":
-                            var_meta.informat = attr_value
+        scaffold_parts = [frame[keys + [occurrence]] for frame in prepared]
+        scaffold = pd.concat(scaffold_parts, ignore_index=True).drop_duplicates()
+        if not scaffold.empty:
+            try:
+                scaffold = scaffold.sort_values(
+                    keys + [occurrence],
+                    kind="stable",
+                ).reset_index(drop=True)
+            except TypeError:
+                scaffold = scaffold.reset_index(drop=True)
 
-        if target_name:
-            self.session.put_dataset(target_libref, target_name, out_ds)
-            return StepResult(
-                success=True,
-                dataset_name=f"{target_libref}.{target_name}",
-                rows_affected=out_ds.nrow,
-                notes=[f"Dataset {target_libref}.{target_name} created with {out_ds.nrow} observations and {out_ds.ncol} variables."],
+        result = scaffold.copy()
+        output_columns: dict[str, str] = {}
+        for dataset_index, frame in enumerate(prepared):
+            non_by = [
+                column for column in frame.columns
+                if column not in keys and column != occurrence
+            ]
+            temporary = {
+                column: f"__SASLITE_{dataset_index}_{position}__"
+                for position, column in enumerate(non_by)
+            }
+            actual_marker = f"__SASLITE_ACTUAL_{dataset_index}__"
+            current = frame[keys + [occurrence] + non_by].rename(columns=temporary)
+            current[actual_marker] = 1
+            expanded = scaffold.merge(
+                current,
+                on=keys + [occurrence],
+                how="left",
+                sort=False,
             )
-        return StepResult(success=True, rows_affected=0)
+
+            present_marker = f"__SASLITE_PRESENT_{dataset_index}__"
+            present = frame[keys].drop_duplicates().copy()
+            present[present_marker] = 1
+            expanded = expanded.merge(present, on=keys, how="left", sort=False)
+            contributes = expanded[present_marker].eq(1)
+
+            last_columns = {
+                column: f"__SASLITE_LAST_{dataset_index}_{position}__"
+                for position, column in enumerate(non_by)
+            }
+            last = (
+                frame.groupby(keys, sort=False, dropna=False)
+                .tail(1)[keys + non_by]
+                .rename(columns=last_columns)
+            )
+            expanded = expanded.merge(last, on=keys, how="left", sort=False)
+            repeat_last = expanded[actual_marker].isna() & contributes
+
+            for column in non_by:
+                logical_name = str(column).upper()
+                value = expanded[temporary[column]].where(
+                    ~repeat_last,
+                    expanded[last_columns[column]],
+                )
+                output_name = output_columns.get(logical_name)
+                if output_name is None:
+                    output_name = str(column)
+                    output_columns[logical_name] = output_name
+                    result[output_name] = value
+                else:
+                    result[output_name] = value.where(
+                        contributes,
+                        result[output_name],
+                    )
+
+        return result.drop(columns=[occurrence])
 
     def _build_datalines_dataset(self, step: DataStepNode, input_node: InputNode) -> Dataset:
         """Build a dataset from INPUT + DATALINES, to be fed into the implicit loop."""
@@ -1366,7 +1490,15 @@ class DataStepContext:
         # OUTPUT <dataset>; rows keyed by upper-cased target name
         self.target_rows: dict[str, list[dict[str, Any]]] = {}
         self.lag_state = lag_state
-        self.evaluator = ExpressionEvaluator(var_getter=pdv.get, session=session)
+        self.evaluator = ExpressionEvaluator(
+            var_getter=pdv.get,
+            session=session,
+            variable_metadata_getter=lambda name: (
+                pdv.variables.get(name.upper()).metadata
+                if pdv.variables.get(name.upper()) is not None
+                else None
+            ),
+        )
         self.arrays: dict[str, list[str]] = {}  # array_name → [var_names]
         # Register functions
         for name in fn_registry.names:
