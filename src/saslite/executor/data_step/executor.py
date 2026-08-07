@@ -920,7 +920,9 @@ class DataStepExecutor:
         if not datasets:
             return StepResult(success=False, error="MERGE requires at least one dataset")
 
+        merge_warnings: list[str] = []
         if by_vars and len(datasets) >= 2:
+            merge_warnings = self._many_to_many_merge_warnings(datasets, by_vars)
             left_df = self._match_merge_frames(datasets, by_vars)
             for flag_name in in_flag_names or set():
                 actual = self._find_col(left_df, flag_name)
@@ -986,7 +988,81 @@ class DataStepExecutor:
             pdv,
             datasets,
             in_flag_names or set(),
+            merge_warnings,
         )
+
+    @staticmethod
+    def _many_to_many_merge_warnings(
+        datasets: list[Dataset],
+        by_vars: list[str],
+    ) -> list[str]:
+        """Describe BY groups repeated in two or more MERGE inputs."""
+        keys = [name.upper() for name in by_vars]
+        repeated: dict[
+            tuple[tuple[str, str], ...],
+            tuple[tuple[Any, ...], list[tuple[str, int]]],
+        ] = {}
+
+        for dataset in datasets:
+            column_map = {str(column).upper(): column for column in dataset.data.columns}
+            actual_keys = [column_map[name] for name in keys if name in column_map]
+            if len(actual_keys) != len(keys):
+                continue
+            counts = dataset.data.groupby(
+                actual_keys,
+                sort=False,
+                dropna=False,
+            ).size()
+            dataset_name = (
+                f"{dataset.metadata.libref}.{dataset.metadata.member_name}"
+            ).upper()
+            for raw_key, count in counts.items():
+                if int(count) <= 1:
+                    continue
+                values = raw_key if isinstance(raw_key, tuple) else (raw_key,)
+                signature = tuple(
+                    ("missing", "")
+                    if pd.isna(value)
+                    else (type(value).__name__, repr(value))
+                    for value in values
+                )
+                if signature not in repeated:
+                    repeated[signature] = (values, [])
+                repeated[signature][1].append((dataset_name, int(count)))
+
+        conflicts = [entry for entry in repeated.values() if len(entry[1]) >= 2]
+        warnings: list[str] = []
+        for values, sources in conflicts[:5]:
+            by_value = ", ".join(
+                f"{name}={DataStepExecutor._display_merge_key(value)}"
+                for name, value in zip(keys, values)
+            )
+            source_text = ", ".join(
+                f"{name} ({count} observations)" for name, count in sources
+            )
+            warnings.append(
+                "Many-to-many MERGE detected: "
+                f"BY group {by_value} repeats in {source_text}. "
+                "SAS match-merge semantics align observations by position; "
+                "this is not a Cartesian join."
+            )
+        if len(conflicts) > 5:
+            warnings.append(
+                f"Many-to-many MERGE detected in {len(conflicts) - 5} additional "
+                "BY group(s); only the first 5 groups are shown."
+            )
+        return warnings
+
+    @staticmethod
+    def _display_merge_key(value: Any) -> str:
+        try:
+            if pd.isna(value):
+                return "."
+        except (TypeError, ValueError):
+            pass
+        if isinstance(value, str):
+            return repr(value)
+        return str(value)
 
     def _match_merge_frames(
         self,
