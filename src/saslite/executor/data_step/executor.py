@@ -259,7 +259,7 @@ class DataStepExecutor:
                 pdv,
                 input_datasets,
                 in_flag_names,
-                set_length_warnings,
+                [*set_length_warnings, *pdv.character_length_warnings()],
             )
 
         except Exception as e:
@@ -267,7 +267,9 @@ class DataStepExecutor:
 
     def _build_pdv(self, step: DataStepNode, inputs: list[Dataset]) -> PDV:
         """Build PDV from input datasets and DATA step statements."""
-        pdv = PDV()
+        pdv = PDV(
+            character_encoding=str(self.session.get_option("ENCODING", "utf-8")),
+        )
 
         # Add variables from input datasets
         for ds in inputs:
@@ -940,8 +942,9 @@ class DataStepExecutor:
         else:
             left_df = datasets[0].data.copy()
 
-        # Build PDV from merged data
-        pdv = PDV()
+        # Build the PDV from input metadata and declarations so character
+        # LENGTH checks also apply to values loaded by MERGE.
+        pdv = self._build_pdv(step, datasets)
         for col in left_df.columns:
             pdv.ensure_variable(col)
 
@@ -988,7 +991,7 @@ class DataStepExecutor:
             pdv,
             datasets,
             in_flag_names or set(),
-            merge_warnings,
+            [*merge_warnings, *pdv.character_length_warnings()],
         )
 
     @staticmethod

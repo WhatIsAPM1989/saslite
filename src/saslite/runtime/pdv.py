@@ -89,7 +89,7 @@ class PDVVariable:
 class PDV:
     """Program Data Vector — holds current observation state."""
 
-    def __init__(self) -> None:
+    def __init__(self, character_encoding: str = "utf-8") -> None:
         self.variables: dict[str, PDVVariable] = {}
         self._n: int = 0
         self._error: int = 0
@@ -100,6 +100,8 @@ class PDV:
         self._retain_state: dict[str, Any] = {}
         self._lag_state: LagState = LagState()
         self._by_state: ByState = ByState()
+        self._character_encoding = character_encoding
+        self._character_overflows: dict[str, dict[str, Any]] = {}
 
     def add_variable(self, name: str, metadata: VariableMetadata) -> PDVVariable:
         """Add a variable to the PDV."""
@@ -166,8 +168,7 @@ class PDV:
             else:
                 dtype = "numeric"
             var = self.ensure_variable(name, dtype)
-        var.value = value
-        var.initialized = True
+        self._assign_value(var, value)
 
     def reset_for_iteration(self) -> None:
         """Reset PDV for a new iteration (non-retained variables)."""
@@ -199,5 +200,70 @@ class PDV:
         for col_name, value in row.items():
             key = col_name.upper()
             if key in self.variables:
-                self.variables[key].value = value
-                self.variables[key].initialized = True
+                self._assign_value(self.variables[key], value)
+
+    def character_length_warnings(self) -> list[str]:
+        """Summarize values SAS would truncate at their declared byte length."""
+        warnings: list[str] = []
+        for event in self._character_overflows.values():
+            count = event["count"]
+            value_word = "value" if count == 1 else "values"
+            location = (
+                f"_N_={event['first_n']}"
+                if event["first_n"] > 0
+                else "initialization"
+            )
+            warnings.append(
+                f"Character truncation risk for variable {event['name']}: "
+                f"{count} {value_word} exceeded the declared LENGTH "
+                f"{event['limit']} bytes (maximum {event['maximum']} bytes; "
+                f"first at {location}: {event['preview']}; encoding "
+                f"{self._character_encoding}). SAS would truncate the value; "
+                "SASLite preserved it for validation. Increase LENGTH or "
+                "shorten the assigned value."
+            )
+        return warnings
+
+    def _assign_value(self, variable: PDVVariable, value: Any) -> None:
+        self._record_character_overflow(variable, value)
+        variable.value = value
+        variable.initialized = True
+
+    def _record_character_overflow(
+        self,
+        variable: PDVVariable,
+        value: Any,
+    ) -> None:
+        limit = variable.metadata.length
+        if (
+            variable.metadata.dtype != "character"
+            or limit is None
+            or not isinstance(value, str)
+        ):
+            return
+        try:
+            actual = len(value.encode(self._character_encoding))
+        except (LookupError, UnicodeEncodeError):
+            # Without a valid byte representation the truncation boundary is
+            # not knowable, so do not emit a potentially false diagnostic.
+            return
+        if actual <= limit:
+            return
+
+        key = variable.metadata.logical_name
+        event = self._character_overflows.get(key)
+        if event is None:
+            preview = repr(value)
+            if len(preview) > 82:
+                preview = preview[:79] + "..."
+            self._character_overflows[key] = {
+                "name": variable.metadata.name,
+                "limit": limit,
+                "maximum": actual,
+                "count": 1,
+                "first_n": self._n,
+                "preview": preview,
+            }
+            return
+        event["count"] += 1
+        event["maximum"] = max(event["maximum"], actual)
