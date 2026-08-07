@@ -32,6 +32,7 @@ class SqlExecutor:
         self.session = session
         self.reporter = reporter
         self._fn_registry = build_default_registry()
+        self._outobs: int | None = None
 
     def _compute_window_functions(self, columns: list, df: pd.DataFrame,
                                   col_map: dict[str, str]):
@@ -221,6 +222,9 @@ class SqlExecutor:
     def run(self, step: ProcSqlNode) -> StepResult:
         """Execute all SQL statements in a PROC SQL block."""
         combined = StepResult(success=True)
+        previous_outobs = self._outobs
+        raw_outobs = step.options.get("OUTOBS") if step.options else None
+        self._outobs = int(raw_outobs) if raw_outobs is not None else None
         try:
             for stmt in step.statements:
                 if isinstance(stmt, SelectNode):
@@ -252,8 +256,15 @@ class SqlExecutor:
             return combined
         except Exception as e:
             return StepResult(success=False, error=str(e))
+        finally:
+            self._outobs = previous_outobs
 
-    def _execute_select(self, sel: SelectNode, return_df: bool = False):
+    def _execute_select(
+        self,
+        sel: SelectNode,
+        return_df: bool = False,
+        apply_outobs: bool = True,
+    ):
         """Execute a SELECT statement. If return_df=True, returns (StepResult, DataFrame)."""
         import io
         from saslite.functions.date_funcs import _reset_datetime_cache
@@ -532,11 +543,24 @@ class SqlExecutor:
                 group_by=sel.group_by,
                 having_clause=sel.having_clause,
                 order_by=sel.order_by,
+                into_vars=sel.into_vars,
+                into_trimmed=sel.into_trimmed,
+                into_separators=sel.into_separators,
             )
-            return self._execute_select_grouped(sel_grouped, df, return_df, has_joins=has_joins)
+            return self._execute_select_grouped(
+                sel_grouped,
+                df,
+                return_df,
+                has_joins=has_joins,
+                apply_outobs=apply_outobs,
+            )
 
         # Select columns — evaluate expressions (rewritten, no subqueries)
         df, rewritten_cols = self._compute_window_functions(rewritten_cols, df, col_map)
+        # SAS permits ORDER BY columns that are not present in the SELECT
+        # list. Sort the query input while those columns are still available;
+        # the post-projection ORDER BY below continues to handle aliases.
+        df = self._sort_input_for_order_by(df, sel.order_by, col_map)
         df = self._apply_select_columns(rewritten_cols, df, col_map=col_map)
 
         # Drop temp subquery columns if they survived
@@ -570,6 +594,9 @@ class SqlExecutor:
             if sort_cols:
                 df = df.sort_values(by=sort_cols, ascending=ascending).reset_index(drop=True)
 
+        if apply_outobs:
+            df = self._apply_outobs(df)
+
         # Display results
         buf = io.StringIO()
         buf.write(f"\n{'=' * 60}\n")
@@ -583,16 +610,7 @@ class SqlExecutor:
         output = buf.getvalue()
         self.reporter.log(output)
 
-        # SELECT ... INTO :macrovar — store first-row values as macro vars
-        if getattr(sel, "into_vars", None):
-            for j, mv in enumerate(sel.into_vars):
-                if j < len(df.columns) and len(df) > 0:
-                    val = df.iloc[0, j]
-                    if isinstance(val, float) and val == int(val):
-                        sval = str(int(val))
-                    else:
-                        sval = str(val) if val is not None else ""
-                    self.session.set_macro_var(mv, sval.strip())
+        self._assign_into_vars(sel, df)
 
         result = StepResult(
             success=True,
@@ -603,12 +621,87 @@ class SqlExecutor:
         )
         return (result, df) if return_df else result
 
+    def _assign_into_vars(self, sel: SelectNode, df: pd.DataFrame) -> None:
+        """Assign positional SELECT columns to INTO macro variables."""
+        for index, name in enumerate(sel.into_vars):
+            if index >= len(df.columns) or df.empty:
+                continue
+            separator = (
+                sel.into_separators[index]
+                if index < len(sel.into_separators)
+                else None
+            )
+            if separator is not None:
+                values = [
+                    self._into_text(value).strip()
+                    for value in df.iloc[:, index].tolist()
+                ]
+                text = separator.join(values)
+            else:
+                text = self._into_text(df.iloc[0, index])
+            if index < len(sel.into_trimmed) and sel.into_trimmed[index]:
+                text = text.strip()
+            self.session.set_macro_var(name, text)
+
+    @staticmethod
+    def _into_text(value: Any) -> str:
+        if is_missing(value):
+            return ""
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+
+    def _sort_input_for_order_by(
+        self,
+        df: pd.DataFrame,
+        order_by: list[Any],
+        col_map: dict[str, str],
+    ) -> pd.DataFrame:
+        if not order_by or df.empty:
+            return df
+        working = df.copy()
+        sort_columns: list[str] = []
+        ascending: list[bool] = []
+        temporary: list[str] = []
+        for index, item in enumerate(order_by):
+            if not isinstance(item, OrderItemNode):
+                continue
+            column_name = self._expr_to_column_name(item.expr)
+            actual = self._find_column(working, column_name) if column_name else None
+            if actual is not None:
+                sort_columns.append(actual)
+                ascending.append(item.ascending)
+                continue
+            # Complex expressions such as ORDER BY CASE ... can also be
+            # evaluated before projection. A bare unresolved alias is left
+            # for the normal post-projection ORDER BY pass.
+            if isinstance(item.expr, VariableNode):
+                continue
+            temp_name = f"__order_{index}__"
+            working[temp_name] = self._eval_vectorized(
+                item.expr,
+                working,
+                col_map,
+            )
+            temporary.append(temp_name)
+            sort_columns.append(temp_name)
+            ascending.append(item.ascending)
+        if sort_columns:
+            working = working.sort_values(
+                by=sort_columns,
+                ascending=ascending,
+                kind="mergesort",
+            ).reset_index(drop=True)
+        if temporary:
+            working = working.drop(columns=temporary)
+        return working
+
     def _execute_set_op(self, node: SetOperationNode) -> StepResult:
         """Execute UNION/INTERSECT/EXCEPT set operations."""
         import io
 
-        left_df = self._select_to_df(node.left)
-        right_df = self._select_to_df(node.right)
+        left_df = self._select_to_df(node.left, apply_outobs=False)
+        right_df = self._select_to_df(node.right, apply_outobs=False)
 
         # Align columns by position (SAS convention)
         if list(left_df.columns) != list(right_df.columns):
@@ -633,7 +726,7 @@ class SqlExecutor:
         else:
             return StepResult(success=False, error=f"Unknown set operation: {op}")
 
-        result_df = result_df.reset_index(drop=True)
+        result_df = self._apply_outobs(result_df.reset_index(drop=True))
 
         # Display
         buf = io.StringIO()
@@ -655,29 +748,43 @@ class SqlExecutor:
             output_messages=[output],
         )
 
-    def _select_to_df(self, sel: Any) -> pd.DataFrame:
+    def _select_to_df(self, sel: Any, apply_outobs: bool = True) -> pd.DataFrame:
         """Execute a SELECT and return the resulting DataFrame."""
         if isinstance(sel, SetOperationNode):
-            left_df = self._select_to_df(sel.left)
-            right_df = self._select_to_df(sel.right)
+            left_df = self._select_to_df(sel.left, apply_outobs=False)
+            right_df = self._select_to_df(sel.right, apply_outobs=False)
             if list(left_df.columns) != list(right_df.columns):
                 right_df.columns = left_df.columns[:len(right_df.columns)]
             op = sel.op.upper()
             if op == "UNION":
                 if sel.all:
-                    return pd.concat([left_df, right_df], ignore_index=True)
-                return pd.concat([left_df, right_df], ignore_index=True).drop_duplicates()
+                    result_df = pd.concat([left_df, right_df], ignore_index=True)
+                else:
+                    result_df = pd.concat(
+                        [left_df, right_df], ignore_index=True
+                    ).drop_duplicates()
             elif op == "INTERSECT":
-                return left_df.merge(right_df, how="inner").drop_duplicates()
+                result_df = left_df.merge(
+                    right_df, how="inner"
+                ).drop_duplicates()
             elif op == "EXCEPT":
                 merged = left_df.merge(right_df, how="left", indicator=True)
-                return merged[merged["_merge"] == "left_only"].drop(columns=["_merge"]).drop_duplicates()
-            return left_df
+                result_df = merged[merged["_merge"] == "left_only"].drop(
+                    columns=["_merge"]
+                ).drop_duplicates()
+            else:
+                result_df = left_df
+            result_df = result_df.reset_index(drop=True)
+            return self._apply_outobs(result_df) if apply_outobs else result_df
 
         if not isinstance(sel, SelectNode):
             return pd.DataFrame()
 
-        result = self._execute_select(sel, return_df=True)
+        result = self._execute_select(
+            sel,
+            return_df=True,
+            apply_outobs=apply_outobs,
+        )
         if isinstance(result, tuple) and len(result) == 2:
             return result[1]
         return pd.DataFrame()
@@ -917,7 +1024,14 @@ class SqlExecutor:
             return left, right
         return None, None
 
-    def _execute_select_grouped(self, sel: SelectNode, df: pd.DataFrame, return_df: bool = False, **kw):
+    def _execute_select_grouped(
+        self,
+        sel: SelectNode,
+        df: pd.DataFrame,
+        return_df: bool = False,
+        apply_outobs: bool = True,
+        **kw,
+    ):
         """Execute a SELECT with GROUP BY. If return_df=True, returns (StepResult, DataFrame)."""
         import io
 
@@ -1003,6 +1117,7 @@ class SqlExecutor:
         agg_funcs = {}
         star_count_aliases = []  # COUNT(*) aliases — computed via size()
         complex_agg_funcs = {}  # Aggregates with complex expressions (e.g., min(strip(col)))
+        aggregate_fallbacks = {}  # COALESCE(aggregate, fallback) by output alias
 
         for col_node in sel.columns:
             if isinstance(col_node, SelectColumnNode):
@@ -1010,14 +1125,30 @@ class SqlExecutor:
                 # Strip table alias prefix from output column name
                 if "." in alias:
                     alias = alias.split(".", 1)[-1]
-                if isinstance(col_node.expr, FunctionCallNode):
-                    fn_name = col_node.expr.name.upper()
+                aggregate_expr = col_node.expr
+                fallback = None
+                has_fallback = False
+                if (
+                    isinstance(aggregate_expr, FunctionCallNode)
+                    and aggregate_expr.name.upper() == "COALESCE"
+                    and aggregate_expr.args
+                    and isinstance(aggregate_expr.args[0], FunctionCallNode)
+                ):
+                    candidate = aggregate_expr.args[0]
+                    if candidate.name.upper() in ("COUNT", "SUM", "AVG", "MEAN", "MIN", "MAX", "STD", "MEDIAN"):
+                        aggregate_expr = candidate
+                        if len(col_node.expr.args) > 1 and isinstance(col_node.expr.args[1], LiteralNode):
+                            fallback = col_node.expr.args[1].value
+                            has_fallback = True
+
+                if isinstance(aggregate_expr, FunctionCallNode):
+                    fn_name = aggregate_expr.name.upper()
                     inner_col = None
                     is_star = False
                     distinct_agg = False
                     aggregate_arg = None
-                    if col_node.expr.args:
-                        arg0 = col_node.expr.args[0]
+                    if aggregate_expr.args:
+                        arg0 = aggregate_expr.args[0]
                         distinct_agg = (isinstance(arg0, FunctionCallNode)
                                         and arg0.name == "_DISTINCT_")
                         if distinct_agg:
@@ -1050,6 +1181,8 @@ class SqlExecutor:
                             complex_agg_funcs[alias] = (
                                 aggregate_arg, pandas_agg, distinct_agg
                             )
+                    if has_fallback:
+                        aggregate_fallbacks[alias] = fallback
 
         if agg_funcs:
             agg_dict = {alias: pd.NamedAgg(column=col, aggfunc=fn) for alias, (col, fn) in agg_funcs.items()}
@@ -1153,6 +1286,11 @@ class SqlExecutor:
                 # Add the aggregated column to result_df
                 result_df[alias] = agg_results
 
+        for alias, fallback in aggregate_fallbacks.items():
+            actual = self._find_column(result_df, alias)
+            if actual:
+                result_df[actual] = result_df[actual].fillna(fallback)
+
         # Handle non-aggregate columns (literals, pass-through)
         for col_node in sel.columns:
             if not isinstance(col_node, SelectColumnNode):
@@ -1166,6 +1304,23 @@ class SqlExecutor:
             # Literal value — add constant column
             if isinstance(col_node.expr, LiteralNode):
                 result_df[alias] = col_node.expr.value
+
+        # GROUP BY aggregation builds grouping, aggregate, and literal columns
+        # in phases. Restore the SELECT-list order expected by SAS and by
+        # positional consumers such as UNION and INTO.
+        selected_columns = []
+        for col_node in sel.columns:
+            if not isinstance(col_node, SelectColumnNode):
+                continue
+            name = col_node.alias or self._expr_to_column_name(col_node.expr) or ""
+            if "." in name:
+                name = name.split(".", 1)[-1]
+            actual = self._find_column(result_df, name) if name else None
+            if actual and actual not in selected_columns:
+                selected_columns.append(actual)
+        if selected_columns:
+            remaining = [name for name in result_df.columns if name not in selected_columns]
+            result_df = result_df[selected_columns + remaining]
 
         # Apply HAVING
         if sel.having_clause:
@@ -1186,6 +1341,9 @@ class SqlExecutor:
             if sort_cols:
                 result_df = result_df.sort_values(by=sort_cols, ascending=ascending).reset_index(drop=True)
 
+        if apply_outobs:
+            result_df = self._apply_outobs(result_df)
+
         # Display results
         buf = io.StringIO()
         buf.write(f"\n{'=' * 60}\n")
@@ -1199,6 +1357,8 @@ class SqlExecutor:
         output = buf.getvalue()
         self.reporter.log(output)
 
+        self._assign_into_vars(sel, result_df)
+
         result = StepResult(
             success=True,
             rows_affected=len(result_df),
@@ -1209,12 +1369,12 @@ class SqlExecutor:
 
     def _execute_create_table(self, node: CreateTableNode) -> StepResult:
         """CREATE TABLE AS SELECT."""
-        if node.select and isinstance(node.select, SelectNode):
-            # Execute the select and get the result DataFrame
-            result, df = self._execute_select(node.select, return_df=True)
+        if node.select and isinstance(node.select, (SelectNode, SetOperationNode)):
+            df = self._select_to_df(node.select)
             out_ds = Dataset.from_dataframe(df, name=node.name, libref=node.libref)
             # Apply column attributes from SELECT
-            self._apply_col_attrs(out_ds, node.select.columns)
+            if isinstance(node.select, SelectNode):
+                self._apply_col_attrs(out_ds, node.select.columns)
             self.session.put_dataset(node.libref, node.name, out_ds)
             return StepResult(
                 success=True,
@@ -1223,6 +1383,12 @@ class SqlExecutor:
                 notes=[f"Table {node.libref.upper()}.{node.name.upper()} created with {len(df)} rows."],
             )
         return StepResult(success=True)
+
+    def _apply_outobs(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply the active PROC SQL OUTOBS= cap to a final query result."""
+        if self._outobs is None:
+            return df
+        return df.head(self._outobs).reset_index(drop=True)
 
     def _execute_insert(self, node: InsertNode) -> StepResult:
         """INSERT INTO ... VALUES(...) or INSERT INTO ... SELECT."""
@@ -1628,7 +1794,11 @@ class SqlExecutor:
         """Load a table and apply dataset options (keep=, drop=, where=)."""
 
         if ft.select is not None:
-            df = self._select_to_df(ft.select).copy()
+            # OUTOBS= caps the enclosing query result, not an intermediate
+            # derived table used by that query.
+            df = self._select_to_df(ft.select, apply_outobs=False).copy()
+        elif ft.libref.upper() == "DICTIONARY" and ft.name.upper() == "COLUMNS":
+            df = self.session.dictionary_columns().data.copy()
         else:
             ds = self.session.get_dataset(ft.libref, ft.name)
             df = ds.data.copy()
@@ -1885,6 +2055,29 @@ class SqlExecutor:
         if col_map is None:
             col_map = self._build_col_map(df, False)
 
+        # Expand qualified wildcards positionally before evaluating the rest
+        # of the projection. Joined dataframes use `alias.column` names.
+        expanded_columns = []
+        for column in columns:
+            if (
+                isinstance(column, SelectColumnNode)
+                and isinstance(column.expr, VariableNode)
+                and column.expr.name.endswith(".*")
+                and column.expr.name != "*"
+            ):
+                prefix = column.expr.name[:-1].upper()
+                for actual_name in df.columns:
+                    if actual_name.upper().startswith(prefix):
+                        expanded_columns.append(
+                            SelectColumnNode(
+                                expr=VariableNode(name=actual_name),
+                                alias=actual_name.split(".", 1)[-1],
+                            )
+                        )
+            else:
+                expanded_columns.append(column)
+        columns = expanded_columns
+
         # Check for SELECT *
         for col in columns:
             if isinstance(col, SelectColumnNode) and isinstance(col.expr, VariableNode) and col.expr.name == "*":
@@ -1902,7 +2095,7 @@ class SqlExecutor:
         # If there are aggregates without GROUP BY, compute them once for the entire dataset
         if has_aggregates:
             result_row = {}
-            for col_node in columns:
+            for column_index, col_node in enumerate(columns):
                 if not isinstance(col_node, SelectColumnNode):
                     continue
                 # Get the column name from expression (may include table alias prefix)
@@ -1914,7 +2107,10 @@ class SqlExecutor:
                     # Strip table alias prefix: "E.FOLDERNAME" -> "FOLDERNAME"
                     alias = expr_col_name.split(".")[-1] if "." in expr_col_name else expr_col_name
                 else:
-                    alias = ""
+                    # A dict-backed result row still needs one unique key per
+                    # unaliased expression so positional INTO targets are not
+                    # collapsed into a single output column.
+                    alias = f"_COL{column_index + 1}"
 
                 if isinstance(col_node.expr, FunctionCallNode):
                     fn_name = col_node.expr.name.upper()
@@ -1950,9 +2146,19 @@ class SqlExecutor:
                                     # Evaluate the expression for each row, then aggregate
                                     vals = self._eval_per_row(arg0, df, col_map)
                                     # Filter out None/NaN values
-                                    valid_vals = [v for v in vals if v is not None and (not isinstance(v, float) or not pd.isna(v))]
+                                    valid_vals = [
+                                        value for value in vals
+                                        if not is_missing(value)
+                                        and not (
+                                            fn_name == "COUNT"
+                                            and isinstance(value, str)
+                                            and not value.strip()
+                                        )
+                                    ]
                                     if valid_vals:
                                         series = pd.Series(valid_vals)
+                                        if distinct_agg:
+                                            series = series.drop_duplicates()
                                         pandas_agg = self._sas_agg_to_pandas(fn_name)
                                         if pandas_agg:
                                             result_row[alias] = getattr(series, pandas_agg)()

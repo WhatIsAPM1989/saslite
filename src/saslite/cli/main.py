@@ -49,6 +49,25 @@ def main(argv: list[str] | None = None) -> int:
         default="utf-8",
         help="Encoding used to read SAS script files",
     )
+    profile_group = parser.add_mutually_exclusive_group()
+    profile_group.add_argument(
+        "--profile",
+        choices=["example"],
+        default=None,
+        help="Apply a public built-in compatibility profile",
+    )
+    profile_group.add_argument(
+        "--profile-file",
+        type=str,
+        default=None,
+        help="Load a trusted project profile from an external Python file",
+    )
+    parser.add_argument(
+        "--profile-root",
+        type=str,
+        default=None,
+        help="Project root used by the selected compatibility profile",
+    )
     parser.add_argument(
         "--version",
         action="store_true",
@@ -62,7 +81,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SASLite {__version__}")
         return 0
 
-    sas = SasInterpreter(work_dir=args.workdir, sas_format=args.format)
+    try:
+        sas = SasInterpreter(
+            work_dir=args.workdir,
+            sas_format=args.format,
+            profile=args.profile,
+            profile_file=args.profile_file,
+            profile_root=args.profile_root,
+        )
+    except (FileNotFoundError, ImportError, TypeError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     if args.execute:
         return _run_text(sas, args.execute)

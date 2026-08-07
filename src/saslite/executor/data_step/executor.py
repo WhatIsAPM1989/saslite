@@ -91,6 +91,7 @@ class DataStepExecutor:
             set_nodes = [s for s in step.statements if isinstance(s, SetNode)]
             input_nodes = [s for s in step.statements if isinstance(s, InputNode)]
             set_length_warnings: list[str] = []
+            in_flag_names: set[str] = set()
 
             if input_nodes and input_nodes[0].datalines_data:
                 # INPUT + DATALINES mode: parse rows into an in-memory dataset and
@@ -108,6 +109,10 @@ class DataStepExecutor:
                     try:
                         ds = self.session.get_dataset(ds_ref.libref, ds_ref.name)
                         ds = self._apply_dataset_options(ds, ds_ref.options)
+                        in_flag = self._dataset_in_flag(ds_ref)
+                        if in_flag:
+                            ds = self._add_in_flag(ds, in_flag)
+                            in_flag_names.add(in_flag)
                         input_datasets.append(ds)
                         input_ds_names.append(ds_name)
                     except KeyError:
@@ -124,7 +129,8 @@ class DataStepExecutor:
                         break
 
                 return self._execute_merge(step, input_datasets, by_vars,
-                                           target_name, target_libref)
+                                           target_name, target_libref,
+                                           in_flag_names)
 
             elif set_nodes:
                 # Track per-SET-statement dataset groups: one SET statement
@@ -138,6 +144,10 @@ class DataStepExecutor:
                         try:
                             ds = self.session.get_dataset(ds_ref.libref, ds_ref.name)
                             ds = self._apply_dataset_options(ds, ds_ref.options)
+                            in_flag = self._dataset_in_flag(ds_ref)
+                            if in_flag:
+                                ds = self._add_in_flag(ds, in_flag)
+                                in_flag_names.add(in_flag)
                             input_datasets.append(ds)
                             input_ds_names.append(ds_name)
                             group.append(ds)
@@ -247,9 +257,39 @@ class DataStepExecutor:
             if output_rows:
                 df = pd.DataFrame(output_rows)
             else:
-                df = pd.DataFrame()
+                # A zero-observation DATA step still has its compiled PDV
+                # schema (notably when SET reads an empty input data set).
+                df = pd.DataFrame(columns=[
+                    variable.metadata.name for variable in pdv.variables.values()
+                ])
+
+            # IN= variables exist in the PDV for conditional processing but,
+            # like SAS automatic variables, are not written to the output data set.
+            if in_flag_names:
+                df = df.drop(columns=[
+                    column for column in df.columns
+                    if str(column).upper() in in_flag_names
+                ], errors="ignore")
 
             out_ds = Dataset.from_dataframe(df, name=target_name, libref=target_libref)
+
+            # A SAS SET statement carries variable attributes into the output
+            # PDV. Preserve metadata from the first contributing input data set;
+            # explicit FORMAT/LABEL/LENGTH/ATTRIB statements below may override
+            # these inherited values.
+            for column in out_ds.data.columns:
+                target_meta = out_ds.metadata.get_variable(str(column))
+                if target_meta is None:
+                    continue
+                for input_ds in input_datasets:
+                    source_meta = input_ds.metadata.get_variable(str(column))
+                    if source_meta is None:
+                        continue
+                    target_meta.length = source_meta.length
+                    target_meta.format = source_meta.format
+                    target_meta.informat = source_meta.informat
+                    target_meta.label = source_meta.label
+                    break
 
             # Apply KEEP/DROP/RENAME
             for stmt in step.statements:
@@ -732,9 +772,27 @@ class DataStepExecutor:
             ds = ds.select_columns(actual)
         return ds
 
+    @staticmethod
+    def _dataset_in_flag(ref: DatasetRefNode) -> str:
+        for option in ref.options:
+            if isinstance(option, dict) and option.get("IN"):
+                return str(option["IN"]).upper()
+        return ""
+
+    @staticmethod
+    def _add_in_flag(ds: Dataset, flag_name: str) -> Dataset:
+        """Return a copy with a temporary numeric IN= contribution flag."""
+        flagged = ds.copy()
+        flagged.data[flag_name] = 1
+        flagged.metadata.variables[flag_name] = make_variable(
+            flag_name, dtype="numeric"
+        )
+        return flagged
+
     def _execute_merge(self, step: DataStepNode, datasets: list[Dataset],
                        by_vars: list[str], target_name: str,
-                       target_libref: str) -> StepResult:
+                       target_libref: str,
+                       in_flag_names: set[str] | None = None) -> StepResult:
         """Execute MERGE statement."""
         if not datasets:
             return StepResult(success=False, error="MERGE requires at least one dataset")
@@ -839,7 +897,15 @@ class DataStepExecutor:
         if eval_ctx.output_rows:
             df = pd.DataFrame(eval_ctx.output_rows)
         else:
-            df = pd.DataFrame()
+            df = pd.DataFrame(columns=[
+                variable.metadata.name for variable in pdv.variables.values()
+            ])
+
+        if in_flag_names:
+            df = df.drop(columns=[
+                column for column in df.columns
+                if str(column).upper() in in_flag_names
+            ], errors="ignore")
 
         out_ds = Dataset.from_dataframe(df, name=target_name, libref=target_libref)
 
@@ -1309,9 +1375,33 @@ class DataStepContext:
                 self.evaluator.register_function(name, fn)
         # Wrap PUT/PUTN to honor PROC FORMAT custom formats
         self._wrap_put_with_custom_formats(fn_registry)
+        self._register_session_functions()
         # Register LAG/DIF stateful functions
         if lag_state:
             self._register_lag_dif(lag_state)
+
+    def _register_session_functions(self) -> None:
+        """Register DATA-step functions whose result depends on the session."""
+        session = self.session
+
+        def dataset_exists(dataset_name: Any, member_type: Any = "DATA") -> int:
+            requested_type = str(member_type).strip().strip("'\"").upper()
+            if requested_type not in {"", "DATA", "ANY"}:
+                return 0
+            reference = str(dataset_name).strip().strip("'\"")
+            reference = reference.split("(", 1)[0].strip()
+            if not reference:
+                return 0
+            if "." in reference:
+                libref, member = reference.split(".", 1)
+            else:
+                libref, member = "WORK", reference
+            try:
+                return int(session.dataset_exists(libref, member))
+            except (KeyError, OSError, ValueError):
+                return 0
+
+        self.evaluator.register_function("EXIST", dataset_exists)
 
     def _wrap_put_with_custom_formats(self, fn_registry: Any) -> None:
         """Make PUT()/PUTN() check session-defined custom formats first."""

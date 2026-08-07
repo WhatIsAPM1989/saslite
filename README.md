@@ -90,6 +90,34 @@ saslite --workdir ./work --format sas7bdat path/to/program.sas
 saslite --workdir ./work --format xpt path/to/program.sas
 ```
 
+### Environment compatibility profiles
+
+The public package includes an anonymized example profile:
+
+```bash
+saslite --profile example --profile-root /path/to/example-project program.sas
+```
+
+It demonstrates project-root discovery, loading
+`_local/config/localsetup.sas`, supplying a compatibility macro, and redirecting
+an example shared Excel path to `_local/output/excel/`. The tracked SAS source
+is not modified.
+
+Real project profiles can remain in a private repository or ignored local
+directory. Load one explicitly as trusted Python code:
+
+```bash
+saslite \
+  --profile-file /private/project/saslite_profile.py \
+  --profile-root /private/project \
+  program.sas
+```
+
+The external module must define
+`create_profile(*, project_root=None)` and return a
+`saslite.profiles.CompatibilityProfile`. Do not load profile files from an
+untrusted source.
+
 ## GUI
 
 Install the GUI extra:

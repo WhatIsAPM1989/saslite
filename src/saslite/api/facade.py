@@ -26,6 +26,7 @@ from saslite.executor.proc.extras import (
 from saslite.executor.proc.stats import handle_proc_reg, handle_proc_logistic, handle_proc_corr, handle_proc_ttest
 from saslite.runtime.execution_result import RunSummary
 from saslite.diagnostics.reporter import Reporter
+from saslite.profiles import CompatibilityProfile, create_profile, load_profile_file
 
 
 class SasInterpreter:
@@ -34,6 +35,9 @@ class SasInterpreter:
     Args:
         work_dir: Directory for persistent dataset storage (optional)
         sas_format: Storage format for datasets - 'sas7bdat' (default) or 'xpt'
+        profile: Optional environment compatibility profile name or instance
+        profile_file: Trusted external Python profile kept outside the package
+        profile_root: Explicit project root for the selected profile
 
     Example:
         >>> # Use default sas7bdat format
@@ -46,11 +50,32 @@ class SasInterpreter:
         >>> sas = SasInterpreter(work_dir='./work', sas_format='sas7bdat')
     """
 
-    def __init__(self, work_dir: str | None = None, sas_format: str = "sas7bdat") -> None:
-        self._macro = MacroExpander()
+    def __init__(
+        self,
+        work_dir: str | None = None,
+        sas_format: str = "sas7bdat",
+        profile: str | CompatibilityProfile | None = None,
+        profile_file: str | Path | None = None,
+        profile_root: str | None = None,
+    ) -> None:
         self._parser = ProgramParser()
         self._session = Session(StorageRouter(work_dir, sas_format=sas_format))
+        # Macro functions such as OPEN/VARNUM inspect datasets in this same
+        # session.  Keep one expander for the interpreter lifetime so dataset
+        # handles remain valid across separately executed source chunks.
+        self._macro = MacroExpander(self._session)
         self._reporter = Reporter()
+        if profile is not None and profile_file is not None:
+            raise ValueError("Pass either profile or profile_file, not both")
+        if profile_file is not None:
+            self._profile = load_profile_file(
+                profile_file,
+                project_root=profile_root,
+            )
+        elif isinstance(profile, str):
+            self._profile = create_profile(profile, project_root=profile_root)
+        else:
+            self._profile = profile
 
     @property
     def session(self) -> Session:
@@ -70,6 +95,11 @@ class SasInterpreter:
     ) -> RunSummary:
         """Execute SAS source code."""
         try:
+            if self._profile is not None:
+                source = self._profile.prepare_source(
+                    source,
+                    source_name=source_name,
+                )
             # Step 0: Expand %INCLUDE before DATALINES extraction so included
             # files can contain their own inline data blocks.
             source = self._expand_includes(
@@ -83,6 +113,13 @@ class SasInterpreter:
             self._reporter.error(str(e))
             return summary
 
+        # PROC SQL INTO creates macro variables while the program is running.
+        # Expand later RUN/QUIT-delimited steps only after the producing SQL
+        # step has executed, so consumers see the newly assigned values.
+        if self._has_later_sql_into_reference(source):
+            chunks = self._split_into_step_chunks(source)
+            return self._execute_chunks(chunks)
+
         summary = self._execute_expanded(source)
 
         # Retry in chunked mode when a macro variable could not be resolved:
@@ -92,20 +129,60 @@ class SasInterpreter:
                 and "No terminal matches '&'" in str(summary.error)):
             chunks = self._split_into_step_chunks(source)
             if len(chunks) > 1:
-                combined = RunSummary(success=True)
-                for chunk in chunks:
-                    if not chunk.strip():
-                        continue
-                    part = self._execute_expanded(chunk)
-                    for st in part.steps:
-                        combined.add_step(st)
-                    if not part.success:
-                        combined.success = False
-                        combined.error = part.error
-                        break
-                return combined
+                return self._execute_chunks(chunks)
 
         return summary
+
+    def _execute_chunks(self, chunks: list[str]) -> RunSummary:
+        """Execute source chunks sequentially, syncing runtime macro values."""
+        combined = RunSummary(success=True)
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            # A macro definition and its invocation stay in one raw chunk so
+            # RUN/QUIT inside the definition is not split. If that expanded
+            # body creates and later consumes an SQL INTO variable, expose its
+            # generated step boundaries before executing it.
+            if (
+                re.search(r"%\s*MACRO\b", chunk, re.IGNORECASE)
+                and self._has_later_sql_into_reference(chunk)
+            ):
+                for scope in self._session._macro_stack:
+                    for key, value in scope.variables.items():
+                        self._macro._global_vars[key] = value
+                expanded_chunk = self._macro.expand(chunk)
+                for line in self._macro.put_output:
+                    self._reporter.log(line)
+                self._macro.put_output.clear()
+                nested_chunks = self._split_into_step_chunks(expanded_chunk)
+                if len(nested_chunks) > 1:
+                    part = self._execute_chunks(nested_chunks)
+                else:
+                    part = self._execute_expanded(expanded_chunk)
+            else:
+                part = self._execute_expanded(chunk)
+            for step in part.steps:
+                combined.add_step(step)
+            if not part.success:
+                combined.success = False
+                combined.error = part.error
+                break
+        return combined
+
+    @staticmethod
+    def _has_later_sql_into_reference(source: str) -> bool:
+        """Return whether an INTO target is referenced later in the source."""
+        into_clause = re.compile(
+            r"\bINTO\b(?P<targets>.*?)\bFROM\b",
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        target_name = re.compile(r":\s*([A-Za-z_]\w*)")
+        for match in into_clause.finditer(source):
+            remainder = source[match.end():]
+            for name in target_name.findall(match.group("targets")):
+                if re.search(rf"&{re.escape(name)}(?:\.|\b)", remainder, re.IGNORECASE):
+                    return True
+        return False
 
     def _execute_expanded(self, source: str) -> RunSummary:
         """Run the preprocess → macro-expand → parse → dispatch pipeline."""
@@ -116,7 +193,14 @@ class SasInterpreter:
             # Step 1: Macro expansion (sync CALL SYMPUT vars from session first)
             for scope in self._session._macro_stack:
                 for k, v in scope.variables.items():
-                    self._macro._global_vars[k] = v
+                    # A %LET seen in an earlier chunk lives in the expander's
+                    # local table. PROC SQL INTO/CALL SYMPUT may subsequently
+                    # replace that same macro variable in Session; update the
+                    # existing slot so the stale %LET value cannot shadow it.
+                    if k in self._macro._local_vars:
+                        self._macro._local_vars[k] = v
+                    else:
+                        self._macro._global_vars[k] = v
             expanded = self._macro.expand(source)
 
             # Report %PUT output
@@ -163,8 +247,6 @@ class SasInterpreter:
 
             return dispatcher.run(program)
 
-        except NameError:
-            raise
         except Exception as e:
             summary = RunSummary(success=False, error=str(e))
             self._reporter.error(str(e))

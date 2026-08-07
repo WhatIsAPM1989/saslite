@@ -44,7 +44,7 @@ libname_option: NAME "=" option_value
 
 filename_stmt: "FILENAME"i NAME STRING
 
-options_stmt: "OPTIONS"i option_item+
+options_stmt: ("OPTIONS"i | "OPTION"i) option_item+
 option_item: NAME "=" option_value
            | NAME
            | "NONUMBER"i
@@ -113,13 +113,13 @@ dataset_option: "KEEP"i "=" name_list
               | "DROP"i "=" name_list
               | "WHERE"i "=" "(" expr ")"
               | "RENAME"i "=" "(" (rename_pair)+ ")"
+              | "IN"i "=" NAME
 
 assign_stmt: NAME "=" expr
 arr_assign_stmt: NAME "[" expr "]" "=" expr
 sum_stmt: NAME "+" expr
 
 if_stmt: IF_KW expr THEN_KW data_stmt (ELSE_KW data_stmt)?
-       | IF_KW expr ";" (data_stmt)* ELSE_KW ";"? (data_stmt)*
        | IF_KW expr ";" -> if_subsetting
 
 do_block: "DO"i ";" (data_stmt)* "END"i ";"
@@ -150,7 +150,9 @@ update_data_stmt: "UPDATE"i (dataset_ref)+
 substr_assign_stmt: "SUBSTR"i "(" NAME "," expr ("," expr)? ")" "=" expr
 
 length_stmt: "LENGTH"i (length_item)+
-length_item: NAME "$"? NUMBER?
+length_item: length_name "$"? NUMBER?
+?length_name: NAME
+            | NAME "-" NAME -> numbered_name_range
 
 attrib_stmt: "ATTRIB"i (attrib_item)+
 attrib_item: NAME (attr_tag)*
@@ -168,6 +170,7 @@ call_stmt: "CALL"i NAME "(" expr_list ")"
 proc_sql: "PROC"i "SQL"i (sql_opt)* ";" (sql_stmt)+ ("QUIT"i ";")?
 
 sql_opt: "NOPRINT"i | "PRINT"i | "FEEDBACK"i
+       | "OUTOBS"i "=" NUMBER -> sql_outobs_opt
 
 sql_stmt: set_op_stmt ";"
         | select_stmt ";"
@@ -188,9 +191,12 @@ select_stmt: "SELECT"i ("DISTINCT"i)? select_list into_clause? from_clause? wher
 
 into_clause: "INTO"i into_var ("," into_var)*
 into_var: ":" NAME
+        | ":" NAME "TRIMMED"i -> into_var_trimmed
+        | ":" NAME "SEPARATED"i "BY"i STRING -> into_var_separated
 
 select_list: select_item ("," select_item)*
 select_item: expr ("AS"i NAME)? (col_attr)* -> select_aliased
+           | NAME "." "*" -> select_qualified_star
            | "*" -> select_star
 
 col_attr: "LENGTH"i "=" NUMBER
@@ -198,7 +204,7 @@ col_attr: "LENGTH"i "=" NUMBER
         | "LABEL"i "=" STRING
 
 from_clause: "FROM"i table_expr
-table_expr: table_factor (join_clause)*
+table_expr: table_factor (("," table_factor) | join_clause)*
 table_factor: qualified_name ("(" (dataset_option)* ")")? ("AS"i)? NAME? -> from_table
             | "(" select_stmt ")" ("AS"i)? NAME? -> from_subquery
 
@@ -215,7 +221,7 @@ having_clause: "HAVING"i expr
 order_by_clause: "ORDER"i "BY"i order_item ("," order_item)*
 order_item: expr ("ASC"i | "DESC"i)?
 
-create_table_stmt: "CREATE"i "TABLE"i qualified_name "AS"i select_stmt
+create_table_stmt: "CREATE"i "TABLE"i qualified_name "AS"i (set_op_stmt | select_stmt)
 insert_stmt: "INSERT"i "INTO"i qualified_name ("(" insert_col_list ")")? "VALUES"i "(" expr_list ")"
             | "INSERT"i "INTO"i qualified_name select_stmt
 insert_col_list: NAME ("," NAME)*
@@ -261,10 +267,11 @@ proc_means: "PROC"i ("MEANS"i | "SUMMARY"i) (means_opt)* ";" (means_stmt)* "RUN"
 means_opt: "DATA"i "=" qualified_name
          | "OUT"i "=" qualified_name
          | "NOPRINT"i
+         | "NWAY"i
          | "MAXDEC"i "=" NUMBER
          | stat_name
 
-stat_name: "N"i | "MEAN"i | "SUM"i | "MIN"i | "MAX"i | "STD"i | "MEDIAN"i
+stat_name: "N"i | "MEAN"i | "SUM"i | "MIN"i | "MAX"i | "STD"i | "MEDIAN"i | "Q1"i | "Q3"i
 
 means_stmt: "VAR"i name_list ";"
           | "CLASS"i name_list ";"
@@ -303,9 +310,12 @@ append_opt: "DATA"i "=" qualified_name
 
 // ─── PROC DATASETS ─────────────────────────────────
 
-proc_datasets: "PROC"i "DATASETS"i (ds_opt)* ";" (ds_stmt)* "QUIT"i ";"
+proc_datasets: "PROC"i "DATASETS"i (ds_opt)* ";" (ds_stmt)* ("RUN"i ";")? "QUIT"i ";"
 
-ds_opt: "LIBRARY"i "=" qualified_name
+ds_opt: ("LIBRARY"i | "LIB"i) "=" qualified_name
+      | "NOLIST"i                         -> ds_nolist_opt
+      | "KILL"i                           -> ds_kill_opt
+      | "MEMTYPE"i "=" NAME              -> ds_memtype_opt
 
 ds_stmt: "DELETE"i name_list ";"
        | "MODIFY"i qualified_name rename_stmt? ";"
@@ -331,24 +341,30 @@ import_stmt: "DATAFILE"i "=" STRING ";"
 
 proc_export: "PROC"i "EXPORT"i (export_opt)* ";" (export_stmt)* "RUN"i ";"
 
-export_opt: "DATA"i "=" qualified_name
+export_opt: "DATA"i "=" dataset_ref
           | "OUTFILE"i "=" STRING
           | "DBMS"i "=" NAME
           | "DELIMITER"i "=" STRING
+          | export_flag
 
-export_stmt: "DATA"i "=" qualified_name ";"
+export_flag: "LABEL"i
+           | "REPLACE"i
+
+export_stmt: "DATA"i "=" dataset_ref ";"
            | "OUTFILE"i "=" STRING ";"
            | "DBMS"i "=" NAME ";"
            | "DELIMITER"i "=" STRING ";"
+           | "SHEET"i "=" STRING ";"
 
 // ─── PROC TRANSPOSE ───────────────────────────────
 
 proc_transpose: "PROC"i "TRANSPOSE"i (transpose_opt)* ";" (transpose_stmt)* "RUN"i ";"
 
 transpose_opt: "DATA"i "=" qualified_name
-             | "OUT"i "=" qualified_name
+             | "OUT"i "=" dataset_ref
              | "PREFIX"i "=" NAME
              | "NAME"i "=" NAME
+             | "LABEL"i "=" NAME
 
 transpose_stmt: "VAR"i name_list ";" -> transpose_var
               | "ID"i name_list ";" -> transpose_id
@@ -423,14 +439,20 @@ proc_report: "PROC"i "REPORT"i (report_opt)* ";" (report_stmt)* "RUN"i ";"
 report_opt: "DATA"i "=" qualified_name
           | "OUT"i "=" qualified_name
           | "NOWD"i
+          | "NOWINDOWS"i
           | "HEADLINE"i
+          | "SPANROWS"i
+          | "MISSING"i
+          | "SPLIT"i "=" STRING
+          | "SPACING"i "=" NUMBER
+          | REPORT_STYLE_OPTION
 
 report_stmt: "COLUMN"i name_list ";" -> report_column
            | "COLUMNS"i name_list ";" -> report_column
            | "DEFINE"i NAME "/" (report_def_attr)* ";" -> report_define
            | "BY"i name_list ";" -> report_by
 
-report_def_attr: "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | STRING | "FORMAT"i "=" format_spec | "WIDTH"i "=" NUMBER
+report_def_attr: "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "NOPRINT"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | STRING | "FORMAT"i "=" format_spec | "WIDTH"i "=" NUMBER | REPORT_STYLE_OPTION
 
 // ─── PROC REG ─────────────────────────────────────
 
@@ -582,10 +604,16 @@ func_args: func_arg ("," func_arg)*
 func_arg: "*" -> star_arg
         | "DISTINCT"i expr -> distinct_arg
         | "OF"i NAME "[" "*" "]" -> of_array_arg
+        | "??" function_format -> suppress_notes_format_arg
+        | function_format -> format_arg
         | expr -> expr_arg
+function_format: "$"? NAME "." NUMBER?
+               | "$"? NUMBER "." NUMBER?
 ?expr: or_expr
 
-name_list: NAME+
+name_list: name_list_item+
+?name_list_item: NAME
+               | NAME "-" NAME -> numbered_name_range
 
 // ─── SQL column attributes ──────────────────────────
 
@@ -606,6 +634,7 @@ LE_OP: /LE(?![A-Za-z0-9_])/i
 NUMBER: /[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?|\.[0-9]+([eE][+-]?[0-9]+)?/
 DATE_LITERAL.2: /("[^"]*"|'[^']*')(dt|d|t)\b/i
 STRING: /"[^"]*"|'[^']*'/
+REPORT_STYLE_OPTION.2: /STYLE\s*\(\s*(REPORT|HEADER|COLUMN)\s*\)\s*=\s*(\{[^}]*\}|\[[^\]]*\])/i
 
 // ─── Comments ─────────────────────────────────────
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from lark import Transformer, Token, Tree
@@ -239,11 +240,53 @@ class SasTransformer(Transformer):
     def expr_arg(self, items: list[Any]) -> Any:
         return items[0] if items else None
 
+    def function_format(self, items: list[Any]) -> str:
+        """Return a trailing-dot format/informat used as a function argument."""
+        return self.format_spec(items)
+
+    @staticmethod
+    def _format_literal(items: list[Any]) -> LiteralNode:
+        value = next(
+            (item for item in items
+             if isinstance(item, str) and not isinstance(item, Token)),
+            "",
+        )
+        return LiteralNode(value=value, literal_type="string")
+
+    def format_arg(self, items: list[Any]) -> LiteralNode:
+        return self._format_literal(items)
+
+    def suppress_notes_format_arg(self, items: list[Any]) -> LiteralNode:
+        """INPUT ?? suppresses diagnostics but does not alter the informat."""
+        return self._format_literal(items)
+
     def expr_list(self, items: list[Any]) -> list[Any]:
         return _non_tokens(items)
 
     def name_list(self, items: list[Any]) -> list[str]:
-        return [_get_name(item) for item in items if item is not None]
+        names: list[str] = []
+        for item in items:
+            if isinstance(item, list):
+                names.extend(item)
+            elif item is not None and str(item) != "-":
+                names.append(_get_name(item))
+        return names
+
+    def numbered_name_range(self, items: list[Any]) -> list[str]:
+        """Expand SAS numbered variable lists such as COL1-COL28."""
+        names = [str(item) for item in items
+                 if isinstance(item, Token) and str(item) != "-"]
+        if len(names) != 2:
+            return names
+        left, right = names
+        left_match = re.fullmatch(r"(.*?)(\d+)", left)
+        right_match = re.fullmatch(r"(.*?)(\d+)", right)
+        if not left_match or not right_match or left_match.group(1).upper() != right_match.group(1).upper():
+            return names
+        start, end = int(left_match.group(2)), int(right_match.group(2))
+        step = 1 if end >= start else -1
+        prefix = left_match.group(1)
+        return [f"{prefix}{number}" for number in range(start, end + step, step)]
 
     def in_list(self, items: list[Any]) -> FunctionCallNode:
         # Rewrite as IN function call
@@ -880,8 +923,6 @@ class SasTransformer(Transformer):
                     continue
                 if isinstance(s, str) and s.upper() in skip_keywords:
                     continue
-                if isinstance(s, DoNode):
-                    continue
                 body.append(s)
             do.body = body
         else:
@@ -1034,9 +1075,12 @@ class SasTransformer(Transformer):
         return LabelNode(items=result_items)
 
     def label_item(self, items: list[Any]) -> tuple[str, str]:
-        non_tok = _non_tokens(items)
-        name = _get_name(non_tok[0]) if non_tok else ""
-        label = _get_text(non_tok[1]) if len(non_tok) > 1 else ""
+        filtered = [
+            item for item in items
+            if not (isinstance(item, Token) and str(item) in ("=", ";"))
+        ]
+        name = _get_name(filtered[0]) if filtered else ""
+        label = _get_text(filtered[1]) if len(filtered) > 1 else ""
         if (label.startswith("'") and label.endswith("'")) or (
             label.startswith('"') and label.endswith('"')
         ):
@@ -1109,16 +1153,47 @@ class SasTransformer(Transformer):
                 return {str(t).upper(): True}
         return {}
 
-    def into_clause(self, items: list[Any]) -> dict[str, Any]:
-        names = [item for item in items
-                 if isinstance(item, str) and not isinstance(item, Token)]
-        return {"_INTO": names}
+    def sql_outobs_opt(self, items: list[Any]) -> dict[str, Any]:
+        value = float(str(items[-1]))
+        if not value.is_integer() or value < 0:
+            raise ValueError("PROC SQL OUTOBS= requires a non-negative integer")
+        return {"OUTOBS": int(value)}
 
-    def into_var(self, items: list[Any]) -> str:
+    def into_clause(self, items: list[Any]) -> dict[str, Any]:
+        targets = [item for item in items if isinstance(item, tuple)]
+        return {
+            "_INTO": [name for name, _trimmed, _separator in targets],
+            "_INTO_TRIMMED": [trimmed for _name, trimmed, _separator in targets],
+            "_INTO_SEPARATORS": [
+                separator for _name, _trimmed, separator in targets
+            ],
+        }
+
+    def into_var(self, items: list[Any]) -> tuple[str, bool, str | None]:
         for t in items:
             if isinstance(t, Token) and str(t) != ":":
-                return str(t).upper()
-        return ""
+                return str(t).upper(), False, None
+        return "", False, None
+
+    def into_var_trimmed(self, items: list[Any]) -> tuple[str, bool, str | None]:
+        for t in items:
+            if isinstance(t, Token) and str(t) != ":":
+                return str(t).upper(), True, None
+        return "", True, None
+
+    def into_var_separated(self, items: list[Any]) -> tuple[str, bool, str | None]:
+        tokens = [item for item in items if isinstance(item, Token)]
+        name_token = next((token for token in tokens if token.type == "NAME"), None)
+        name = str(name_token).upper() if name_token is not None else ""
+        separator = ""
+        string_token = next(
+            (token for token in tokens if token.type == "STRING"),
+            None,
+        )
+        if string_token is not None:
+            raw = str(string_token)
+            separator = raw[1:-1] if len(raw) >= 2 else raw
+        return name, False, separator
 
     def select_stmt(self, items: list[Any]) -> SelectNode:
         sel = SelectNode()
@@ -1133,6 +1208,8 @@ class SasTransformer(Transformer):
         for item in non_tok:
             if isinstance(item, dict) and "_INTO" in item:
                 sel.into_vars = item["_INTO"]
+                sel.into_trimmed = item["_INTO_TRIMMED"]
+                sel.into_separators = item["_INTO_SEPARATORS"]
             elif isinstance(item, list) and item:
                 if isinstance(item[0], SelectColumnNode):
                     sel.columns = item
@@ -1199,6 +1276,13 @@ class SasTransformer(Transformer):
     def select_star(self, items: list[Any]) -> SelectColumnNode:
         return SelectColumnNode(expr=VariableNode(name="*"), alias="")
 
+    def select_qualified_star(self, items: list[Any]) -> SelectColumnNode:
+        qualifier = next(
+            (str(item) for item in items if isinstance(item, Token) and str(item) not in (".", "*")),
+            "",
+        )
+        return SelectColumnNode(expr=VariableNode(name=f"{qualifier}.*"), alias="")
+
     def col_attr(self, items: list[Any]) -> tuple[str, Any]:
         """Transform col_attr: LENGTH=40, FORMAT=date9., LABEL='foo'."""
         non_tok = _non_tokens(items)
@@ -1234,8 +1318,17 @@ class SasTransformer(Transformer):
         return result
 
     def table_expr(self, items: list[Any]) -> list[Any]:
-        """Pass through table_expr children."""
-        return [item for item in items if item is not None]
+        """Build explicit joins and comma-separated implicit cross joins."""
+        result: list[Any] = []
+        for item in items:
+            if isinstance(item, FromTableNode):
+                if not result:
+                    result.append(item)
+                else:
+                    result.append(JoinNode(join_type="CROSS", table=item))
+            elif isinstance(item, JoinNode):
+                result.append(item)
+        return result
 
     def table_factor(self, items: list[Any]) -> Any:
         """Pass through table_factor (from_table or from_subquery)."""
@@ -1772,10 +1865,26 @@ class SasTransformer(Transformer):
         return ProcNode(proc_name="EXPORT", options=options, statements=[])
 
     def export_opt(self, items: list[Any]) -> tuple[str, Any]:
+        for item in items:
+            if isinstance(item, DatasetRefNode):
+                return ("DATA", item)
+        for item in _non_tokens(items):
+            if isinstance(item, tuple) and len(item) == 2:
+                return item
         return self._extract_option(items)
 
     def export_stmt(self, items: list[Any]) -> tuple[str, Any]:
+        for item in items:
+            if isinstance(item, DatasetRefNode):
+                return ("DATA", item)
         return self._extract_option(items)
+
+    def export_flag(self, items: list[Any]) -> tuple[str, Any]:
+        for item in items:
+            text = _get_text(item).upper()
+            if text in ("LABEL", "REPLACE"):
+                return (text, True)
+        return ("", True)
 
     # ── Global statements ───────────────────────────
 
@@ -1842,7 +1951,7 @@ class SasTransformer(Transformer):
         return [item for item in items if item is not None]
 
     def dataset_option(self, items: list[Any]) -> Any:
-        """Parse dataset options: KEEP=, DROP=, WHERE=, RENAME="""
+        """Parse dataset options: KEEP=, DROP=, WHERE=, RENAME=, IN=."""
         if not items:
             return None
 
@@ -1851,7 +1960,7 @@ class SasTransformer(Transformer):
         for item in items:
             if isinstance(item, Token):
                 kw = str(item).upper()
-                if kw in ("KEEP", "DROP", "WHERE", "RENAME"):
+                if kw in ("KEEP", "DROP", "WHERE", "RENAME", "IN"):
                     keyword = kw
                     break
 
@@ -1889,6 +1998,15 @@ class SasTransformer(Transformer):
                     old, new = item
                     renames[old] = new
             return {"RENAME": renames}
+
+        elif keyword == "IN":
+            names = [
+                str(item).upper()
+                for item in items
+                if isinstance(item, Token)
+                and str(item).upper() not in ("IN", "=")
+            ]
+            return {"IN": names[-1]} if names else None
 
         return None
 
@@ -1984,7 +2102,10 @@ class SasTransformer(Transformer):
         return items[0] if items else None
 
     def export_stmt(self, items: list[Any]) -> Any:
-        return items[0] if items else None
+        for item in items:
+            if isinstance(item, DatasetRefNode):
+                return ("DATA", item)
+        return self._extract_option(items)
 
     # ── DATA step UPDATE ──────────────────────────────
 
@@ -2026,10 +2147,19 @@ class SasTransformer(Transformer):
 
     def length_stmt(self, items: list[Any]) -> LengthNode:
         items_list = [item for item in items if not isinstance(item, Token) and item is not None]
-        return LengthNode(items=[item if isinstance(item, tuple) else (item, None) for item in items_list])
+        length_items: list[tuple[str, int | None]] = []
+        for item in items_list:
+            if isinstance(item, list):
+                length_items.extend(item)
+            elif isinstance(item, tuple):
+                length_items.append(item)
+            else:
+                length_items.append((item, None))
+        return LengthNode(items=length_items)
 
-    def length_item(self, items: list[Any]) -> tuple[str, int | None]:
+    def length_item(self, items: list[Any]) -> list[tuple[str, int | None]]:
         name = ""
+        names: list[str] = []
         length = None
         for item in items:
             if isinstance(item, Token):
@@ -2046,9 +2176,13 @@ class SasTransformer(Transformer):
                     name = t
             elif isinstance(item, (int, float)):
                 length = int(item)
+            elif isinstance(item, list):
+                names.extend(item)
             elif isinstance(item, str):
                 name = item
-        return (name, length)
+        if not names and name:
+            names.append(name)
+        return [(item, length) for item in names]
 
     # ── ATTRIB statement ──────────────────────────────
 
@@ -2296,7 +2430,19 @@ class SasTransformer(Transformer):
         key, val = self._extract_option(items)
         if hasattr(val, "name"):
             val = val.name
-        return {key.upper(): val}
+        key = "LIBRARY" if key.upper() == "LIB" else key.upper()
+        return {key: val}
+
+    def ds_nolist_opt(self, items: list[Any]) -> dict[str, Any]:
+        return {"NOLIST": True}
+
+    def ds_kill_opt(self, items: list[Any]) -> dict[str, Any]:
+        return {"KILL": True}
+
+    def ds_memtype_opt(self, items: list[Any]) -> dict[str, Any]:
+        values = _non_tokens(items)
+        value = _get_text(values[-1]) if values else "DATA"
+        return {"MEMTYPE": value.upper()}
 
     def ds_stmt(self, items: list[Any]) -> dict[str, Any]:
         """Transform PROC DATASETS sub-statement into a structured dict."""
@@ -2396,6 +2542,9 @@ class SasTransformer(Transformer):
         return self._generic_proc("TRANSPOSE", items)
 
     def transpose_opt(self, items: list[Any]) -> dict[str, Any]:
+        for item in items:
+            if isinstance(item, DatasetRefNode):
+                return {"OUT": item}
         return self._generic_opt(items)
 
     def transpose_var(self, items: list[Any]) -> dict[str, Any]:
@@ -2553,7 +2702,12 @@ class SasTransformer(Transformer):
         return self._generic_proc("REPORT", items)
 
     def report_opt(self, items: list[Any]) -> dict[str, Any]:
-        return self._generic_opt(items)
+        option = self._generic_opt(items)
+        if "NOWINDOWS" in option:
+            return {"NOWD": option["NOWINDOWS"]}
+        if any(key.startswith("STYLE") for key in option):
+            return {"STYLE_REPORT": True}
+        return option
 
     def report_column(self, items: list[Any]) -> dict[str, Any]:
         return {"action": "column", "names": self._stmt_names(items)}

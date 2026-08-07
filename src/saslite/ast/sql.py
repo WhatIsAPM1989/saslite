@@ -12,6 +12,7 @@ from saslite.ast.base import Node
 class ProcSqlNode(Node):
     """PROC SQL block."""
     statements: list[Any] = field(default_factory=list)
+    options: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -25,6 +26,8 @@ class SelectNode(Node):
     having_clause: Any = None
     order_by: list[Any] = field(default_factory=list)
     into_vars: list[str] = field(default_factory=list)
+    into_trimmed: list[bool] = field(default_factory=list)
+    into_separators: list[str | None] = field(default_factory=list)
 
 
 @dataclass
