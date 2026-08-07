@@ -51,6 +51,19 @@ def nmiss(*args: Any) -> int:
     return len([v for v in args if is_missing(v)])
 
 
+def cmiss(*args: Any) -> int:
+    """CMISS(value1, value2, ...) — count numeric and character missings.
+
+    SAS character missing values contain only blanks. A literal period remains
+    a non-missing character value; numeric missing values arrive as None/NaN.
+    """
+    return len([
+        value
+        for value in args
+        if is_missing(value) or (isinstance(value, str) and not value.strip())
+    ])
+
+
 def round_val(number: Any, unit: float = 1.0) -> float:
     """ROUND(number [, unit]) — round to nearest unit using SAS rounding (away from zero for .5)."""
     if is_missing(number):

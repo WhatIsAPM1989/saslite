@@ -424,33 +424,49 @@ class SasTransformer(Transformer):
 
     def array_stmt(self, items: list[Any]) -> ArrayNode:
         # ARRAY name[size] [var_list] [(init_values)]
-        skip = {"[", "]", "(", ")"}
-        # Filter out brackets, parens, and the ARRAY keyword itself
-        filtered = []
+        name = ""
+        size = None
+        variables: list[str] = []
+        initial_values: list[Any] = []
+        is_character = False
+        temporary = False
+        in_bounds = False
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
-                if t in skip or t.upper() == "ARRAY":
+                upper = t.upper()
+                if upper == "ARRAY":
                     continue
-            filtered.append(item)
-        # items: [NAME, NUMBER, name_list?, expr_list?]
-        name = _get_name(filtered[0]) if filtered else ""
-        size = None
-        variables = []
-        for item in filtered[1:]:
-            if isinstance(item, Token):
-                t = str(item)
-                if t.isdigit():
-                    size = int(t)
+                if not name and getattr(item, "type", "") == "NAME":
+                    name = t
+                    continue
+                if t == "[":
+                    in_bounds = True
+                    continue
+                if t == "]":
+                    in_bounds = False
+                    continue
+                if t == "$":
+                    is_character = True
+                    continue
+                if in_bounds and getattr(item, "type", "") == "NUMBER":
+                    size = int(float(t))
             elif isinstance(item, list):
                 if item and all(isinstance(v, str) for v in item):
-                    variables = item
+                    if any(v.upper() == "_TEMPORARY_" for v in item):
+                        temporary = True
+                    else:
+                        variables = item
                 elif item:
-                    # Could be name_list or expr_list
-                    variables = [_get_name(v) for v in item]
-            elif isinstance(item, (int, float)):
-                size = int(item)
-        return ArrayNode(name=name, bounds=size, variables=variables)
+                    initial_values = item
+        return ArrayNode(
+            name=name,
+            bounds=size,
+            variables=variables,
+            is_character=is_character,
+            temporary=temporary,
+            initial_values=initial_values,
+        )
 
     def input_stmt(self, items: list[Any]) -> InputNode:
         """Handle INPUT statement.
@@ -1951,7 +1967,7 @@ class SasTransformer(Transformer):
         return [item for item in items if item is not None]
 
     def dataset_option(self, items: list[Any]) -> Any:
-        """Parse dataset options: KEEP=, DROP=, WHERE=, RENAME=, IN=."""
+        """Parse input data set options."""
         if not items:
             return None
 
@@ -1960,7 +1976,10 @@ class SasTransformer(Transformer):
         for item in items:
             if isinstance(item, Token):
                 kw = str(item).upper()
-                if kw in ("KEEP", "DROP", "WHERE", "RENAME", "IN"):
+                if kw in (
+                    "KEEP", "DROP", "WHERE", "RENAME", "IN",
+                    "FIRSTOBS", "OBS",
+                ):
                     keyword = kw
                     break
 
@@ -2007,6 +2026,24 @@ class SasTransformer(Transformer):
                 and str(item).upper() not in ("IN", "=")
             ]
             return {"IN": names[-1]} if names else None
+
+        elif keyword in ("FIRSTOBS", "OBS"):
+            value = next(
+                (
+                    _clean_token_value(item)
+                    for item in items
+                    if isinstance(item, Token)
+                    and getattr(item, "type", "") == "NUMBER"
+                ),
+                None,
+            )
+            if not isinstance(value, int):
+                raise ValueError(f"{keyword}= requires an integer observation number")
+            if keyword == "FIRSTOBS" and value < 1:
+                raise ValueError("FIRSTOBS= requires an observation number of at least 1")
+            if keyword == "OBS" and value < 0:
+                raise ValueError("OBS= requires a non-negative observation number")
+            return {keyword: value}
 
         return None
 
@@ -2147,24 +2184,49 @@ class SasTransformer(Transformer):
 
     def length_stmt(self, items: list[Any]) -> LengthNode:
         items_list = [item for item in items if not isinstance(item, Token) and item is not None]
-        length_items: list[tuple[str, int | None]] = []
+        parsed_items: list[tuple[str, int | None, bool]] = []
         for item in items_list:
             if isinstance(item, list):
-                length_items.extend(item)
-            elif isinstance(item, tuple):
-                length_items.append(item)
+                parsed_items.extend(item)
+            elif isinstance(item, tuple) and len(item) == 3:
+                parsed_items.append(item)
             else:
-                length_items.append((item, None))
-        return LengthNode(items=length_items)
+                parsed_items.append((str(item), None, False))
 
-    def length_item(self, items: list[Any]) -> list[tuple[str, int | None]]:
+        # A single SAS length specification applies to the variable list that
+        # precedes it: LENGTH first second $20 third 8;
+        resolved: list[tuple[str, int | None, bool]] = []
+        pending: list[str] = []
+        for name, length, is_character in parsed_items:
+            pending.append(name)
+            if length is None:
+                continue
+            resolved.extend(
+                (pending_name, length, is_character)
+                for pending_name in pending
+            )
+            pending = []
+        resolved.extend((name, None, False) for name in pending)
+
+        return LengthNode(
+            items=[(name, length) for name, length, _ in resolved],
+            character_variables={
+                name.upper() for name, _, is_character in resolved if is_character
+            },
+        )
+
+    def length_item(self, items: list[Any]) -> list[tuple[str, int | None, bool]]:
         name = ""
         names: list[str] = []
         length = None
+        is_character = False
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
-                if t.upper() == "LENGTH" or t == "$":
+                if t.upper() == "LENGTH":
+                    continue
+                if t == "$":
+                    is_character = True
                     continue
                 # Check if it's a NUMBER token
                 if hasattr(item, 'type') and item.type == "NUMBER":
@@ -2182,7 +2244,7 @@ class SasTransformer(Transformer):
                 name = item
         if not names and name:
             names.append(name)
-        return [(item, length) for item in names]
+        return [(item, length, is_character) for item in names]
 
     # ── ATTRIB statement ──────────────────────────────
 
@@ -2604,6 +2666,9 @@ class SasTransformer(Transformer):
         return self._generic_proc("FORMAT", items)
 
     def format_proc_opt(self, items: list[Any]) -> dict[str, Any]:
+        for item in items:
+            if isinstance(item, DatasetRefNode):
+                return {"CNTLIN": item}
         return self._generic_opt(items)
 
     def value_stmt(self, items: list[Any]) -> dict[str, Any]:

@@ -54,7 +54,7 @@ option_value: NAME | NUMBER | STRING
 
 // ─── DATA step ────────────────────────────────────
 
-data_step: "DATA"i dataset_target ("," dataset_target)* ";" data_stmt* "RUN"i ";"
+data_step: "DATA"i dataset_target (","? dataset_target)* ";" data_stmt* "RUN"i ";"
 
 dataset_target: qualified_name
               | "_NULL_"i
@@ -114,6 +114,8 @@ dataset_option: "KEEP"i "=" name_list
               | "WHERE"i "=" "(" expr ")"
               | "RENAME"i "=" "(" (rename_pair)+ ")"
               | "IN"i "=" NAME
+              | "FIRSTOBS"i "=" NUMBER
+              | "OBS"i "=" NUMBER
 
 assign_stmt: NAME "=" expr
 arr_assign_stmt: NAME "[" expr "]" "=" expr
@@ -408,6 +410,7 @@ copy_stmt: "SELECT"i name_list ";" -> copy_select
 proc_format: "PROC"i "FORMAT"i (format_proc_opt)* ";" (value_stmt)* "RUN"i ";"
 
 format_proc_opt: "LIBRARY"i "=" qualified_name
+               | "CNTLIN"i "=" dataset_ref
 
 value_stmt: "VALUE"i "$"? NAME (value_range)+ ";"
 

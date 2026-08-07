@@ -131,6 +131,8 @@ class ArrayNode(Node):
     bounds: Any = None
     variables: list[str] = field(default_factory=list)
     is_character: bool = False
+    temporary: bool = False
+    initial_values: list[Any] = field(default_factory=list)
 
 
 @dataclass
@@ -176,6 +178,7 @@ class SubstrAssignNode(Node):
 class LengthNode(Node):
     """LENGTH statement — set variable lengths."""
     items: list[tuple[str, int | None]] = field(default_factory=list)
+    character_variables: set[str] = field(default_factory=set)
 
 
 @dataclass

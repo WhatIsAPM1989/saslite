@@ -51,6 +51,7 @@ def build_default_registry() -> FunctionRegistry:
     reg.register("MAX", numeric_funcs.max_val)
     reg.register("N", numeric_funcs.n)
     reg.register("NMISS", numeric_funcs.nmiss)
+    reg.register("CMISS", numeric_funcs.cmiss)
     reg.register("ROUND", numeric_funcs.round_val)
     reg.register("INT", numeric_funcs.int_val)
     reg.register("MOD", numeric_funcs.mod_val)

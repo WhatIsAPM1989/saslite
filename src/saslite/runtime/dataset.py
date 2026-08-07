@@ -71,10 +71,17 @@ class Dataset:
     def select_columns(self, columns: list[str]) -> Dataset:
         """Return new dataset with only the specified columns."""
         cols = [c for c in columns if c in self.data.columns]
+        new_meta = self.metadata.copy()
+        selected = {str(column).upper() for column in cols}
+        new_meta.variables = {
+            logical_name: variable
+            for logical_name, variable in new_meta.variables.items()
+            if logical_name in selected
+        }
         return Dataset(
             name=self.name,
             data=self.data[cols].copy(),
-            metadata=self.metadata.copy(),
+            metadata=new_meta,
         )
 
     def rename_columns(self, mapping: dict[str, str]) -> Dataset:

@@ -206,6 +206,68 @@ class SqlIntoTests(unittest.TestCase):
         self.assertTrue(result.success, result.error)
         self.assertEqual(sas.get_dataset("WORK", "RESULT").iloc[0]["value"], 2)
 
+    def test_local_into_value_drives_iterative_macro_loop_at_runtime(self) -> None:
+        sas = SasInterpreter()
+        sas.create_dataset("source", pd.DataFrame({"value": [10, 20, 30]}))
+
+        result = sas.execute(
+            """
+            %macro build;
+              %local row_count index;
+              proc sql noprint;
+                select count(*) into :row_count trimmed from source;
+              quit;
+
+              %do index=1 %to &row_count.;
+                data result&index.;
+                  value=&index.;
+                run;
+              %end;
+            %mend;
+            %build;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            [
+                sas.get_dataset("WORK", f"RESULT{index}").iloc[0]["value"]
+                for index in range(1, 4)
+            ],
+            [1, 2, 3],
+        )
+
+    def test_call_symput_value_drives_later_macro_conditional(self) -> None:
+        sas = SasInterpreter()
+        sas.create_dataset("source", pd.DataFrame({"choice": [2]}))
+
+        result = sas.execute(
+            """
+            %macro choose;
+              %local selected;
+              data _null_;
+                set source;
+                call symputx("selected", choice);
+              run;
+
+              %if &selected. = 2 %then %do;
+                data result;
+                  value=&selected.;
+                run;
+              %end;
+              %else %do;
+                data result;
+                  value=0;
+                run;
+              %end;
+            %mend;
+            %choose;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas.get_dataset("WORK", "RESULT").iloc[0]["value"], 2)
+
     def test_create_table_accepts_union_all_query(self) -> None:
         sas = SasInterpreter()
         sas.create_dataset(
@@ -319,6 +381,73 @@ class SqlIntoTests(unittest.TestCase):
                 {"ord": 1, "label": "A", "trtn": 20},
                 {"ord": 2, "label": "B", "trtn": 10},
                 {"ord": 2, "label": "B", "trtn": 20},
+            ],
+        )
+
+    def test_grouped_left_join_uses_keys_from_temporary_array(self) -> None:
+        sas = SasInterpreter()
+        sas.create_dataset(
+            "base",
+            pd.DataFrame(
+                {
+                    "subject": ["01", "02"],
+                    "arm": [1, 1],
+                    "all_value": ["All", "All"],
+                    "status_value": ["Eligible", "Ineligible"],
+                    "response": [1, 0],
+                }
+            ),
+        )
+        sas.create_dataset(
+            "shell",
+            pd.DataFrame(
+                {
+                    "key": ["all_key", "status_key"],
+                    "value": ["All", "Eligible"],
+                    "arm": [1, 1],
+                }
+            ),
+        )
+
+        result = sas.execute(
+            """
+            data long;
+              length key $32 value $40;
+              set base;
+              array values[2] $40 all_value status_value;
+              array keys[2] $32 _temporary_ ("all_key", "status_key");
+              do index=1 to dim(values);
+                key=keys[index];
+                value=values[index];
+                output;
+              end;
+              keep subject arm response key value;
+            run;
+
+            proc sql;
+              create table counts as
+              select a.key, a.value, a.arm,
+                     count(distinct b.subject) as denominator,
+                     coalesce(sum(b.response=1),0) as responders
+              from shell as a left join long as b
+                on a.key=b.key and a.value=b.value and a.arm=b.arm
+              group by a.key, a.value, a.arm
+              order by a.key;
+            quit;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        long_data = sas.get_dataset("WORK", "LONG")
+        self.assertEqual(set(long_data["key"]), {"all_key", "status_key"})
+        counts = sas.get_dataset("WORK", "COUNTS")
+        self.assertEqual(
+            counts.to_dict("records"),
+            [
+                {"key": "all_key", "value": "All", "arm": 1,
+                 "denominator": 2, "responders": 1},
+                {"key": "status_key", "value": "Eligible", "arm": 1,
+                 "denominator": 1, "responders": 1},
             ],
         )
 

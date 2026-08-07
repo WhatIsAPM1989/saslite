@@ -116,7 +116,7 @@ class SasInterpreter:
         # PROC SQL INTO creates macro variables while the program is running.
         # Expand later RUN/QUIT-delimited steps only after the producing SQL
         # step has executed, so consumers see the newly assigned values.
-        if self._has_later_sql_into_reference(source):
+        if self._has_later_runtime_macro_reference(source):
             chunks = self._split_into_step_chunks(source)
             return self._execute_chunks(chunks)
 
@@ -145,20 +145,14 @@ class SasInterpreter:
             # generated step boundaries before executing it.
             if (
                 re.search(r"%\s*MACRO\b", chunk, re.IGNORECASE)
-                and self._has_later_sql_into_reference(chunk)
+                and self._has_later_runtime_macro_reference(chunk)
             ):
-                for scope in self._session._macro_stack:
-                    for key, value in scope.variables.items():
-                        self._macro._global_vars[key] = value
+                self._sync_runtime_macro_values()
                 expanded_chunk = self._macro.expand(chunk)
                 for line in self._macro.put_output:
                     self._reporter.log(line)
                 self._macro.put_output.clear()
-                nested_chunks = self._split_into_step_chunks(expanded_chunk)
-                if len(nested_chunks) > 1:
-                    part = self._execute_chunks(nested_chunks)
-                else:
-                    part = self._execute_expanded(expanded_chunk)
+                part = self._execute_staged_macro_source(expanded_chunk)
             else:
                 part = self._execute_expanded(chunk)
             for step in part.steps:
@@ -168,6 +162,55 @@ class SasInterpreter:
                 combined.error = part.error
                 break
         return combined
+
+    def _execute_staged_macro_source(self, source: str) -> RunSummary:
+        """Execute an expanded macro body while preserving runtime flow.
+
+        A macro can create a value in one SAS step and consume it in a later
+        macro statement.  Keep unexpanded macro-control groups on a queue,
+        expanding only the next group after earlier executable steps have
+        populated the session macro table.
+        """
+        combined = RunSummary(success=True)
+        queue = self._split_into_step_chunks(source)
+        while queue:
+            chunk = queue.pop(0)
+            if not chunk.strip():
+                continue
+            self._sync_runtime_macro_values()
+            try:
+                expanded = self._macro.expand_macro_fragment(chunk)
+                for line in self._macro.put_output:
+                    self._reporter.log(line)
+                self._macro.put_output.clear()
+            except Exception as exc:
+                self._reporter.error(str(exc))
+                combined.success = False
+                combined.error = str(exc)
+                break
+
+            nested = self._split_into_step_chunks(expanded)
+            if len(nested) > 1:
+                queue[0:0] = nested
+                continue
+
+            part = self._execute_expanded(expanded, macro_fragment=True)
+            for step in part.steps:
+                combined.add_step(step)
+            if not part.success:
+                combined.success = False
+                combined.error = part.error
+                break
+        return combined
+
+    def _sync_runtime_macro_values(self) -> None:
+        """Copy values produced by executable steps into the expander."""
+        for scope in self._session._macro_stack:
+            for key, value in scope.variables.items():
+                if key in self._macro._local_vars:
+                    self._macro._local_vars[key] = value
+                else:
+                    self._macro._global_vars[key] = value
 
     @staticmethod
     def _has_later_sql_into_reference(source: str) -> bool:
@@ -184,24 +227,43 @@ class SasInterpreter:
                     return True
         return False
 
-    def _execute_expanded(self, source: str) -> RunSummary:
+    @classmethod
+    def _has_later_runtime_macro_reference(cls, source: str) -> bool:
+        """Return whether a runtime-assigned macro variable is used later."""
+        if cls._has_later_sql_into_reference(source):
+            return True
+
+        symput = re.compile(
+            r"\bCALL\s+SYMPUTX?\s*\(\s*(['\"])([A-Za-z_]\w*)\1\s*,",
+            flags=re.IGNORECASE,
+        )
+        for match in symput.finditer(source):
+            name = match.group(2)
+            if re.search(
+                rf"&{re.escape(name)}(?:\.|\b)",
+                source[match.end():],
+                flags=re.IGNORECASE,
+            ):
+                return True
+        return False
+
+    def _execute_expanded(
+        self,
+        source: str,
+        *,
+        macro_fragment: bool = False,
+    ) -> RunSummary:
         """Run the preprocess → macro-expand → parse → dispatch pipeline."""
         try:
             # Step 0.5: Preprocess DATALINES blocks
             source, datalines_list = self._preprocess_datalines(source)
 
             # Step 1: Macro expansion (sync CALL SYMPUT vars from session first)
-            for scope in self._session._macro_stack:
-                for k, v in scope.variables.items():
-                    # A %LET seen in an earlier chunk lives in the expander's
-                    # local table. PROC SQL INTO/CALL SYMPUT may subsequently
-                    # replace that same macro variable in Session; update the
-                    # existing slot so the stale %LET value cannot shadow it.
-                    if k in self._macro._local_vars:
-                        self._macro._local_vars[k] = v
-                    else:
-                        self._macro._global_vars[k] = v
-            expanded = self._macro.expand(source)
+            self._sync_runtime_macro_values()
+            if macro_fragment:
+                expanded = self._macro.expand_macro_fragment(source)
+            else:
+                expanded = self._macro.expand(source)
 
             # Report %PUT output
             for line in self._macro.put_output:
@@ -265,6 +327,7 @@ class SasInterpreter:
         current: list[str] = []
         in_datalines = False
         macro_depth = 0
+        macro_control_depth = 0
 
         for line in lines:
             stripped = line.strip().upper()
@@ -284,7 +347,21 @@ class SasInterpreter:
             if macro_depth < 0:
                 macro_depth = 0
 
-            if macro_depth == 0 and _re.search(r"\b(RUN|QUIT)\s*;\s*$", stripped):
+            if macro_depth == 0:
+                macro_control_depth += len(
+                    _re.findall(r"%\s*DO\b", line, flags=_re.IGNORECASE)
+                )
+                macro_control_depth -= len(
+                    _re.findall(r"%\s*END\b", line, flags=_re.IGNORECASE)
+                )
+                if macro_control_depth < 0:
+                    macro_control_depth = 0
+
+            if (
+                macro_depth == 0
+                and macro_control_depth == 0
+                and _re.search(r"\b(RUN|QUIT)\s*;\s*$", stripped)
+            ):
                 chunks.append("\n".join(current))
                 current = []
 
