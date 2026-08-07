@@ -90,6 +90,7 @@ class DataStepExecutor:
             merge_nodes = [s for s in step.statements if isinstance(s, MergeNode)]
             set_nodes = [s for s in step.statements if isinstance(s, SetNode)]
             input_nodes = [s for s in step.statements if isinstance(s, InputNode)]
+            set_length_warnings: list[str] = []
 
             if input_nodes and input_nodes[0].datalines_data:
                 # INPUT + DATALINES mode: parse rows into an in-memory dataset and
@@ -146,6 +147,8 @@ class DataStepExecutor:
                                 error=f"Dataset {ds_name} does not exist",
                             )
                     set_groups.append(group)
+
+                set_length_warnings = self._set_length_warnings(set_groups)
 
             # Build PDV
             pdv = self._build_pdv(step, input_datasets)
@@ -313,9 +316,14 @@ class DataStepExecutor:
                     dataset_name=f"{target_libref}.{target_name}",
                     rows_affected=out_ds.nrow,
                     notes=[f"Dataset {target_libref}.{target_name} created with {out_ds.nrow} observations and {out_ds.ncol} variables."],
+                    warnings=set_length_warnings,
                 )
             else:
-                return StepResult(success=True, rows_affected=0)
+                return StepResult(
+                    success=True,
+                    rows_affected=0,
+                    warnings=set_length_warnings,
+                )
 
         except Exception as e:
             return StepResult(success=False, error=str(e))
@@ -344,6 +352,35 @@ class DataStepExecutor:
                         pdv.set(name, val)
 
         return pdv
+
+    @staticmethod
+    def _set_length_warnings(set_groups: list[list[Dataset]]) -> list[str]:
+        """Return SAS-style warnings for conflicting SET variable lengths."""
+        lengths_by_variable: dict[str, set[int]] = {}
+        display_names: dict[str, str] = {}
+
+        for group in set_groups:
+            for ds in group:
+                for column in ds.data.columns:
+                    var_meta = ds.metadata.get_variable(str(column))
+                    if var_meta is None:
+                        continue
+                    logical_name = var_meta.logical_name
+                    if var_meta.length is None:
+                        continue
+                    lengths_by_variable.setdefault(logical_name, set()).add(var_meta.length)
+                    display_names.setdefault(logical_name, var_meta.name)
+
+        return [
+            (
+                f"Multiple lengths were specified for the variable "
+                f"{display_names[logical_name]} by input data set(s). "
+                f"Different lengths: {', '.join(str(length) for length in sorted(lengths))}. "
+                "This can cause truncation of data."
+            )
+            for logical_name, lengths in lengths_by_variable.items()
+            if len(lengths) > 1
+        ]
 
     def _has_explicit_output(self, statements: list[Any]) -> bool:
         """Recursively check for explicit OUTPUT statements."""
