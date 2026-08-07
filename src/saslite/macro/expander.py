@@ -21,6 +21,12 @@ class MacroDef:
 class MacroExpander:
     """Macro expander for %LET, &var, %MACRO/%MEND, and macro invocation."""
 
+    _OPEN_CODE_MACRO_ERROR = "Macro code is not allowed in open code."
+    _MACRO_SCOPE_KEYWORDS = (
+        "IF", "THEN", "ELSE", "DO", "END", "TO", "BY", "WHILE", "UNTIL",
+        "GOTO", "RETURN", "LOCAL", "MEND",
+    )
+
     def __init__(self, session: Any | None = None) -> None:
         self._global_vars: dict[str, str] = {}
         self._local_vars: dict[str, str] = {}
@@ -101,6 +107,11 @@ class MacroExpander:
 
         # Step 2: Process %MACRO/%MEND definitions
         source = self._process_macro_definitions(source)
+
+        # Macro control statements are valid only inside a macro definition.
+        # Definitions have been removed from the open-code stream above, while
+        # their bodies will be processed later when the macro is invoked.
+        self._reject_open_code_macro_statements(source)
 
         # Step 2.5: Process macro character functions and %SYSFUNC
         source = self._process_macro_functions(source)
@@ -267,6 +278,37 @@ class MacroExpander:
                                           defaults=defaults)
             result = result.replace(match.group(0), "")
         return result
+
+    def _reject_open_code_macro_statements(self, source: str) -> None:
+        """Reject macro control statements outside %MACRO/%MEND definitions."""
+        # Do not interpret percent-prefixed text inside quoted SAS strings as
+        # macro statements. SAS escapes a quote inside a string by doubling it.
+        unquoted: list[str] = []
+        quote: str | None = None
+        i = 0
+        while i < len(source):
+            ch = source[i]
+            if quote is None:
+                if ch in ("'", '"'):
+                    quote = ch
+                    unquoted.append(" ")
+                else:
+                    unquoted.append(ch)
+                i += 1
+                continue
+
+            unquoted.append(" ")
+            if ch == quote:
+                if i + 1 < len(source) and source[i + 1] == quote:
+                    unquoted.append(" ")
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+
+        keywords = "|".join(self._MACRO_SCOPE_KEYWORDS)
+        if re.search(rf"%\s*(?:{keywords})\b", "".join(unquoted), re.IGNORECASE):
+            raise SyntaxError(self._OPEN_CODE_MACRO_ERROR)
 
     def _process_conditionals(self, source: str) -> str:
         """Process %IF ... %THEN ... %ELSE ... %DO ... %END; conditionals."""
