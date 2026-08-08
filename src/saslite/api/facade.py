@@ -14,7 +14,7 @@ from saslite.session.session import Session
 from saslite.storage.path_resolver import StorageRouter
 from saslite.executor.dispatcher import Dispatcher
 from saslite.executor.proc.registry import (
-    handle_proc_print, handle_proc_sort, handle_proc_contents,
+    handle_proc_print, handle_proc_sgrender, handle_proc_sort, handle_proc_contents,
     handle_proc_means, handle_proc_freq, handle_proc_import, handle_proc_export,
     handle_proc_append, handle_proc_datasets,
 )
@@ -286,6 +286,7 @@ class SasInterpreter:
             session = self._session
             reporter = self._reporter
             dispatcher.register_proc("PRINT", lambda p: handle_proc_print(p, session, reporter))
+            dispatcher.register_proc("SGRENDER", lambda p: handle_proc_sgrender(p, session, reporter))
             dispatcher.register_proc("SORT", lambda p: handle_proc_sort(p, session, reporter))
             dispatcher.register_proc("CONTENTS", lambda p: handle_proc_contents(p, session, reporter))
             dispatcher.register_proc("MEANS", lambda p: handle_proc_means(p, session, reporter))
@@ -328,9 +329,31 @@ class SasInterpreter:
         in_datalines = False
         macro_depth = 0
         macro_control_depth = 0
+        in_block_comment = False
+
+        def structural_text(line: str) -> str:
+            """Return code outside /* ... */ while preserving comment state."""
+            nonlocal in_block_comment
+            visible: list[str] = []
+            position = 0
+            while position < len(line):
+                if in_block_comment:
+                    end = line.find("*/", position)
+                    if end < 0:
+                        return "".join(visible)
+                    in_block_comment = False
+                    position = end + 2
+                    continue
+                start = line.find("/*", position)
+                if start < 0:
+                    visible.append(line[position:])
+                    break
+                visible.append(line[position:start])
+                in_block_comment = True
+                position = start + 2
+            return "".join(visible)
 
         for line in lines:
-            stripped = line.strip().upper()
             current.append(line)
 
             if in_datalines:
@@ -338,21 +361,26 @@ class SasInterpreter:
                     in_datalines = False
                 continue
 
+            active_line = structural_text(line)
+            stripped = active_line.strip().upper()
+            if not stripped:
+                continue
+
             if _re.match(r"^(DATALINES|CARDS|LINES4)\s*;\s*$", stripped):
                 in_datalines = True
                 continue
 
-            macro_depth += len(_re.findall(r"%\s*MACRO\b", line, flags=_re.IGNORECASE))
-            macro_depth -= len(_re.findall(r"%\s*MEND\b", line, flags=_re.IGNORECASE))
+            macro_depth += len(_re.findall(r"%\s*MACRO\b", active_line, flags=_re.IGNORECASE))
+            macro_depth -= len(_re.findall(r"%\s*MEND\b", active_line, flags=_re.IGNORECASE))
             if macro_depth < 0:
                 macro_depth = 0
 
             if macro_depth == 0:
                 macro_control_depth += len(
-                    _re.findall(r"%\s*DO\b", line, flags=_re.IGNORECASE)
+                    _re.findall(r"%\s*DO\b", active_line, flags=_re.IGNORECASE)
                 )
                 macro_control_depth -= len(
-                    _re.findall(r"%\s*END\b", line, flags=_re.IGNORECASE)
+                    _re.findall(r"%\s*END\b", active_line, flags=_re.IGNORECASE)
                 )
                 if macro_control_depth < 0:
                     macro_control_depth = 0

@@ -644,6 +644,8 @@ class SqlExecutor:
                 into_vars=sel.into_vars,
                 into_trimmed=sel.into_trimmed,
                 into_separators=sel.into_separators,
+                into_rowwise=sel.into_rowwise,
+                into_open_range=sel.into_open_range,
             )
             return self._execute_select_grouped(
                 sel_grouped,
@@ -721,7 +723,26 @@ class SqlExecutor:
 
     def _assign_into_vars(self, sel: SelectNode, df: pd.DataFrame) -> None:
         """Assign positional SELECT columns to INTO macro variables."""
+        if sel.into_open_range:
+            import re
+
+            match = re.fullmatch(r"(.*?)(\d+)", sel.into_open_range)
+            if match is not None and df.shape[1] > 0:
+                start = int(match.group(2))
+                for index in range(len(df)):
+                    self.session.set_macro_var(
+                        f"{match.group(1)}{start + index}",
+                        self._into_text(df.iloc[index, 0]),
+                    )
+            return
         for index, name in enumerate(sel.into_vars):
+            if sel.into_rowwise:
+                if df.empty or index >= len(df) or df.shape[1] == 0:
+                    continue
+                self.session.set_macro_var(
+                    name, self._into_text(df.iloc[index, 0])
+                )
+                continue
             if index >= len(df.columns) or df.empty:
                 continue
             separator = (
@@ -2101,10 +2122,20 @@ class SqlExecutor:
                 return left & right
             if op == "OR":
                 return left | right
+            if op == "CONTAINS":
+                return pd.Series(
+                    [
+                        False
+                        if is_missing(left.iloc[index]) or is_missing(right.iloc[index])
+                        else str(right.iloc[index]) in str(left.iloc[index])
+                        for index in range(len(df))
+                    ],
+                    index=df.index,
+                )
 
         if isinstance(expr, UnaryOpNode):
             operand = self._eval_vectorized(expr.operand, df, col_map)
-            if expr.op.upper() == "NOT":
+            if expr.op.upper() in ("NOT", "^", "~"):
                 return ~operand
             if expr.op == "-":
                 return -operand
@@ -2206,7 +2237,14 @@ class SqlExecutor:
         has_aggregates = False
         for col_node in columns:
             if isinstance(col_node, SelectColumnNode) and isinstance(col_node.expr, FunctionCallNode):
-                fn_name = col_node.expr.name.upper()
+                aggregate_expr = col_node.expr
+                if (
+                    aggregate_expr.name.upper() == "COALESCE"
+                    and aggregate_expr.args
+                    and isinstance(aggregate_expr.args[0], FunctionCallNode)
+                ):
+                    aggregate_expr = aggregate_expr.args[0]
+                fn_name = aggregate_expr.name.upper()
                 if fn_name in ("COUNT", "SUM", "AVG", "MEAN", "MIN", "MAX", "STD", "MEDIAN"):
                     has_aggregates = True
                     break
@@ -2232,11 +2270,24 @@ class SqlExecutor:
                     alias = f"_COL{column_index + 1}"
 
                 if isinstance(col_node.expr, FunctionCallNode):
-                    fn_name = col_node.expr.name.upper()
+                    aggregate_expr = col_node.expr
+                    fallback_expr = None
+                    if (
+                        aggregate_expr.name.upper() == "COALESCE"
+                        and aggregate_expr.args
+                        and isinstance(aggregate_expr.args[0], FunctionCallNode)
+                    ):
+                        fallback_expr = (
+                            aggregate_expr.args[1]
+                            if len(aggregate_expr.args) > 1
+                            else None
+                        )
+                        aggregate_expr = aggregate_expr.args[0]
+                    fn_name = aggregate_expr.name.upper()
                     if fn_name in ("COUNT", "SUM", "AVG", "MEAN", "MIN", "MAX", "STD", "MEDIAN"):
                         # Handle aggregate function
-                        if col_node.expr.args:
-                            arg0 = col_node.expr.args[0]
+                        if aggregate_expr.args:
+                            arg0 = aggregate_expr.args[0]
                             distinct_agg = (isinstance(arg0, FunctionCallNode)
                                             and arg0.name == "_DISTINCT_")
                             if distinct_agg:
@@ -2287,6 +2338,14 @@ class SqlExecutor:
                                         result_row[alias] = None
                         else:
                             result_row[alias] = None
+                        if is_missing(result_row.get(alias)) and fallback_expr is not None:
+                            fallback_values = self._eval_per_row(
+                                fallback_expr, df.head(1), col_map
+                            )
+                            if fallback_values:
+                                result_row[alias] = fallback_values[0]
+                            elif isinstance(fallback_expr, LiteralNode):
+                                result_row[alias] = fallback_expr.value
                         continue
 
                 # Non-aggregate expression or literal

@@ -34,6 +34,7 @@ def build_default_registry() -> FunctionRegistry:
     reg.register("MISSING", char_funcs.missing)
     reg.register("COALESCEC", char_funcs.coalescec)
     reg.register("PRXMATCH", char_funcs.prxmatch)
+    reg.register("PRXCHANGE", char_funcs.prxchange)
     reg.register("PROPCASE", char_funcs.propcase)
     reg.register("COUNTW", char_funcs.countw)
     reg.register("VERIFY", char_funcs.verify)

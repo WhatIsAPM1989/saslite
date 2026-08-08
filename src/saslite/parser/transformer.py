@@ -164,6 +164,9 @@ class SasTransformer(Transformer):
             return LiteralNode(value=float(text), literal_type="number")
         return LiteralNode(value=int(text), literal_type="number")
 
+    def missing_numeric(self, items: list[Any]) -> LiteralNode:
+        return LiteralNode(value=float("nan"), literal_type="missing")
+
     def string(self, items: list[Any]) -> LiteralNode:
         text = _get_text(items[0])
         # Strip quotes
@@ -289,6 +292,15 @@ class SasTransformer(Transformer):
         prefix = left_match.group(1)
         return [f"{prefix}{number}" for number in range(start, end + step, step)]
 
+    def name_prefix(self, items: list[Any]) -> str:
+        """Preserve SAS prefix lists such as KEEP COL:."""
+        name = next(
+            (str(item) for item in items
+             if isinstance(item, Token) and str(item) != ":"),
+            "",
+        )
+        return f"{name}:"
+
     def in_list(self, items: list[Any]) -> FunctionCallNode:
         # Rewrite as IN function call
         non_tok = _non_tokens(items)
@@ -315,6 +327,19 @@ class SasTransformer(Transformer):
     def not_like_op(self, items: list[Any]) -> LikeNode:
         non_tok = _non_tokens(items)
         return LikeNode(expr=non_tok[0], pattern=non_tok[1], negated=True)
+
+    def contains_op(self, items: list[Any]) -> BinaryOpNode:
+        non_tok = _non_tokens(items)
+        return BinaryOpNode(op="CONTAINS", left=non_tok[0], right=non_tok[1])
+
+    def not_contains_op(self, items: list[Any]) -> UnaryOpNode:
+        non_tok = _non_tokens(items)
+        return UnaryOpNode(
+            op="NOT",
+            operand=BinaryOpNode(
+                op="CONTAINS", left=non_tok[0], right=non_tok[1]
+            ),
+        )
 
     def between_op(self, items: list[Any]) -> BetweenNode:
         non_tok = _non_tokens(items)
@@ -440,7 +465,15 @@ class SasTransformer(Transformer):
 
     def set_stmt(self, items: list[Any]) -> SetNode:
         datasets = [item for item in items if item is not None and not isinstance(item, Token)]
-        return SetNode(datasets=datasets)
+        end_var = ""
+        for index, item in enumerate(items):
+            if isinstance(item, Token) and str(item).upper() == "END":
+                for candidate in items[index + 1:]:
+                    if isinstance(candidate, Token) and str(candidate) not in ("=", ";"):
+                        end_var = str(candidate)
+                        break
+                break
+        return SetNode(datasets=datasets, end_var=end_var)
 
     def merge_stmt(self, items: list[Any]) -> MergeNode:
         datasets = _non_tokens(items)
@@ -1014,6 +1047,31 @@ class SasTransformer(Transformer):
 
         return do
 
+    def do_value_list(self, items: list[Any]) -> DoNode:
+        """Handle ``DO var = value1, value2, ...;`` loops."""
+        variable = ""
+        values: list[Any] = []
+        body: list[Any] = []
+        in_body = False
+
+        for item in items:
+            if isinstance(item, Token):
+                text = str(item)
+                upper = text.upper()
+                if not variable and upper not in {"DO", "=", ",", ";", "END"}:
+                    variable = text
+                elif text == ";" and values and not in_body:
+                    in_body = True
+                continue
+            if item is None:
+                continue
+            if in_body:
+                body.append(item)
+            else:
+                values.append(item)
+
+        return DoNode(var=variable, values=values, body=body)
+
     def output_stmt(self, items: list[Any]) -> OutputNode:
         # Filter out the OUTPUT keyword token, only keep the dataset name if provided
         non_tok = _non_tokens(items)
@@ -1231,13 +1289,26 @@ class SasTransformer(Transformer):
         return {"OUTOBS": int(value)}
 
     def into_clause(self, items: list[Any]) -> dict[str, Any]:
-        targets = [item for item in items if isinstance(item, tuple)]
+        targets: list[tuple[str, bool, str | None]] = []
+        rowwise = False
+        open_range = ""
+        for item in items:
+            if isinstance(item, tuple):
+                targets.append(item)
+            elif isinstance(item, list):
+                targets.extend(item)
+                rowwise = True
+            elif isinstance(item, dict) and "_INTO_OPEN_RANGE" in item:
+                open_range = item["_INTO_OPEN_RANGE"]
+                rowwise = True
         return {
             "_INTO": [name for name, _trimmed, _separator in targets],
             "_INTO_TRIMMED": [trimmed for _name, trimmed, _separator in targets],
             "_INTO_SEPARATORS": [
                 separator for _name, _trimmed, separator in targets
             ],
+            "_INTO_ROWWISE": rowwise,
+            "_INTO_OPEN_RANGE": open_range,
         }
 
     def into_var(self, items: list[Any]) -> tuple[str, bool, str | None]:
@@ -1245,6 +1316,45 @@ class SasTransformer(Transformer):
             if isinstance(t, Token) and str(t) != ":":
                 return str(t).upper(), False, None
         return "", False, None
+
+    def into_var_range(
+        self, items: list[Any]
+    ) -> list[tuple[str, bool, str | None]]:
+        names = [
+            str(item) for item in items
+            if isinstance(item, Token) and str(item) not in (":", "-")
+        ]
+        if len(names) != 2:
+            expanded = names
+        else:
+            left_match = re.fullmatch(r"(.*?)(\d+)", names[0])
+            right_match = re.fullmatch(r"(.*?)(\d+)", names[1])
+            if (
+                left_match is None
+                or right_match is None
+                or left_match.group(1).upper() != right_match.group(1).upper()
+            ):
+                expanded = names
+            else:
+                start = int(left_match.group(2))
+                end = int(right_match.group(2))
+                step = 1 if end >= start else -1
+                expanded = [
+                    f"{left_match.group(1)}{number}"
+                    for number in range(start, end + step, step)
+                ]
+        return [(name.upper(), False, None) for name in expanded]
+
+    def into_var_open_range(self, items: list[Any]) -> dict[str, str]:
+        name = next(
+            (
+                str(item).upper()
+                for item in items
+                if isinstance(item, Token) and str(item) not in (":", "-")
+            ),
+            "",
+        )
+        return {"_INTO_OPEN_RANGE": name}
 
     def into_var_trimmed(self, items: list[Any]) -> tuple[str, bool, str | None]:
         for t in items:
@@ -1281,6 +1391,8 @@ class SasTransformer(Transformer):
                 sel.into_vars = item["_INTO"]
                 sel.into_trimmed = item["_INTO_TRIMMED"]
                 sel.into_separators = item["_INTO_SEPARATORS"]
+                sel.into_rowwise = item.get("_INTO_ROWWISE", False)
+                sel.into_open_range = item.get("_INTO_OPEN_RANGE", "")
             elif isinstance(item, list) and item:
                 if isinstance(item[0], SelectColumnNode):
                     sel.columns = item
@@ -1654,22 +1766,60 @@ class SasTransformer(Transformer):
                 return ByNode(variables=names)
         return first
 
+    # ── PROC SGRENDER ────────────────────────────────
+
+    def proc_sgrender(self, items: list[Any]) -> ProcNode:
+        options: dict[str, Any] = {}
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, dict) and "action" not in item:
+                options.update(item)
+            elif isinstance(item, dict):
+                statements.append(item)
+        return ProcNode(proc_name="SGRENDER", options=options, statements=statements)
+
+    def sgrender_opt(self, items: list[Any]) -> dict[str, Any]:
+        if not items:
+            return {}
+        key = _get_text(items[0]).upper()
+        values = _non_tokens(items)
+        if values:
+            return {key: _get_text(values[0])}
+        return {key: True}
+
+    def sgrender_stmt(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item) for item in items if isinstance(item, Token)]
+        name = next(
+            (token for token in tokens if token.upper() not in {"DYNAMIC", "=", ";"} and not token.startswith(("'", '"'))),
+            "",
+        )
+        value = next(
+            (token[1:-1] for token in tokens if token.startswith(("'", '"'))),
+            "",
+        )
+        return {"action": "dynamic", "name": name.upper(), "value": value}
+
     # ── PROC SORT ───────────────────────────────────
 
     def proc_sort(self, items: list[Any]) -> ProcNode:
         options: dict[str, Any] = {}
         by_vars = []
         ascending = []
+        where_statements = []
         for item in _non_tokens(items):
-            if isinstance(item, tuple) and len(item) == 2:
-                by_vars, ascending = item
+            if isinstance(item, tuple) and len(item) == 3:
+                by_vars, ascending, where_statements = item
             elif isinstance(item, ByNode):
                 by_vars = item.variables
             elif isinstance(item, dict):
                 options.update(item)
         if ascending:
             options["_ascending"] = ascending
-        return ProcNode(proc_name="SORT", options=options, statements=[ByNode(variables=by_vars)])
+        return ProcNode(
+            proc_name="SORT",
+            options=options,
+            statements=[*where_statements, ByNode(variables=by_vars)],
+        )
 
     def sort_options(self, items: list[Any]) -> dict[str, Any]:
         result = {}
@@ -1687,18 +1837,23 @@ class SasTransformer(Transformer):
             val_items = _non_tokens(items)
             if val_items:
                 val = val_items[0]
-                if hasattr(val, 'name'):
-                    return {key: val.name}
-                return {key: _get_text(val)}
+                return {key: val}
         return {key: True}
 
-    def sort_body(self, items: list[Any]) -> tuple[list[str], list[bool]]:
+    def sort_body(
+        self,
+        items: list[Any],
+    ) -> tuple[list[str], list[bool], list[WhereNode]]:
         # Filter out keyword tokens (BY, ;) but track DESCENDING
         names = []
         ascending = []
+        where_statements = []
         is_next_descending = False
         for item in items:
             if item is None:
+                continue
+            if isinstance(item, WhereNode):
+                where_statements.append(item)
                 continue
             if isinstance(item, Token):
                 keyword = str(item).upper()
@@ -1715,7 +1870,7 @@ class SasTransformer(Transformer):
                 names.append(_get_name(item))
                 ascending.append(not is_next_descending)
                 is_next_descending = False
-        return (names, ascending)
+        return (names, ascending, where_statements)
 
     # ── PROC CONTENTS ───────────────────────────────
 
@@ -1924,6 +2079,9 @@ class SasTransformer(Transformer):
 
     def import_stmt(self, items: list[Any]) -> tuple[str, Any]:
         return self._extract_option(items)
+
+    def import_replace(self, items: list[Any]) -> tuple[str, bool]:
+        return ("REPLACE", True)
 
     # ── PROC EXPORT ─────────────────────────────────
 

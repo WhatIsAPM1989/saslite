@@ -451,6 +451,64 @@ class SqlIntoTests(unittest.TestCase):
             ],
         )
 
+    def test_into_numbered_range_assigns_rows_to_macro_variables(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data counts;
+  value=10; output;
+  value=20; output;
+  value=30; output;
+run;
+proc sql noprint;
+  select value into :count1-:count3
+  from counts
+  order by value;
+quit;
+data result;
+  first=&count1.;
+  second=&count2.;
+  third=&count3.;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "RESULT")
+        self.assertEqual(
+            frame[["first", "second", "third"]].iloc[0].tolist(),
+            [10, 20, 30],
+        )
+
+    def test_into_open_numbered_range_uses_query_row_count(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data counts;
+  value=10; output;
+  value=20; output;
+  value=30; output;
+run;
+proc sql noprint;
+  select value into :count1-
+  from counts
+  order by value;
+quit;
+data result;
+  first=&count1.;
+  second=&count2.;
+  third=&count3.;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "RESULT")
+        self.assertEqual(
+            frame[["first", "second", "third"]].iloc[0].tolist(),
+            [10, 20, 30],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

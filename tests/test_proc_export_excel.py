@@ -1,4 +1,3 @@
-import importlib.util
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,10 +44,6 @@ run;
             )
 
 
-@unittest.skipUnless(
-    importlib.util.find_spec("openpyxl") is not None,
-    "openpyxl is installed through the optional excel extra",
-)
 class ProcExportExcelTests(unittest.TestCase):
     def test_xlsx_export_honors_sheet_labels_and_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

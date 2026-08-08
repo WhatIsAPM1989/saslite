@@ -64,6 +64,8 @@ class MacroExpander:
             self._macro_scopes[-1][key] = value
         else:
             self._local_vars[key] = value
+            if self._session is not None:
+                self._session.set_macro_var(key, value)
 
     def get_var(self, name: str) -> str | None:
         key = name.upper()
@@ -172,12 +174,41 @@ class MacroExpander:
 
     def _remove_comments(self, source: str) -> str:
         """Remove /* ... */ block comments, %* ... ; macro comments, and
-        inline statement comments (`* ... ;` directly after a semicolon)."""
-        while "/*" in source:
-            source = re.sub(r"/\*.*?\*/", "", source, flags=re.DOTALL)
+        SAS statement comments (``* ... ;``).
+
+        A statement comment can start at the beginning of the source or at
+        any subsequent statement boundary.  In particular, it may span
+        lines and commonly uses several leading/trailing asterisks.  Remove
+        these before interpreting macro text so a ``%LET`` or ``&name`` in a
+        comment cannot affect expansion.
+        """
+        # Use a scanner instead of repeatedly applying a DOTALL regex.  A
+        # staged source chunk can end inside a block comment; the former
+        # ``while '/*'`` loop made no progress in that case and ran forever.
+        uncommented: list[str] = []
+        position = 0
+        while position < len(source):
+            start = source.find("/*", position)
+            if start < 0:
+                uncommented.append(source[position:])
+                break
+            uncommented.append(source[position:start])
+            end = source.find("*/", start + 2)
+            if end < 0:
+                # SAS treats the rest of the submitted source as commented.
+                position = len(source)
+                break
+            position = end + 2
+        source = "".join(uncommented)
         source = re.sub(r"%\*[^;]*;", "", source)
-        # `;  * comment ;` — a star where a new statement would begin
-        source = re.sub(r"(?<=;)[ \t]*\*[^;\n]*;", "", source)
+        # A leading star denotes a comment only where a new statement may
+        # begin.  This deliberately does not match multiplication or SQL's
+        # SELECT * wildcard.
+        source = re.sub(
+            r"(?:\A|(?<=;))(?P<space>[ \t\r\n]*)\*[^;]*;",
+            lambda match: match.group("space"),
+            source,
+        )
         return source
 
     def _quote_format_literals(self, source: str) -> str:
@@ -496,11 +527,20 @@ class MacroExpander:
         else_at = self._skip_whitespace(masked, branch_end)
         else_match = re.match(r"%\s*ELSE\b", masked[else_at:], re.IGNORECASE)
         if else_match is not None:
-            else_body, conditional_end = self._parse_macro_conditional_branch(
-                source,
-                masked,
-                else_at + else_match.end(),
+            else_branch_at = self._skip_whitespace(
+                masked, else_at + else_match.end()
             )
+            if re.match(r"%\s*IF\b", masked[else_branch_at:], re.IGNORECASE):
+                conditional_end = self._macro_conditional_end(
+                    source, masked, else_branch_at
+                )
+                else_body = source[else_branch_at:conditional_end]
+            else:
+                else_body, conditional_end = self._parse_macro_conditional_branch(
+                    source,
+                    masked,
+                    else_branch_at,
+                )
 
         condition_result = self._eval_macro_condition(condition)
         if condition_result is None:
@@ -512,6 +552,40 @@ class MacroExpander:
         chosen = then_body if condition_result else else_body
         chosen = self._process_conditionals(chosen)
         return source[:if_match.start()] + chosen + source[conditional_end:]
+
+    def _macro_conditional_end(
+        self,
+        source: str,
+        masked: str,
+        if_start: int,
+    ) -> int:
+        """Return the extent of a nested ``%IF ... %ELSE %IF ...`` chain."""
+        if_match = re.match(r"%\s*IF\b", masked[if_start:], re.IGNORECASE)
+        if if_match is None:
+            return if_start
+        condition_start = if_start + if_match.end()
+        then_match = re.search(
+            r"%\s*THEN\b", masked[condition_start:], re.IGNORECASE
+        )
+        if then_match is None:
+            return if_start
+        then_end = condition_start + then_match.end()
+        _body, branch_end = self._parse_macro_conditional_branch(
+            source, masked, then_end
+        )
+        else_at = self._skip_whitespace(masked, branch_end)
+        else_match = re.match(r"%\s*ELSE\b", masked[else_at:], re.IGNORECASE)
+        if else_match is None:
+            return branch_end
+        else_branch_at = self._skip_whitespace(
+            masked, else_at + else_match.end()
+        )
+        if re.match(r"%\s*IF\b", masked[else_branch_at:], re.IGNORECASE):
+            return self._macro_conditional_end(source, masked, else_branch_at)
+        _else_body, conditional_end = self._parse_macro_conditional_branch(
+            source, masked, else_branch_at
+        )
+        return conditional_end
 
     @staticmethod
     def _skip_whitespace(source: str, position: int) -> int:
@@ -684,26 +758,16 @@ class MacroExpander:
 
     def _expand_once(self, source: str) -> str:
         """Single pass of macro expansion."""
-        # Match %name(args) or %name (but not %LET, %MACRO, %MEND, %IF, %DO, %THEN, %ELSE, %END)
-        # %name with arguments: %name(arg1, arg2) — trailing ; optional
-        pattern_with_args = r"%(\w+)\s*\(([^)]*)\)\s*;?"
         # %name without arguments: %name;
         pattern_no_args = r"%(\w+)\s*;"
 
         skip_keywords = {"LET", "MACRO", "MEND", "IF", "THEN", "ELSE", "DO", "END",
                          "PUT", "INCLUDE", "GOTO", "RETURN", "EVAL", "SYSEVALF",
                          "UPCASE", "LOWCASE", "SCAN", "SUBSTR", "LENGTH", "INDEX",
-                         "SUPERQ", "SYSFUNC", "TO", "BY"}
+                         "STR", "NRSTR", "SUPERQ", "SYSFUNC", "TO", "BY"}
 
-        # First expand %name(args);
-        def replacer_with_args(match: re.Match) -> str:
-            macro_name = match.group(1).upper()
-            if macro_name in skip_keywords:
-                return match.group(0)
-            if macro_name not in self._macros:
-                return match.group(0)
+        def expand_with_args(macro_name: str, args_str: str) -> str:
             macro = self._macros[macro_name]
-            args_str = match.group(2)
             args = [a.strip() for a in self._split_args_depth0(args_str)]
             # Build local variable scope: defaults first, then positional
             # and keyword (name=value) arguments
@@ -715,15 +779,71 @@ class MacroExpander:
                     continue
                 kw = re.match(r"^(\w+)\s*=\s*(.*)$", arg, flags=re.DOTALL)
                 if kw and kw.group(1).upper() in macro.params:
-                    local_vars[kw.group(1).upper()] = kw.group(2).strip().strip("'\"")
+                    local_vars[kw.group(1).upper()] = self._strip_matching_quotes(
+                        kw.group(2)
+                    )
                 else:
                     if pos_idx < len(macro.params):
-                        local_vars[macro.params[pos_idx]] = arg.strip("'\"")
+                        local_vars[macro.params[pos_idx]] = self._strip_matching_quotes(arg)
                     pos_idx += 1
             # Expand body with local vars
             return self._expand_invoked_macro(macro, local_vars)
 
-        source = re.sub(pattern_with_args, replacer_with_args, source, flags=re.IGNORECASE)
+        # Expand calls with a balanced scanner.  Macro arguments routinely
+        # contain nested calls such as %SCAN(...); a ``[^)]*`` regex truncates
+        # the outer invocation at the first inner closing parenthesis.
+        head_re = re.compile(r"%(\w+)\s*\(", flags=re.IGNORECASE)
+        expanded_parts: list[str] = []
+        copy_from = 0
+        search_at = 0
+        while True:
+            match = head_re.search(source, search_at)
+            if match is None:
+                expanded_parts.append(source[copy_from:])
+                break
+            macro_name = match.group(1).upper()
+            if macro_name in skip_keywords or macro_name not in self._macros:
+                search_at = match.end()
+                continue
+
+            depth = 1
+            quote: str | None = None
+            position = match.end()
+            while position < len(source) and depth:
+                char = source[position]
+                if quote is not None:
+                    if char == quote:
+                        if position + 1 < len(source) and source[position + 1] == quote:
+                            position += 2
+                            continue
+                        quote = None
+                    position += 1
+                    continue
+                if char in ("'", '"'):
+                    quote = char
+                elif char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                position += 1
+
+            if depth:
+                expanded_parts.append(source[copy_from:])
+                break
+
+            args_str = source[match.end():position - 1]
+            call_end = position
+            while call_end < len(source) and source[call_end] in " \t\r":
+                call_end += 1
+            if call_end < len(source) and source[call_end] == ";":
+                call_end += 1
+
+            expanded_parts.append(source[copy_from:match.start()])
+            expanded_parts.append(expand_with_args(macro_name, args_str))
+            copy_from = call_end
+            search_at = call_end
+
+        source = "".join(expanded_parts)
 
         # Then expand %name; (no args)
         def replacer_no_args(match: re.Match) -> str:
@@ -737,6 +857,17 @@ class MacroExpander:
 
         source = re.sub(pattern_no_args, replacer_no_args, source, flags=re.IGNORECASE)
         return source
+
+    @staticmethod
+    def _strip_matching_quotes(value: str) -> str:
+        text = value.strip()
+        if (
+            len(text) >= 2
+            and text[0] in ("'", '"')
+            and text[-1] == text[0]
+        ):
+            return text[1:-1]
+        return text
 
     def _expand_invoked_macro(
         self,
@@ -809,7 +940,9 @@ class MacroExpander:
         """Find and process %LET statements, return source without them."""
         def replacer(match: re.Match) -> str:
             var_name = match.group(1).upper()
-            value = match.group(2).strip()
+            value = self._resolve_let_value(match.group(2).strip())
+            sync_to_session = not self._macro_scopes
+            sync_to_global_session_scope = False
             # Remove surrounding quotes if present
             if (value.startswith("'") and value.endswith("'")) or (
                 value.startswith('"') and value.endswith('"')
@@ -828,10 +961,17 @@ class MacroExpander:
                     target_scope[var_name] = value
                 elif var_name in self._global_vars:
                     self._global_vars[var_name] = value
+                    sync_to_session = True
+                    sync_to_global_session_scope = True
                 else:
                     self._macro_scopes[-1][var_name] = value
             else:
                 self._local_vars[var_name] = value
+            if sync_to_session and self._session is not None:
+                if sync_to_global_session_scope:
+                    self._session.global_scope.define_var(var_name, value)
+                else:
+                    self._session.set_macro_var(var_name, value)
             self._log_symbolgen(var_name, value)
             return ""  # Remove the %LET statement
 
@@ -842,6 +982,22 @@ class MacroExpander:
             flags=re.IGNORECASE,
         )
         return source
+
+    def _resolve_let_value(self, value: str) -> str:
+        """Resolve macro triggers on a %LET right-hand side in source order.
+
+        Later %LET statements in the same macro can depend on values assigned
+        by earlier statements, including a chain of %SYSFUNC calls.  Re-scan
+        until stable, as the SAS macro processor does after each resolution.
+        """
+        for _ in range(30):
+            resolved = self._process_macro_functions(value)
+            resolved = self._process_eval(resolved)
+            resolved = self._substitute_vars(resolved)
+            if resolved == value:
+                return resolved
+            value = resolved
+        return value
 
     def _process_global_declarations(self, source: str) -> str:
         """Declare persistent macro variables and remove %GLOBAL statements."""
@@ -1096,7 +1252,7 @@ class MacroExpander:
 
     _MACRO_FUNC_NAMES = (
         "UPCASE", "LOWCASE", "SCAN", "SUBSTR", "LENGTH", "INDEX",
-        "SUPERQ", "SYMEXIST", "SYSFUNC",
+        "STR", "NRSTR", "SUPERQ", "SYMEXIST", "SYSFUNC",
     )
 
     def _process_macro_functions(self, source: str) -> str:
@@ -1172,6 +1328,13 @@ class MacroExpander:
             if value is None:
                 return ""
             return self._quote_macro_value(value)
+
+        if func in ("STR", "NRSTR"):
+            return (
+                self._quote_macro_value(raw_args)
+                if func == "NRSTR"
+                else raw_args
+            )
 
         if func == "SYMEXIST":
             return "1" if self.get_var(raw_args.strip()) is not None else "0"

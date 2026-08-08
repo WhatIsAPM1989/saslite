@@ -47,14 +47,13 @@ pip install saslite
 Optional extras:
 
 ```bash
-pip install "saslite[excel]"
 pip install "saslite[gui]"
 ```
 
 For local development from a checkout:
 
 ```bash
-pip install -e ".[excel,gui]"
+pip install -e ".[gui]"
 ```
 
 ## Command Line
@@ -292,7 +291,7 @@ SASLite includes support for:
 - **LIBNAME**: Local work areas, reference libraries
 - **CSV support**: PROC IMPORT/EXPORT for CSV files
 - **Python API**: Create datasets from pandas, export to pandas
-- **Excel support** (optional): With `saslite[excel]` extra
+- **Excel support**: PROC IMPORT/EXPORT for XLSX files
 
 See `DOCS.md` and the `examples/` directory for detailed usage.
 

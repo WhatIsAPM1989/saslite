@@ -110,6 +110,10 @@ class ExpressionEvaluator:
             return sas_bool(left) or sas_bool(right)
         if op == "AND":
             return sas_bool(left) and sas_bool(right)
+        if op == "CONTAINS":
+            if is_missing(left) or is_missing(right):
+                return False
+            return str(right) in str(left)
 
         # Handle missing values in comparisons
         if op in ("=", "EQ", "NE", "<>", "^=", "~=", ">", "GT", ">=", "GE", "<", "LT", "<=", "LE"):
@@ -184,7 +188,7 @@ class ExpressionEvaluator:
 
     def _eval_unary(self, node: UnaryOpNode) -> Any:
         operand = self.evaluate(node.operand)
-        if node.op.upper() == "NOT":
+        if node.op.upper() in ("NOT", "^", "~"):
             return not sas_bool(operand)
         if node.op == "-":
             return -self._to_num(operand)

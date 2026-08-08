@@ -7,6 +7,53 @@ from saslite.parser.program_parser import ProgramParser
 
 
 class ProcCompatibilityOptionTests(unittest.TestCase):
+    def test_sgrender_validates_input_and_skips_presentation_output(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data panel_data;
+  x=1;
+run;
+proc sgrender data=panel_data template=butterfly;
+  dynamic panel="Safety overview";
+run;
+data after;
+  ok=1;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas.get_dataset("WORK", "AFTER")["ok"].tolist(), [1])
+        sgrender = next(
+            step for step in result.steps
+            if any("PROC SGRENDER" in note for note in step.notes)
+        )
+        self.assertEqual(sgrender.dataset_name, "WORK.PANEL_DATA")
+        self.assertEqual(sgrender.rows_affected, 1)
+
+    def test_data_statement_implicitly_ends_proc_means(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data source;
+  value=2;
+run;
+proc means data=source noprint;
+  var value;
+  output out=stats mean=value_mean;
+data copied;
+  set stats;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            sas.get_dataset("WORK", "COPIED")["VALUE_MEAN"].tolist(),
+            [2.0],
+        )
+
     def test_means_nway_outputs_only_observed_full_class_groups(self) -> None:
         sas = SasInterpreter()
         sas.create_dataset(
