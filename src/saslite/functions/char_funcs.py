@@ -266,6 +266,100 @@ def prxmatch(pattern: Any, source: Any) -> int:
             return 0
 
 
+def prxchange(pattern: Any, times: Any, source: Any) -> str:
+    """PRXCHANGE substitution using a SAS Perl-regex expression.
+
+    ``times`` is the maximum number of substitutions; a negative value means
+    replace every match.  SAS replacement backreferences such as ``$1`` and
+    ``${1}`` are translated to their Python equivalents.
+    """
+    text = _to_str(source)
+    parsed = _parse_prx_substitution(_to_str(pattern).strip())
+    if parsed is None:
+        return text
+
+    regex, replacement, flags = parsed
+    try:
+        limit = int(float(times))
+    except (TypeError, ValueError, OverflowError):
+        return text
+    if limit == 0:
+        return text
+
+    count = 0 if limit < 0 else limit
+    try:
+        compiled = re.compile(regex, flags)
+        python_replacement = _translate_prx_replacement(replacement)
+        return compiled.sub(python_replacement, text, count=count)
+    except (re.error, IndexError):
+        # Match PRXMATCH's compatibility behavior: an invalid PRX expression
+        # does not abort the surrounding DATA step.
+        return text
+
+
+def _parse_prx_substitution(
+    expression: str,
+) -> tuple[str, str, int] | None:
+    """Parse ``s/pattern/replacement/flags`` with any SAS PRX delimiter."""
+    if len(expression) < 4 or expression[0].lower() != "s":
+        return None
+    delimiter = expression[1]
+    if delimiter.isalnum() or delimiter.isspace() or delimiter == "\\":
+        return None
+
+    pattern, position = _read_prx_part(expression, 2, delimiter)
+    if pattern is None:
+        return None
+    replacement, position = _read_prx_part(expression, position, delimiter)
+    if replacement is None:
+        return None
+
+    modifiers = expression[position:].strip().lower()
+    if any(modifier not in "imsxo" for modifier in modifiers):
+        return None
+    flags = 0
+    if "i" in modifiers:
+        flags |= re.IGNORECASE
+    if "m" in modifiers:
+        flags |= re.MULTILINE
+    if "s" in modifiers:
+        flags |= re.DOTALL
+    if "x" in modifiers:
+        flags |= re.VERBOSE
+    # The SAS/Perl ``o`` modifier compiles the expression once. Python already
+    # caches compiled regular expressions, so it needs no separate handling.
+    return pattern, replacement, flags
+
+
+def _read_prx_part(
+    expression: str, position: int, delimiter: str
+) -> tuple[str | None, int]:
+    """Read one delimiter-terminated PRX part, preserving regex escapes."""
+    chars: list[str] = []
+    while position < len(expression):
+        char = expression[position]
+        if char == delimiter:
+            return "".join(chars), position + 1
+        if char == "\\" and position + 1 < len(expression):
+            next_char = expression[position + 1]
+            if next_char == delimiter:
+                chars.append(delimiter)
+            else:
+                chars.extend((char, next_char))
+            position += 2
+            continue
+        chars.append(char)
+        position += 1
+    return None, position
+
+
+def _translate_prx_replacement(replacement: str) -> str:
+    """Translate Perl/SAS dollar backreferences for :func:`re.sub`."""
+    translated = re.sub(r"\$\{(\d+)\}", r"\\g<\1>", replacement)
+    translated = re.sub(r"\$(\d+)", r"\\g<\1>", translated)
+    return translated.replace("$&", r"\g<0>")
+
+
 def propcase(s: Any, delimiters: str = " /-") -> str:
     """PROPCASE(string [, delimiters]) — convert to proper case (title case)."""
     text = _to_str(s)

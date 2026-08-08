@@ -24,8 +24,8 @@ Requires-Dist: pandas>=2.2.0
 Requires-Dist: numpy>=1.26.0
 Requires-Dist: scipy>=1.11.0
 Requires-Dist: pyreadstat>=1.2.0
+Requires-Dist: openpyxl>=3.1.0
 Provides-Extra: excel
-Requires-Dist: openpyxl>=3.1.0; extra == "excel"
 Provides-Extra: gui
 Requires-Dist: flask>=3.0.0; extra == "gui"
 Requires-Dist: pywebview>=5.0.0; extra == "gui"
@@ -71,14 +71,13 @@ pip install saslite
 Optional extras:
 
 ```bash
-pip install "saslite[excel]"
 pip install "saslite[gui]"
 ```
 
 For local development from a checkout:
 
 ```bash
-pip install -e ".[excel,gui]"
+pip install -e ".[gui]"
 ```
 
 ## Command Line
@@ -288,7 +287,7 @@ SASLite includes support for:
 - **LIBNAME**: Local work areas, reference libraries
 - **CSV support**: PROC IMPORT/EXPORT for CSV files
 - **Python API**: Create datasets from pandas, export to pandas
-- **Excel support** (optional): With `saslite[excel]` extra
+- **Excel support**: PROC IMPORT/EXPORT for XLSX files
 
 See `DOCS.md` and the `examples/` directory for detailed usage.
 

@@ -22,6 +22,7 @@ class SetNode(Node):
     """SET statement."""
     datasets: list[Any] = field(default_factory=list)
     options: dict[str, Any] = field(default_factory=dict)
+    end_var: str = ""
 
 
 @dataclass
@@ -71,6 +72,7 @@ class DoNode(Node):
     start: Any = None
     end: Any = None
     by: Any = None
+    values: list[Any] = field(default_factory=list)
     # WHILE/UNTIL
     while_cond: Any = None
     until_cond: Any = None

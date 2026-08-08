@@ -21,6 +21,7 @@ statement: data_step
          | proc_format
          | proc_tabulate
          | proc_report
+         | proc_sgrender
          | proc_reg
          | proc_logistic
          | proc_corr
@@ -54,7 +55,9 @@ option_value: NAME | NUMBER | STRING
 
 // ─── DATA step ────────────────────────────────────
 
-data_step: "DATA"i dataset_target (","? dataset_target)* ";" data_stmt* "RUN"i ";"
+// A following DATA or PROC statement implicitly ends a DATA step in SAS, so
+// RUN is optional at the grammar boundary.
+data_step: "DATA"i dataset_target (","? dataset_target)* ";" data_stmt* ("RUN"i ";")?
 
 dataset_target: qualified_name ("(" (dataset_option)* ")")?
               | "_NULL_"i
@@ -97,7 +100,7 @@ output_stmt: "OUTPUT"i (qualified_name)?
 delete_stmt: "DELETE"i
 stop_stmt: "STOP"i
 
-set_stmt: "SET"i (dataset_ref)+
+set_stmt: "SET"i (dataset_ref)+ ("END"i "=" NAME)?
 merge_stmt: "MERGE"i (dataset_ref)+
 by_stmt: "BY"i ("DESCENDING"i)? NAME (("DESCENDING"i)? NAME)*
 array_stmt: "ARRAY"i NAME "[" NUMBER "]" ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
@@ -128,6 +131,7 @@ if_stmt: IF_KW expr THEN_KW data_stmt (ELSE_KW data_stmt)?
 
 do_block: "DO"i ";" (data_stmt)* "END"i ";"
         | "DO"i NAME "=" expr "TO"i expr ("BY"i expr)? ";" (data_stmt)* "END"i ";"
+        | "DO"i NAME "=" expr ("," expr)+ ";" (data_stmt)* "END"i ";" -> do_value_list
         | "DO"i "WHILE"i "(" expr ")" ";" (data_stmt)* "END"i ";"
         | "DO"i "UNTIL"i "(" expr ")" ";" (data_stmt)* "END"i ";"
 
@@ -156,7 +160,7 @@ update_data_stmt: "UPDATE"i (dataset_ref)+
 substr_assign_stmt: "SUBSTR"i "(" NAME "," expr ("," expr)? ")" "=" expr
 
 length_stmt: "LENGTH"i (length_item)+
-length_item: length_name "$"? NUMBER?
+length_item: length_name "$"? (NUMBER "."?)?
 ?length_name: NAME
             | NAME "-" NAME -> numbered_name_range
 
@@ -199,6 +203,8 @@ into_clause: "INTO"i into_var ("," into_var)*
 into_var: ":" NAME
         | ":" NAME "TRIMMED"i -> into_var_trimmed
         | ":" NAME "SEPARATED"i "BY"i STRING -> into_var_separated
+        | ":" NAME "-" ":" NAME -> into_var_range
+        | ":" NAME "-" -> into_var_open_range
 
 select_list: select_item ("," select_item)*
 select_item: expr ("AS"i NAME)? (col_attr)* -> select_aliased
@@ -237,7 +243,7 @@ delete_sql_stmt: "DELETE"i "FROM"i qualified_name where_clause?
 
 // ─── PROC PRINT ───────────────────────────────────
 
-proc_print: "PROC"i "PRINT"i ("DATA"i "=" qualified_name)? ";" (print_stmt)* "RUN"i ";"
+proc_print: "PROC"i "PRINT"i ("DATA"i "=" qualified_name)? ";" (print_stmt)* ("RUN"i ";")?
 
 print_stmt: "VAR"i name_list ";"
           | "ID"i name_list ";"
@@ -246,9 +252,20 @@ print_stmt: "VAR"i name_list ";"
           | where_stmt ";"
           | format_stmt ";"
 
+// ─── PROC SGRENDER ───────────────────────────────
+// GTL rendering is presentation-only in SASLite, but accepting SGRENDER lets
+// validation programs materialize and verify their plotting datasets.
+
+proc_sgrender: "PROC"i "SGRENDER"i (sgrender_opt)* ";" (sgrender_stmt)* ("RUN"i ";")?
+
+sgrender_opt: "DATA"i "=" qualified_name
+            | "TEMPLATE"i "=" qualified_name
+
+sgrender_stmt: "DYNAMIC"i NAME "=" STRING ";"
+
 // ─── PROC SORT ────────────────────────────────────
 
-proc_sort: "PROC"i "SORT"i (sort_opt)* ";" sort_body "RUN"i ";"
+proc_sort: "PROC"i "SORT"i (sort_opt)* ";" sort_body ("RUN"i ";")?
 
 sort_opt: "DATA"i "=" dataset_ref
         | "OUT"i "=" dataset_ref
@@ -256,11 +273,11 @@ sort_opt: "DATA"i "=" dataset_ref
         | "NODUPRECS"i
         | "FORCE"i
 
-sort_body: "BY"i ("DESCENDING"i)? NAME (("DESCENDING"i)? NAME)* ";"
+sort_body: (where_stmt ";")* "BY"i ("DESCENDING"i)? NAME (("DESCENDING"i)? NAME)* ";" (where_stmt ";")*
 
 // ─── PROC CONTENTS ────────────────────────────────
 
-proc_contents: "PROC"i "CONTENTS"i (contents_opt)* ";" "RUN"i ";"
+proc_contents: "PROC"i "CONTENTS"i (contents_opt)* ";" ("RUN"i ";")?
 
 contents_opt: "DATA"i "=" qualified_name
             | "VARNUM"i
@@ -268,7 +285,7 @@ contents_opt: "DATA"i "=" qualified_name
 
 // ─── PROC MEANS / SUMMARY ─────────────────────────
 
-proc_means: "PROC"i ("MEANS"i | "SUMMARY"i) (means_opt)* ";" (means_stmt)* "RUN"i ";"
+proc_means: "PROC"i ("MEANS"i | "SUMMARY"i) (means_opt)* ";" (means_stmt)* ("RUN"i ";")?
 
 means_opt: "DATA"i "=" qualified_name
          | "OUT"i "=" qualified_name
@@ -288,7 +305,7 @@ means_output_kv: NAME "=" NAME
 
 // ─── PROC FREQ ────────────────────────────────────
 
-proc_freq: "PROC"i "FREQ"i (freq_opt)* ";" freq_body "RUN"i ";"
+proc_freq: "PROC"i "FREQ"i (freq_opt)* ";" freq_body ("RUN"i ";")?
 
 freq_opt: "DATA"i "=" qualified_name -> freq_opt_data
         | "NOPRINT"i -> freq_opt_flag
@@ -309,7 +326,7 @@ freq_by: "BY"i name_list ";"?
 
 // ─── PROC APPEND ──────────────────────────────────
 
-proc_append: "PROC"i "APPEND"i (append_opt)* ";" "RUN"i ";"
+proc_append: "PROC"i "APPEND"i (append_opt)* ";" ("RUN"i ";")?
 
 append_opt: "DATA"i "=" qualified_name
           | "BASE"i "=" qualified_name
@@ -329,23 +346,26 @@ ds_stmt: "DELETE"i name_list ";"
 
 // ─── PROC IMPORT ──────────────────────────────────
 
-proc_import: "PROC"i "IMPORT"i (import_opt)* ";" (import_stmt)* "RUN"i ";"
+proc_import: "PROC"i "IMPORT"i (import_opt)* ";" (import_stmt)* ("RUN"i ";")?
 
 import_opt: "DATAFILE"i "=" STRING
           | "OUT"i "=" qualified_name
           | "DBMS"i "=" NAME
           | "GETNAMES"i "=" ("YES"i | "NO"i)
           | "DELIMITER"i "=" STRING
+          | "REPLACE"i -> import_replace
 
 import_stmt: "DATAFILE"i "=" STRING ";"
            | "OUT"i "=" qualified_name ";"
            | "DBMS"i "=" NAME ";"
            | "GETNAMES"i "=" ("YES"i | "NO"i) ";"
            | "DELIMITER"i "=" STRING ";"
+           | "GUESSINGROWS"i "=" (NAME | NUMBER) ";"
+           | "REPLACE"i ";" -> import_replace
 
 // ─── PROC EXPORT ──────────────────────────────────
 
-proc_export: "PROC"i "EXPORT"i (export_opt)* ";" (export_stmt)* "RUN"i ";"
+proc_export: "PROC"i "EXPORT"i (export_opt)* ";" (export_stmt)* ("RUN"i ";")?
 
 export_opt: "DATA"i "=" dataset_ref
           | "OUTFILE"i "=" STRING
@@ -364,7 +384,7 @@ export_stmt: "DATA"i "=" dataset_ref ";"
 
 // ─── PROC TRANSPOSE ───────────────────────────────
 
-proc_transpose: "PROC"i "TRANSPOSE"i (transpose_opt)* ";" (transpose_stmt)* "RUN"i ";"
+proc_transpose: "PROC"i "TRANSPOSE"i (transpose_opt)* ";" (transpose_stmt)* ("RUN"i ";")?
 
 transpose_opt: "DATA"i "=" qualified_name
              | "OUT"i "=" dataset_ref
@@ -378,7 +398,7 @@ transpose_stmt: "VAR"i name_list ";" -> transpose_var
 
 // ─── PROC UNIVARIATE ──────────────────────────────
 
-proc_univariate: "PROC"i "UNIVARIATE"i (univariate_opt)* ";" (univariate_stmt)* "RUN"i ";"
+proc_univariate: "PROC"i "UNIVARIATE"i (univariate_opt)* ";" (univariate_stmt)* ("RUN"i ";")?
 
 univariate_opt: "DATA"i "=" qualified_name
               | "NOPRINT"i
@@ -388,7 +408,7 @@ univariate_stmt: "VAR"i name_list ";" -> univariate_var
 
 // ─── PROC COMPARE ─────────────────────────────────
 
-proc_compare: "PROC"i "COMPARE"i (compare_opt)* ";" (compare_stmt)* "RUN"i ";"
+proc_compare: "PROC"i "COMPARE"i (compare_opt)* ";" (compare_stmt)* ("RUN"i ";")?
 
 compare_opt: "BASE"i "=" qualified_name
            | "COMPARE"i "=" qualified_name
@@ -401,7 +421,7 @@ compare_stmt: "VAR"i name_list ";" -> compare_var
 
 // ─── PROC COPY ────────────────────────────────────
 
-proc_copy: "PROC"i "COPY"i (copy_opt)* ";" (copy_stmt)* "RUN"i ";"
+proc_copy: "PROC"i "COPY"i (copy_opt)* ";" (copy_stmt)* ("RUN"i ";")?
 
 copy_opt: "IN"i "=" NAME
         | "OUT"i "=" NAME
@@ -411,9 +431,9 @@ copy_stmt: "SELECT"i name_list ";" -> copy_select
 
 // ─── PROC FORMAT ──────────────────────────────────
 
-proc_format: "PROC"i "FORMAT"i (format_proc_opt)* ";" (value_stmt)* "RUN"i ";"
+proc_format: "PROC"i "FORMAT"i (format_proc_opt)* ";" (value_stmt)* ("RUN"i ";")?
 
-format_proc_opt: "LIBRARY"i "=" qualified_name
+format_proc_opt: ("LIBRARY"i | "LIB"i) "=" qualified_name
                | "CNTLIN"i "=" dataset_ref
 
 value_stmt: "VALUE"i "$"? NAME (value_range)+ ";"
@@ -428,7 +448,7 @@ value_key: NUMBER "-" NUMBER -> value_key_range
 
 // ─── PROC TABULATE ────────────────────────────────
 
-proc_tabulate: "PROC"i "TABULATE"i (tabulate_opt)* ";" (tabulate_stmt)* "RUN"i ";"
+proc_tabulate: "PROC"i "TABULATE"i (tabulate_opt)* ";" (tabulate_stmt)* ("RUN"i ";")?
 
 tabulate_opt: "DATA"i "=" qualified_name
 
@@ -441,7 +461,7 @@ tabulate_term: NAME ("*" NAME)*
 
 // ─── PROC REPORT ──────────────────────────────────
 
-proc_report: "PROC"i "REPORT"i (report_opt)* ";" (report_stmt)* "RUN"i ";"
+proc_report: "PROC"i "REPORT"i (report_opt)* ";" (report_stmt)* ("RUN"i ";")?
 
 report_opt: "DATA"i "=" qualified_name
           | "OUT"i "=" qualified_name
@@ -557,6 +577,8 @@ ttest_stmt: "VAR"i name_list ";" -> ttest_var
              | compare_expr "NOT"i "IN"i "(" expr_list ")" -> not_in_list
              | compare_expr "NOT"i "LIKE"i concat_expr -> not_like_op
              | compare_expr "LIKE"i concat_expr -> like_op
+             | compare_expr "NOT"i "CONTAINS"i concat_expr -> not_contains_op
+             | compare_expr "CONTAINS"i concat_expr -> contains_op
              | compare_expr "NOT"i "BETWEEN"i concat_expr "AND"i concat_expr -> not_between_op
              | compare_expr "BETWEEN"i concat_expr "AND"i concat_expr -> between_op
              | compare_expr "IS"i "NOT"i "NULL"i -> is_not_null
@@ -581,8 +603,10 @@ ttest_stmt: "VAR"i name_list ";" -> ttest_var
 ?unary_expr: primary
            | "-" unary_expr -> unaryop
            | "+" unary_expr -> unaryop
+           | "^" unary_expr -> unaryop
 
-?primary: NUMBER -> number
+?primary: MISSING_NUMERIC -> missing_numeric
+        | NUMBER -> number
         | DATE_LITERAL -> date_literal
         | STRING -> string
         | "NULL"i -> null_val
@@ -621,6 +645,7 @@ function_format: "$"? NAME "." NUMBER?
 name_list: name_list_item+
 ?name_list_item: NAME
                | NAME "-" NAME -> numbered_name_range
+               | NAME ":" -> name_prefix
 
 // ─── SQL column attributes ──────────────────────────
 
@@ -639,6 +664,7 @@ GE_OP: /GE(?![A-Za-z0-9_])/i
 LT_OP: /LT(?![A-Za-z0-9_])/i
 LE_OP: /LE(?![A-Za-z0-9_])/i
 NUMBER: /[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?|\.[0-9]+([eE][+-]?[0-9]+)?/
+MISSING_NUMERIC: "."
 DATE_LITERAL.2: /("[^"]*"|'[^']*')(dt|d|t)\b/i
 STRING: /"[^"]*"|'[^']*'/
 REPORT_STYLE_OPTION.2: /STYLE\s*\(\s*(REPORT|HEADER|COLUMN)\s*\)\s*=\s*(\{[^}]*\}|\[[^\]]*\])/i

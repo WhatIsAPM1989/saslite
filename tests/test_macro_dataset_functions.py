@@ -114,6 +114,37 @@ class MacroDatasetFunctionTests(unittest.TestCase):
         self.assertTrue(inspected.success, inspected.error)
         self.assertEqual(self.log.getvalue(), "RC=0\nNAME= RC2=1\n")
 
+    def test_sysfunc_let_chain_drives_macro_conditional(self) -> None:
+        created = self.sas.execute(
+            """
+data empty_source;
+  stop;
+run;
+"""
+        )
+        self.assertTrue(created.success, created.error)
+
+        result = self.sas.execute(
+            """
+%macro inspect_empty;
+  %let dsid=%sysfunc(open(empty_source));
+  %let dsobs=%sysfunc(attrn(&dsid,nobs));
+  %let rc=%sysfunc(close(&dsid));
+  %let numobs=&dsobs;
+  %if &numobs=0 %then %do;
+    data inspection_result;
+      status='empty';
+    run;
+  %end;
+%mend inspect_empty;
+%inspect_empty;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = self.sas.get_dataset("WORK", "INSPECTION_RESULT")
+        self.assertEqual(frame["status"].tolist(), ["empty"])
+
     def test_unknown_sysfunc_returns_failed_summary_without_raising(self) -> None:
         result = self.sas.execute("%put %sysfunc(no_such_function(1));")
 

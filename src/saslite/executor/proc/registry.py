@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 
 from saslite.ast.proc import ProcNode, VarListNode, ByNode, ClassNode, FreqTableSpec
-from saslite.ast.data_step import DatasetRefNode
+from saslite.ast.data_step import DatasetRefNode, WhereNode
 from saslite.executor.expression_eval import ExpressionEvaluator
 from saslite.functions import build_default_registry
 from saslite.runtime.dataset import Dataset
@@ -17,6 +17,32 @@ from saslite.runtime.formatting import csv_dataframe
 from saslite.runtime.types import sas_bool
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
+
+
+def handle_proc_sgrender(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
+    """Validate PROC SGRENDER input while treating GTL output as presentation-only."""
+    data_name = str(proc.options.get("DATA", ""))
+    if not data_name:
+        return StepResult(success=False, error="PROC SGRENDER requires DATA=")
+
+    try:
+        if "." in data_name:
+            libref, member = data_name.split(".", 1)
+        else:
+            libref, member = "WORK", data_name
+        ds = session.get_dataset(libref, member)
+    except KeyError:
+        return StepResult(success=False, error=f"Dataset {data_name} not found")
+
+    template = str(proc.options.get("TEMPLATE", ""))
+    suffix = f" using template {template}" if template else ""
+    qualified = f"{libref.upper()}.{member.upper()}"
+    return StepResult(
+        success=True,
+        dataset_name=qualified,
+        rows_affected=ds.nrow,
+        notes=[f"PROC SGRENDER validated {qualified}{suffix}; GTL rendering skipped."],
+    )
 
 
 def handle_proc_print(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
@@ -161,10 +187,15 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
     from saslite.ast.data_step import DatasetRefNode
 
     data_ref = proc.options.get("DATA", "")
+    if not data_ref:
+        data_ref = session.get_macro_var("SYSLAST") or ""
     out_ref = proc.options.get("OUT", data_ref)
 
     if not data_ref:
-        return StepResult(success=False, error="PROC SORT requires DATA=")
+        return StepResult(
+            success=False,
+            error="PROC SORT has no DATA= and no previously created dataset",
+        )
 
     # Handle DatasetRefNode or string
     if isinstance(data_ref, DatasetRefNode):
@@ -220,6 +251,35 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
         working_ds = working_ds.rename_columns(rename_map)
         df = working_ds.data
 
+    # A WHERE statement in PROC SORT filters observations before sorting.
+    # Evaluate against the source schema and retain the Dataset metadata.
+    where_statements = [
+        statement for statement in proc.statements
+        if isinstance(statement, WhereNode)
+    ]
+    if where_statements:
+        registry = build_default_registry()
+        columns = {str(column).upper(): column for column in df.columns}
+        mask = [True] * len(df)
+        for statement in where_statements:
+            statement_mask: list[bool] = []
+            for _, row in df.iterrows():
+                evaluator = ExpressionEvaluator(
+                    var_getter=lambda name, current=row: current.get(
+                        columns.get(name.upper(), name)
+                    ),
+                    session=session,
+                )
+                for function_name in registry.names:
+                    function = registry.get(function_name)
+                    if function is not None:
+                        evaluator.register_function(function_name, function)
+                statement_mask.append(sas_bool(evaluator.evaluate(statement.condition)))
+            mask = [current and selected for current, selected in zip(mask, statement_mask)]
+        df = df.loc[mask].reset_index(drop=True)
+        working_ds.data = df
+        working_ds.metadata.row_count = len(df)
+
     # Get BY variables
     by_vars = []
     descending = []
@@ -234,15 +294,20 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
     # Resolve BY vars to actual column names (case-insensitive)
     col_map = {c.upper(): c for c in df.columns}
     resolved_by = []
-    for bv in by_vars:
-        actual = col_map.get(bv.upper())
-        if actual:
-            resolved_by.append(actual)
-        else:
-            return StepResult(success=False, error=f"Variable {bv} not found in dataset")
+    if len(by_vars) == 1 and by_vars[0].upper() == "_ALL_":
+        resolved_by = list(df.columns)
+    else:
+        for bv in by_vars:
+            actual = col_map.get(bv.upper())
+            if actual:
+                resolved_by.append(actual)
+            else:
+                return StepResult(success=False, error=f"Variable {bv} not found in dataset")
 
     # Sort
     asc = proc.options.get("_ascending", [True] * len(resolved_by))
+    if len(asc) != len(resolved_by):
+        asc = [asc[0] if asc else True] * len(resolved_by)
     tie_cols = [c for c in df.columns if c not in resolved_by]
     sorted_df = df.copy()
     sorted_df["__sas_sort_ord__"] = range(len(sorted_df))
@@ -986,9 +1051,8 @@ def handle_proc_export(proc: ProcNode, session: Session, reporter: Reporter) -> 
                     success=False,
                     error=(
                         f"Cannot export {filepath}: Excel export requires the "
-                        "optional dependency openpyxl. "
-                        "Install SASLite with the excel extra: pip install "
-                        "'saslite[excel]'"
+                        "runtime dependency openpyxl, but it is not installed. "
+                        "Reinstall SASLite to restore its required dependencies."
                     ),
                 )
         else:

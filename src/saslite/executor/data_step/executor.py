@@ -17,7 +17,10 @@ from saslite.ast.data_step import (
     CallMissingNode, ArrayAssignNode, SumStatementNode, LengthNode, AttribNode,
     PutItemNode,
 )
-from saslite.ast.expressions import ArrayRefNode, VariableNode
+from saslite.ast.expressions import (
+    ArrayRefNode, BinaryOpNode, CaseNode, FunctionCallNode, LiteralNode,
+    UnaryOpNode, VariableNode,
+)
 from saslite.ast.proc import ByNode
 from saslite.runtime.pdv import PDV
 from saslite.runtime.dataset import Dataset
@@ -167,6 +170,9 @@ class DataStepExecutor:
                     set_groups.append(group)
 
                 set_length_warnings = self._set_length_warnings(set_groups)
+                for set_node in set_nodes:
+                    if set_node.end_var:
+                        in_flag_names.add(set_node.end_var.upper())
 
             # Build PDV
             pdv = self._build_pdv(step, input_datasets)
@@ -233,6 +239,12 @@ class DataStepExecutor:
                     row = combined_df.iloc[i].to_dict()
                     pdv.load_row(row)
 
+                    # SET END= creates a temporary flag which is 1 only on
+                    # the final observation read by the SET statement.
+                    for set_node in set_nodes:
+                        if set_node.end_var:
+                            pdv.set(set_node.end_var, int(i == total_rows - 1))
+
                     # Update FIRST./LAST. flags
                     if by_vars:
                         next_row = None
@@ -295,7 +307,10 @@ class DataStepExecutor:
         # no input observations. This is what gives zero-row output data sets
         # their schema and variable attributes.
         for stmt in step.statements:
-            if isinstance(stmt, LengthNode):
+            if isinstance(stmt, SetNode) and stmt.end_var:
+                pdv.ensure_variable(stmt.end_var, dtype="numeric")
+                pdv.mark_produced(stmt.end_var)
+            elif isinstance(stmt, LengthNode):
                 for name, length in stmt.items:
                     dtype = (
                         "character"
@@ -377,6 +392,18 @@ class DataStepExecutor:
             "missing-value semantics; check the local fixture schema.",
         )
 
+    @staticmethod
+    def _name_list_matches(name: str, specifications: list[str] | set[str]) -> bool:
+        logical_name = str(name).upper()
+        for specification in specifications:
+            logical_spec = str(specification).upper()
+            if logical_spec.endswith(":"):
+                if logical_name.startswith(logical_spec[:-1]):
+                    return True
+            elif logical_name == logical_spec:
+                return True
+        return False
+
     def _validate_data_step_references(
         self,
         statements: list[Any],
@@ -456,12 +483,29 @@ class DataStepExecutor:
                 self._schema_warnings.pop(key, None)
 
     def _mark_produced_variables(self, statements: list[Any], pdv: PDV) -> None:
-        """Record variables that an executable statement can initialize."""
+        """Compile variables that executable statements can initialize.
+
+        SAS builds the PDV before reading the first observation.  Assignment
+        targets therefore remain in the output descriptor even when an input
+        data set has zero rows or every assignment is inside an untaken
+        branch.
+        """
         for stmt in statements:
-            if isinstance(stmt, (AssignNode, SumStatementNode, SubstrAssignNode)):
+            if isinstance(stmt, AssignNode):
+                pdv.ensure_variable(
+                    stmt.target,
+                    dtype=self._expression_dtype(stmt.expr, pdv),
+                )
+                pdv.mark_produced(stmt.target)
+            elif isinstance(stmt, SumStatementNode):
+                pdv.ensure_variable(stmt.target, dtype="numeric")
+                pdv.mark_produced(stmt.target)
+            elif isinstance(stmt, SubstrAssignNode):
+                pdv.ensure_variable(stmt.target, dtype="character")
                 pdv.mark_produced(stmt.target)
             elif isinstance(stmt, DoNode):
                 if stmt.var:
+                    pdv.ensure_variable(stmt.var, dtype="numeric")
                     pdv.mark_produced(stmt.var)
                 self._mark_produced_variables(stmt.body, pdv)
             elif isinstance(stmt, IfNode):
@@ -472,13 +516,65 @@ class DataStepExecutor:
             elif isinstance(stmt, CallMissingNode):
                 for variable in stmt.variables:
                     if isinstance(variable, VariableNode):
+                        pdv.ensure_variable(variable.name)
                         pdv.mark_produced(variable.name)
             elif isinstance(stmt, InputNode):
                 for name in stmt.variables:
+                    pdv.ensure_variable(
+                        name,
+                        dtype=(
+                            "character"
+                            if stmt.is_character.get(name, False)
+                            else "numeric"
+                        ),
+                    )
                     pdv.mark_produced(name)
             elif isinstance(stmt, ArrayNode) and stmt.initial_values:
-                for name in stmt.variables[:len(stmt.initial_values)]:
+                for name, initial_value in zip(stmt.variables, stmt.initial_values):
+                    pdv.ensure_variable(
+                        name,
+                        dtype=(
+                            "character"
+                            if stmt.is_character
+                            else self._expression_dtype(initial_value, pdv)
+                        ),
+                    )
                     pdv.mark_produced(name)
+
+    @staticmethod
+    def _expression_dtype(expression: Any, pdv: PDV) -> str:
+        """Infer the compile-time SAS type needed for an assignment target."""
+        if isinstance(expression, LiteralNode):
+            return "character" if expression.literal_type == "string" else "numeric"
+        if isinstance(expression, VariableNode):
+            variable = pdv.variables.get(expression.name.upper())
+            return variable.metadata.dtype if variable is not None else "numeric"
+        if isinstance(expression, BinaryOpNode):
+            return "character" if expression.op.upper() in ("||", "!!") else "numeric"
+        if isinstance(expression, UnaryOpNode):
+            return "numeric"
+        if isinstance(expression, FunctionCallNode):
+            character_functions = {
+                "BYTE", "CAT", "CATS", "CATX", "COALESCEC", "COMPBL",
+                "COMPRESS", "IFC", "LEFT", "LOWCASE", "PRXCHANGE",
+                "PROPCASE", "PUT", "PUTC", "PUTN", "REPEAT", "REVERSE",
+                "SCAN", "STRIP", "SUBSTR", "SUBSTRN", "SYMGET", "TRANSLATE",
+                "TRANWRD", "TRIM", "UPCASE", "VLABEL", "VVALUE",
+            }
+            return (
+                "character"
+                if expression.name.upper() in character_functions
+                else "numeric"
+            )
+        if isinstance(expression, CaseNode):
+            candidates = [*expression.results, expression.else_result]
+            if any(
+                DataStepExecutor._expression_dtype(candidate, pdv) == "character"
+                for candidate in candidates
+                if candidate is not None
+            ):
+                return "character"
+        return "numeric"
 
     @staticmethod
     def _set_length_warnings(set_groups: list[list[Dataset]]) -> list[str]:
@@ -634,7 +730,13 @@ class DataStepExecutor:
 
     def _execute_do(self, stmt: DoNode, ctx: DataStepContext) -> None:
         """Execute a DO block."""
-        if stmt.var and stmt.start is not None and stmt.end is not None:
+        if stmt.var and stmt.values:
+            for value_expr in stmt.values:
+                ctx.pdv.set(stmt.var, ctx.evaluator.evaluate(value_expr))
+                self._execute_statements(stmt.body, ctx)
+                if ctx.pdv.stop_flag or ctx.pdv.delete_flag:
+                    break
+        elif stmt.var and stmt.start is not None and stmt.end is not None:
             # Iterative DO loop
             start = int(ctx.evaluator.evaluate(stmt.start))
             end = int(ctx.evaluator.evaluate(stmt.end))
@@ -972,29 +1074,25 @@ class DataStepExecutor:
 
         for stmt in step.statements:
             if isinstance(stmt, KeepNode):
-                keep = {name.upper() for name in stmt.variables}
                 out_ds = out_ds.select_columns([
                     column for column in out_ds.data.columns
-                    if str(column).upper() in keep
+                    if self._name_list_matches(str(column), stmt.variables)
                 ])
             elif isinstance(stmt, DropNode):
-                drop = {name.upper() for name in stmt.variables}
                 out_ds = out_ds.select_columns([
                     column for column in out_ds.data.columns
-                    if str(column).upper() not in drop
+                    if not self._name_list_matches(str(column), stmt.variables)
                 ])
 
         if "KEEP" in output_options:
-            keep = {str(name).upper() for name in output_options["KEEP"]}
             out_ds = out_ds.select_columns([
                 column for column in out_ds.data.columns
-                if str(column).upper() in keep
+                if self._name_list_matches(str(column), output_options["KEEP"])
             ])
         if "DROP" in output_options:
-            drop = {str(name).upper() for name in output_options["DROP"]}
             out_ds = out_ds.select_columns([
                 column for column in out_ds.data.columns
-                if str(column).upper() not in drop
+                if not self._name_list_matches(str(column), output_options["DROP"])
             ])
 
         for stmt in step.statements:
@@ -1092,21 +1190,33 @@ class DataStepExecutor:
                 keep_cols = [c.upper() for c in opt["KEEP"]]
                 available = {str(column).upper() for column in ds.data.columns}
                 for variable in keep_cols:
-                    if variable not in available:
+                    if not any(
+                        self._name_list_matches(column, [variable])
+                        for column in available
+                    ):
                         self._record_missing_schema_variable(
                             variable, "KEEP=", ds.metadata.qualified_name
                         )
-                actual = [c for c in ds.data.columns if c.upper() in keep_cols]
+                actual = [
+                    c for c in ds.data.columns
+                    if self._name_list_matches(str(c), keep_cols)
+                ]
                 ds = ds.select_columns(actual)
             if "DROP" in opt:
                 drop_cols = [c.upper() for c in opt["DROP"]]
                 available = {str(column).upper() for column in ds.data.columns}
                 for variable in drop_cols:
-                    if variable not in available:
+                    if not any(
+                        self._name_list_matches(column, [variable])
+                        for column in available
+                    ):
                         self._record_missing_schema_variable(
                             variable, "DROP=", ds.metadata.qualified_name
                         )
-                actual = [c for c in ds.data.columns if c.upper() not in drop_cols]
+                actual = [
+                    c for c in ds.data.columns
+                    if not self._name_list_matches(str(c), drop_cols)
+                ]
                 ds = ds.select_columns(actual)
         return ds
 
@@ -1772,12 +1882,16 @@ class DataStepExecutor:
         # Apply KEEP/DROP/RENAME, FORMAT, LABEL from other statements
         for stmt in step.statements:
             if isinstance(stmt, KeepNode):
-                keep_cols = [c.upper() for c in stmt.variables]
-                actual = [c for c in df.columns if c.upper() in keep_cols]
+                actual = [
+                    c for c in df.columns
+                    if self._name_list_matches(str(c), stmt.variables)
+                ]
                 out_ds = out_ds.select_columns(actual)
             elif isinstance(stmt, DropNode):
-                drop_cols = [c.upper() for c in stmt.variables]
-                actual = [c for c in df.columns if c.upper() not in drop_cols]
+                actual = [
+                    c for c in df.columns
+                    if not self._name_list_matches(str(c), stmt.variables)
+                ]
                 out_ds = out_ds.select_columns(actual)
             elif isinstance(stmt, RenameNode):
                 out_ds = out_ds.rename_columns(stmt.mapping)
@@ -1862,6 +1976,15 @@ class DataStepContext:
                 return 0
 
         self.evaluator.register_function("EXIST", dataset_exists)
+
+        def symget(macro_variable_name: Any) -> str:
+            name = str(macro_variable_name).strip()
+            if not name:
+                return ""
+            value = session.get_macro_var(name)
+            return value if value is not None else ""
+
+        self.evaluator.register_function("SYMGET", symget)
 
     def _wrap_put_with_custom_formats(self, fn_registry: Any) -> None:
         """Make PUT()/PUTN() check session-defined custom formats first."""

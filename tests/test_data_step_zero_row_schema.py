@@ -48,6 +48,85 @@ run;
         self.assertEqual((formatted.dtype, formatted.format), ("numeric", "10.2"))
         self.assertEqual((described.dtype, described.label), ("numeric", "Description"))
 
+    def test_assignment_targets_compile_for_zero_row_set_input(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data empty_source;
+  length grade $8;
+  stop;
+run;
+
+data empty_result;
+  set empty_source;
+  if grade='Any' then sort_ord=0;
+  else if grade='Unknown' then sort_ord=1;
+  if missing(grade) then display_value='Missing';
+run;
+
+proc sort data=empty_result out=sorted_result;
+  by sort_ord display_value;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "SORTED_RESULT")
+        self.assertEqual(len(frame), 0)
+        self.assertEqual(
+            [str(column).upper() for column in frame.columns],
+            ["GRADE", "SORT_ORD", "DISPLAY_VALUE"],
+        )
+        metadata = sas.session.get_dataset("WORK", "EMPTY_RESULT").metadata
+        self.assertEqual(metadata.get_variable("sort_ord").dtype, "numeric")
+        self.assertEqual(metadata.get_variable("display_value").dtype, "character")
+
+    def test_proc_statement_implicitly_ends_data_step(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data source;
+  value=2;
+run;
+
+data copied;
+  set source;
+proc sort data=copied out=sorted;
+  by value;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            sas.get_dataset("WORK", "SORTED")["value"].tolist(),
+            [2],
+        )
+
+    def test_proc_sort_without_data_uses_last_created_dataset(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data last_source;
+  input value;
+  datalines;
+2
+1
+;
+run;
+
+proc sort;
+  by value;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            sas.get_dataset("WORK", "LAST_SOURCE")["VALUE"].tolist(),
+            [1, 2],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

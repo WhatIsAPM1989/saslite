@@ -28,6 +28,8 @@ class SelectNode(Node):
     into_vars: list[str] = field(default_factory=list)
     into_trimmed: list[bool] = field(default_factory=list)
     into_separators: list[str | None] = field(default_factory=list)
+    into_rowwise: bool = False
+    into_open_range: str = ""
 
 
 @dataclass
