@@ -294,20 +294,38 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
     # Resolve BY vars to actual column names (case-insensitive)
     col_map = {c.upper(): c for c in df.columns}
     resolved_by = []
+    resolved_ascending = []
     if len(by_vars) == 1 and by_vars[0].upper() == "_ALL_":
         resolved_by = list(df.columns)
+        resolved_ascending = [True] * len(resolved_by)
     else:
-        for bv in by_vars:
+        requested_ascending = proc.options.get("_ascending", [True] * len(by_vars))
+        for index, bv in enumerate(by_vars):
+            direction = (
+                requested_ascending[index]
+                if index < len(requested_ascending)
+                else True
+            )
+            if bv.endswith(":"):
+                prefix = bv[:-1].upper()
+                matches = [column for column in df.columns if column.upper().startswith(prefix)]
+                if not matches:
+                    return StepResult(
+                        success=False,
+                        error=f"No variables match prefix {bv}",
+                    )
+                resolved_by.extend(matches)
+                resolved_ascending.extend([direction] * len(matches))
+                continue
             actual = col_map.get(bv.upper())
             if actual:
                 resolved_by.append(actual)
+                resolved_ascending.append(direction)
             else:
                 return StepResult(success=False, error=f"Variable {bv} not found in dataset")
 
     # Sort
-    asc = proc.options.get("_ascending", [True] * len(resolved_by))
-    if len(asc) != len(resolved_by):
-        asc = [asc[0] if asc else True] * len(resolved_by)
+    asc = resolved_ascending
     tie_cols = [c for c in df.columns if c not in resolved_by]
     sorted_df = df.copy()
     sorted_df["__sas_sort_ord__"] = range(len(sorted_df))
@@ -557,7 +575,19 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
             o_libref, o_member = parts[0], parts[1]
         else:
             o_libref, o_member = "WORK", out_stmt_name
-        o_ds = Dataset.from_dataframe(pd.DataFrame(rows), name=o_member, libref=o_libref)
+        output_frame = pd.DataFrame(rows)
+        for option in output_stmt.get("out_options", []):
+            drop_names = option.get("DROP", [])
+            if drop_names:
+                drop_keys = {name.upper() for name in drop_names}
+                output_frame = output_frame.drop(
+                    columns=[
+                        column for column in output_frame.columns
+                        if str(column).upper() in drop_keys
+                    ],
+                    errors="ignore",
+                )
+        o_ds = Dataset.from_dataframe(output_frame, name=o_member, libref=o_libref)
         session.put_dataset(o_libref, o_member, o_ds)
 
     if out_name:
@@ -590,18 +620,23 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
 
 def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
     """PROC FREQ — frequency tables with cross-tabulation support."""
-    data_name = proc.options.get("DATA", "")
-    if not data_name:
+    data_ref = proc.options.get("DATA", "")
+    if not data_ref:
         return StepResult(success=False, error="PROC FREQ requires DATA=")
 
     try:
-        if "." in data_name:
-            parts = data_name.split(".", 1)
-            ds = session.get_dataset(parts[0], parts[1])
+        if isinstance(data_ref, DatasetRefNode):
+            ds = session.get_dataset(data_ref.libref, data_ref.name)
+            ds = _apply_export_dataset_options(ds, data_ref.options, session)
         else:
-            ds = session.get_dataset("WORK", data_name)
+            data_name = str(data_ref)
+            if "." in data_name:
+                parts = data_name.split(".", 1)
+                ds = session.get_dataset(parts[0], parts[1])
+            else:
+                ds = session.get_dataset("WORK", data_name)
     except KeyError:
-        return StepResult(success=False, error=f"Dataset {data_name} not found")
+        return StepResult(success=False, error=f"Dataset {data_ref} not found")
 
     buf = io.StringIO()
     buf.write(f"\n{'=' * 60}\n")
@@ -645,6 +680,29 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
         else:
             _freq_crosstab(buf, ds.data, vars_resolved, include_missing,
                            show_row, show_col, show_pct)
+
+        out_name = opts.get("OUT", "")
+        if out_name:
+            frequency = (
+                ds.data[vars_resolved]
+                .value_counts(dropna=not include_missing, sort=False)
+                .rename("COUNT")
+                .reset_index()
+            )
+            total = frequency["COUNT"].sum()
+            frequency["PERCENT"] = (
+                frequency["COUNT"] / total * 100 if total else 0.0
+            )
+            if "." in out_name:
+                out_libref, out_member = out_name.split(".", 1)
+            else:
+                out_libref, out_member = "WORK", out_name
+            out_ds = Dataset.from_dataframe(
+                frequency,
+                name=out_member,
+                libref=out_libref,
+            )
+            session.put_dataset(out_libref, out_member, out_ds)
 
     output = buf.getvalue()
     reporter.log(output)

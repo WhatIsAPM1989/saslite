@@ -118,6 +118,45 @@ class SasTransformer(Transformer):
     def empty_stmt(self, items: list[Any]) -> None:
         return None
 
+    # ── ODS routing ────────────────────────────────
+
+    def ods_output_item(self, items: list[Any]) -> tuple[str, DatasetRefNode]:
+        table = next(
+            (str(item).upper() for item in items
+             if isinstance(item, Token) and item.type == "NAME"),
+            "",
+        )
+        target = next(
+            (item for item in items if isinstance(item, DatasetRefNode)),
+            DatasetRefNode(name=""),
+        )
+        return table, target
+
+    def ods_output(self, items: list[Any]) -> ProcNode:
+        tables = {
+            name: target
+            for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for name, target in [item]
+            if name
+        }
+        return ProcNode(
+            proc_name="ODS",
+            options={"ACTION": "OUTPUT", "TABLES": tables},
+        )
+
+    def ods_output_close(self, items: list[Any]) -> ProcNode:
+        return ProcNode(proc_name="ODS", options={"ACTION": "OUTPUT_CLOSE"})
+
+    def ods_control(self, items: list[Any]) -> ProcNode:
+        return ProcNode(proc_name="ODS", options={"ACTION": "CONTROL"})
+
+    def ods_control_name(self, items: list[Any]) -> str:
+        return _get_text(items[0]).upper() if items else ""
+
+    def ods_control_value(self, items: list[Any]) -> str:
+        return _get_text(items[0]) if items else ""
+
     def data_stmt(self, items: list[Any]) -> Any:
         """Unwrap data_stmt — return the inner statement."""
         return items[0] if items else None
@@ -150,6 +189,14 @@ class SasTransformer(Transformer):
         right = items[2] if len(items) > 2 else items[1] if len(items) > 1 else None
         op = _get_text(op_token).upper() if op_token else ""
         return BinaryOpNode(op=op, left=left, right=right)
+
+    def le_spaced(self, items: list[Any]) -> BinaryOpNode:
+        non_tokens = _non_tokens(items)
+        return BinaryOpNode(op="<=", left=non_tokens[0], right=non_tokens[1])
+
+    def ge_spaced(self, items: list[Any]) -> BinaryOpNode:
+        non_tokens = _non_tokens(items)
+        return BinaryOpNode(op=">=", left=non_tokens[0], right=non_tokens[1])
 
     def unaryop(self, items: list[Any]) -> UnaryOpNode:
         if len(items) == 1:
@@ -203,6 +250,16 @@ class SasTransformer(Transformer):
             except (ValueError, IndexError):
                 val = float("nan")
         return LiteralNode(value=val, literal_type="number")
+
+    def hex_literal(self, items: list[Any]) -> LiteralNode:
+        """SAS hexadecimal character literal, for example ``"A0"x``."""
+        text = _get_text(items[0])
+        hexadecimal = text[1:-2]
+        try:
+            value = bytes.fromhex(hexadecimal).decode("latin-1")
+        except (ValueError, UnicodeDecodeError):
+            value = ""
+        return LiteralNode(value=value, literal_type="string")
 
     def name(self, items: list[Any]) -> VariableNode:
         return VariableNode(name=_get_name(items[0]))
@@ -265,6 +322,9 @@ class SasTransformer(Transformer):
         return self._format_literal(items)
 
     def expr_list(self, items: list[Any]) -> list[Any]:
+        return _non_tokens(items)
+
+    def in_expr_list(self, items: list[Any]) -> list[Any]:
         return _non_tokens(items)
 
     def name_list(self, items: list[Any]) -> list[str]:
@@ -844,6 +904,21 @@ class SasTransformer(Transformer):
             parts = name.split(".", 1)
             return DatasetRefNode(name=parts[1].upper(), libref=parts[0].upper(), options=options)
         return DatasetRefNode(name=name.upper(), options=options)
+
+    def dataset_prefix_ref(self, items: list[Any]) -> DatasetRefNode:
+        """Dataset name prefix list such as SET ROW: or SET LIB.CYCLE:."""
+        name_node = next(
+            (item for item in items if isinstance(item, VariableNode)),
+            VariableNode(name=""),
+        )
+        name = name_node.name
+        if "." in name:
+            libref, member = name.split(".", 1)
+            return DatasetRefNode(
+                name=f"{member.upper()}:",
+                libref=libref.upper(),
+            )
+        return DatasetRefNode(name=f"{name.upper()}:")
 
     def assign_stmt(self, items: list[Any]) -> AssignNode:
         # With keep_all_tokens: [NAME, '=', expr]
@@ -1479,6 +1554,9 @@ class SasTransformer(Transformer):
                     continue
                 if not key and t in ("LENGTH", "FORMAT", "LABEL"):
                     key = t
+                    continue
+                if key and val is None:
+                    val = _clean_token_value(item)
         for item in non_tok:
             if isinstance(item, str):
                 val = item
@@ -1990,9 +2068,21 @@ class SasTransformer(Transformer):
         val_items = _non_tokens(items)
         if val_items:
             val = val_items[0]
+            if isinstance(val, DatasetRefNode):
+                return {"DATA": val}
             if hasattr(val, 'name'):
                 return {"DATA": val.name}
             return {"DATA": _get_text(val)}
+        return {}
+
+    def freq_opt_out(self, items: list[Any]) -> dict[str, Any]:
+        """Handle OUT= on an individual PROC FREQ table specification."""
+        val_items = _non_tokens(items)
+        if val_items:
+            value = val_items[0]
+            if hasattr(value, "name"):
+                return {"OUT": value.name}
+            return {"OUT": _get_text(value)}
         return {}
 
     def freq_opt_flag(self, items: list[Any]) -> dict[str, Any]:
@@ -2040,6 +2130,358 @@ class SasTransformer(Transformer):
 
     def freq_stmt(self, items: list[Any]) -> Any:
         return items[0] if items else None
+
+    # ── PROC LIFETEST ─────────────────────────────
+
+    def proc_lifetest(self, items: list[Any]) -> ProcNode:
+        options: dict[str, Any] = {}
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, dict):
+                options.update(item)
+            elif isinstance(item, WhereNode):
+                statements.append(item)
+        return ProcNode(proc_name="LIFETEST", options=options, statements=statements)
+
+    def lifetest_opt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def lifetest_stmt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def lifetest_data_opt(self, items: list[Any]) -> dict[str, Any]:
+        ref = next((item for item in items if isinstance(item, DatasetRefNode)), None)
+        return {"DATA": ref} if ref is not None else {}
+
+    def lifetest_outsurv_opt(self, items: list[Any]) -> dict[str, Any]:
+        ref = next((item for item in items if isinstance(item, DatasetRefNode)), None)
+        return {"OUTSURV": ref} if ref is not None else {}
+
+    def lifetest_named_opt(self, items: list[Any]) -> dict[str, Any]:
+        names = [str(item).upper() for item in items
+                 if isinstance(item, Token) and str(item) != "="]
+        return {names[0]: names[1]} if len(names) >= 2 else {}
+
+    def lifetest_flag_opt(self, items: list[Any]) -> dict[str, Any]:
+        name = next((str(item).upper() for item in items if isinstance(item, Token)), "")
+        return {name: True} if name else {}
+
+    def lifetest_plot_piece(self, items: list[Any]) -> str:
+        return _get_text(items[0]) if items else ""
+
+    def lifetest_plot_opt(self, items: list[Any]) -> dict[str, Any]:
+        values = [str(item) for item in items if not isinstance(item, Token)]
+        tokens = [str(item) for item in items if isinstance(item, Token)]
+        return {"name": tokens[0].upper() if tokens else "", "pieces": values}
+
+    def lifetest_plots_opt(self, items: list[Any]) -> dict[str, Any]:
+        plot = next((item for item in items if isinstance(item, dict)), {})
+        return {"PLOTS": plot}
+
+    def lifetest_timelist_opt(self, items: list[Any]) -> dict[str, Any]:
+        values = [float(str(item)) for item in items
+                  if isinstance(item, Token) and item.type == "NUMBER"]
+        return {"TIMELIST": values}
+
+    def lifetest_time_stmt(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item) for item in items if isinstance(item, Token)]
+        star_index = tokens.index("*") if "*" in tokens else -1
+        duration_name = tokens[star_index - 1].upper() if star_index > 0 else ""
+        censor_name = (
+            tokens[star_index + 1].upper()
+            if star_index >= 0 and star_index + 1 < len(tokens)
+            else ""
+        )
+        values: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, list):
+                values.extend(
+                    value.value if isinstance(value, LiteralNode) else value
+                    for value in item
+                )
+        return {
+            "TIME_VAR": duration_name,
+            "CENSOR_VAR": censor_name,
+            "CENSOR_VALUES": values,
+        }
+
+    def lifetest_strata_opt(self, items: list[Any]) -> dict[str, Any]:
+        names = [str(item).upper() for item in items
+                 if isinstance(item, Token) and item.type == "NAME"]
+        lists = [item for item in items if isinstance(item, list)]
+        value: Any = lists[0] if lists else (names[1] if len(names) > 1 else True)
+        return {names[0]: value} if names else {}
+
+    def lifetest_strata_stmt(self, items: list[Any]) -> dict[str, Any]:
+        variables: list[str] = []
+        strata_options: dict[str, Any] = {}
+        for item in items:
+            if isinstance(item, list) and not variables:
+                variables = [str(name).upper() for name in item]
+            elif isinstance(item, dict):
+                strata_options.update(item)
+        return {"STRATA": variables, "STRATA_OPTIONS": strata_options}
+
+    def lifetest_where_stmt(self, items: list[Any]) -> WhereNode:
+        expression = next((item for item in _non_tokens(items)), None)
+        return WhereNode(condition=expression)
+
+    def lifetest_test_stmt(self, items: list[Any]) -> dict[str, Any]:
+        variables = next((item for item in items if isinstance(item, list)), [])
+        return {"TEST": [str(name).upper() for name in variables]}
+
+    # ── PROC PHREG ────────────────────────────────
+
+    def proc_phreg(self, items: list[Any]) -> ProcNode:
+        options: dict[str, Any] = {}
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, dict) and "action" not in item:
+                options.update(item)
+            elif item is not None:
+                statements.append(item)
+        return ProcNode(proc_name="PHREG", options=options, statements=statements)
+
+    def phreg_opt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def phreg_stmt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def phreg_data_opt(self, items: list[Any]) -> dict[str, Any]:
+        ref = next((item for item in items if isinstance(item, DatasetRefNode)), None)
+        return {"DATA": ref} if ref is not None else {}
+
+    def phreg_generic_opt(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [item for item in items if isinstance(item, Token)
+                  and str(item) != "="]
+        if not tokens:
+            return {}
+        key = str(tokens[0]).upper()
+        value = _clean_token_value(tokens[1]) if len(tokens) > 1 else True
+        return {key: value}
+
+    def phreg_where_stmt(self, items: list[Any]) -> WhereNode:
+        expression = next((item for item in _non_tokens(items)), None)
+        return WhereNode(condition=expression)
+
+    def phreg_class_opt(self, items: list[Any]) -> tuple[str, Any]:
+        tokens = [item for item in items if isinstance(item, Token)
+                  and str(item) != "="]
+        if not tokens:
+            return "", ""
+        key = str(tokens[0]).upper()
+        value = _clean_token_value(tokens[1]) if len(tokens) > 1 else True
+        return key, value
+
+    def phreg_class_item(self, items: list[Any]) -> dict[str, Any]:
+        name = next(
+            (str(item).upper() for item in items
+             if isinstance(item, Token) and item.type == "NAME"),
+            "",
+        )
+        options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {"name": name, "options": options}
+
+    def phreg_class_stmt(self, items: list[Any]) -> dict[str, Any]:
+        classes = [item for item in items if isinstance(item, dict)]
+        return {"action": "class", "classes": classes}
+
+    def phreg_model_opt(self, items: list[Any]) -> tuple[str, Any]:
+        tokens = [item for item in items if isinstance(item, Token)
+                  and str(item) != "="]
+        if not tokens:
+            return "", ""
+        return (
+            str(tokens[0]).upper(),
+            _clean_token_value(tokens[1]) if len(tokens) > 1 else True,
+        )
+
+    def phreg_model_stmt(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item) for item in items if isinstance(item, Token)]
+        star_index = tokens.index("*") if "*" in tokens else -1
+        duration = tokens[star_index - 1].upper() if star_index > 0 else ""
+        censor = tokens[star_index + 1].upper() if star_index >= 0 else ""
+        lists = [item for item in items if isinstance(item, list)]
+        censor_values: list[Any] = []
+        predictors: list[str] = []
+        if lists:
+            censor_values = [
+                value.value if isinstance(value, LiteralNode) else value
+                for value in lists[0]
+            ]
+        if len(lists) > 1:
+            predictors = [str(name).upper() for name in lists[1]]
+        model_options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {
+            "action": "model",
+            "duration": duration,
+            "censor": censor,
+            "censor_values": censor_values,
+            "predictors": predictors,
+            "options": model_options,
+        }
+
+    def phreg_hr_opt(self, items: list[Any]) -> tuple[str, Any]:
+        return self.phreg_model_opt(items)
+
+    def phreg_hazardratio_stmt(self, items: list[Any]) -> dict[str, Any]:
+        label = next(
+            (_clean_token_value(item) for item in items
+             if isinstance(item, Token) and item.type == "STRING"),
+            "",
+        )
+        variable = next(
+            (str(item).upper() for item in items
+             if isinstance(item, Token) and item.type == "NAME"
+             and str(item).upper() != "HAZARDRATIO"),
+            "",
+        )
+        options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {
+            "action": "hazardratio",
+            "label": label,
+            "variable": variable,
+            "options": options,
+        }
+
+    def phreg_strata_stmt(self, items: list[Any]) -> dict[str, Any]:
+        variables = next((item for item in items if isinstance(item, list)), [])
+        return {"action": "strata", "variables": [str(v).upper() for v in variables]}
+
+    def phreg_by_stmt(self, items: list[Any]) -> dict[str, Any]:
+        variables = next((item for item in items if isinstance(item, list)), [])
+        return {"action": "by", "variables": [str(v).upper() for v in variables]}
+
+    # ── PROC GENMOD ───────────────────────────────
+
+    def proc_genmod(self, items: list[Any]) -> ProcNode:
+        options: dict[str, Any] = {}
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, dict) and "action" not in item:
+                options.update(item)
+            elif item is not None:
+                statements.append(item)
+        return ProcNode(proc_name="GENMOD", options=options, statements=statements)
+
+    def genmod_opt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def genmod_stmt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def genmod_data_opt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_data_opt(items)
+
+    def genmod_generic_opt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_generic_opt(items)
+
+    def genmod_where_stmt(self, items: list[Any]) -> WhereNode:
+        return self.phreg_where_stmt(items)
+
+    def genmod_class_stmt(self, items: list[Any]) -> dict[str, Any]:
+        classes = [item for item in items if isinstance(item, dict)]
+        return {"action": "class", "classes": classes}
+
+    def genmod_model_opt(self, items: list[Any]) -> tuple[str, Any]:
+        return self.phreg_model_opt(items)
+
+    def genmod_model_stmt(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [item for item in items if isinstance(item, Token)]
+        response = next(
+            (str(item).upper() for item in tokens
+             if item.type == "NAME" and str(item).upper() != "MODEL"),
+            "",
+        )
+        event = next(
+            (_clean_token_value(item) for item in tokens if item.type == "STRING"),
+            "",
+        )
+        predictors = next((item for item in items if isinstance(item, list)), [])
+        model_options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {
+            "action": "model",
+            "response": response,
+            "event": str(event),
+            "predictors": [str(name).upper() for name in predictors],
+            "options": model_options,
+        }
+
+    def signed_number(self, items: list[Any]) -> float:
+        sign = -1.0 if any(
+            isinstance(item, Token) and str(item) == "-" for item in items
+        ) else 1.0
+        number = next(
+            (float(str(item)) for item in items
+             if isinstance(item, Token) and item.type == "NUMBER"),
+            0.0,
+        )
+        return sign * number
+
+    def genmod_estimate_opt(self, items: list[Any]) -> tuple[str, Any]:
+        return self.phreg_model_opt(items)
+
+    def genmod_estimate_stmt(self, items: list[Any]) -> dict[str, Any]:
+        label = next(
+            (_clean_token_value(item) for item in items
+             if isinstance(item, Token) and item.type == "STRING"),
+            "",
+        )
+        variable = next(
+            (str(item).upper() for item in items
+             if isinstance(item, Token) and item.type == "NAME"
+             and str(item).upper() != "ESTIMATE"),
+            "",
+        )
+        coefficients = [float(item) for item in items if isinstance(item, float)]
+        options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {
+            "action": "estimate",
+            "label": str(label),
+            "variable": variable,
+            "coefficients": coefficients,
+            "options": options,
+        }
+
+    def genmod_by_stmt(self, items: list[Any]) -> dict[str, Any]:
+        variables = next((item for item in items if isinstance(item, list)), [])
+        return {"action": "by", "variables": [str(v).upper() for v in variables]}
+
+    def genmod_ods_stmt(self, items: list[Any]) -> dict[str, Any]:
+        ods = next((item for item in items if isinstance(item, ProcNode)), None)
+        if ods is None:
+            return {"action": "ods", "tables": {}}
+        return {
+            "action": "ods",
+            "tables": ods.options.get("TABLES", {}),
+        }
 
     # ── PROC IMPORT ─────────────────────────────────
 
@@ -2322,15 +2764,28 @@ class SasTransformer(Transformer):
                 return ByNode(variables=names if isinstance(names, list) else [names])
             elif keyword == "OUTPUT":
                 out_name = ""
+                out_options: list[dict[str, Any]] = []
                 stats: dict[str, str] = {}
                 for item in items[1:]:
                     if isinstance(item, Token):
                         continue
                     if isinstance(item, VariableNode):
                         out_name = item.name
+                    elif isinstance(item, DatasetRefNode):
+                        out_name = (
+                            f"{item.libref}.{item.name}"
+                            if item.libref.upper() != "WORK"
+                            else item.name
+                        )
+                        out_options = item.options
                     elif isinstance(item, tuple) and len(item) == 2:
                         stats[item[0].upper()] = item[1].upper()
-                return {"action": "means_output", "out": out_name, "stats": stats}
+                return {
+                    "action": "means_output",
+                    "out": out_name,
+                    "out_options": out_options,
+                    "stats": stats,
+                }
         return first if not isinstance(first, Token) else None
 
     def means_output_kv(self, items: list[Any]) -> tuple[str, str]:
@@ -2817,9 +3272,14 @@ class SasTransformer(Transformer):
         return self._generic_proc("TRANSPOSE", items)
 
     def transpose_opt(self, items: list[Any]) -> dict[str, Any]:
+        key = next(
+            (str(item).upper() for item in items if isinstance(item, Token)
+             and str(item).upper() in {"DATA", "OUT", "PREFIX", "NAME", "LABEL"}),
+            "",
+        )
         for item in items:
             if isinstance(item, DatasetRefNode):
-                return {"OUT": item}
+                return {key or "OUT": item}
         return self._generic_opt(items)
 
     def transpose_var(self, items: list[Any]) -> dict[str, Any]:
@@ -2913,7 +3373,20 @@ class SasTransformer(Transformer):
                     label = t[1:-1]
             elif isinstance(item, tuple):
                 keys.append(item)
+            elif isinstance(item, str):
+                label = item
         return {"keys": keys, "label": label}
+
+    def value_label(self, items: list[Any]) -> str:
+        token = next((item for item in items if isinstance(item, Token)), None)
+        if token is None:
+            return ""
+        text = str(token)
+        if (text.startswith("'") and text.endswith("'")) or (
+            text.startswith('"') and text.endswith('"')
+        ):
+            return text[1:-1]
+        return text
 
     def value_key_range(self, items: list[Any]) -> tuple[str, Any, Any]:
         nums = [float(str(t)) for t in items if isinstance(t, Token) and str(t) not in ("-",)]

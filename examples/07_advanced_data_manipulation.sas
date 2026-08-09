@@ -4,9 +4,9 @@
 DATA work.raw_names;
     INPUT name $ 1-20 city $ 21-35;
     DATALINES;
- Alice Smith      New York
-Bob   Jones       Los Angeles
-  Carol  Brown    Chicago
+Alice Smith         New York
+Bob   Jones         Los Angeles
+  Carol  Brown      Chicago
 ;
 RUN;
 

@@ -207,6 +207,35 @@ run;
             for warning in result.steps[-1].warnings
         ))
 
+    def test_array_wildcard_size_uses_explicit_variable_list(self) -> None:
+        sas, result, _ = self._run(
+            """
+data result;
+  col1=10;
+  col2=20;
+  col3=30;
+  col99=99;
+  array colord[*] col1-col3 col99;
+  count=dim(colord);
+  selected=colord[4];
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "RESULT")
+        self.assertEqual(frame["count"].iloc[0], 4)
+        self.assertEqual(frame["selected"].iloc[0], 99)
+
+    def test_empty_statement_does_not_end_data_step(self) -> None:
+        sas, result, _ = self._run(
+            "data result; value=1; ; doubled=value*2; run;"
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "RESULT")
+        self.assertEqual(frame["doubled"].iloc[0], 2)
+
     def test_bare_retain_variable_list_does_not_create_initializers(self) -> None:
         _, result, _ = self._run(
             """

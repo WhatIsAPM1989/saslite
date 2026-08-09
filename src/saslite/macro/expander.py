@@ -145,10 +145,9 @@ class MacroExpander:
         # Step 5.5: Macro functions may now resolve with %LET values
         source = self._process_macro_functions(source)
 
-        # Step 6: Substitute &var references
-        source = self._substitute_vars(source)
-
-        # Step 7: Process %IF/%THEN/%ELSE conditionals
+        # Step 6: Process %IF/%THEN/%ELSE conditionals.  Conditions resolve
+        # their own variables in source order; substituting the entire tail
+        # here would freeze references before a selected branch can %LET them.
         source = self._process_conditionals(source)
 
         # Step 8: Process %PUT statements
@@ -163,7 +162,6 @@ class MacroExpander:
         source = self._process_do_loops(source)
         source = self._process_eval(source)
         source = self._process_let_statements(source)
-        source = self._substitute_vars(source)
         source = self._process_conditionals(source)
         source = self._process_put_statements(source)
 
@@ -415,6 +413,16 @@ class MacroExpander:
             while position < len(masked) and masked[position].isspace():
                 position += 1
 
+        # SAS permits definition options after the parameter list, for example
+        # ``%macro report(...) / minoperator;``.  They affect macro-expression
+        # semantics, but the header itself remains valid even when no option
+        # needs special handling by the expander.
+        if position < len(masked) and masked[position] == "/":
+            semicolon = masked.find(";", position + 1)
+            if semicolon < 0:
+                raise SyntaxError(f"Expected ';' after %MACRO {name}")
+            position = semicolon
+
         if position >= len(masked) or masked[position] != ";":
             raise SyntaxError(f"Expected ';' after %MACRO {name}")
         return position + 1, params_str
@@ -494,7 +502,11 @@ class MacroExpander:
         """Process %IF ... %THEN ... %ELSE ... %DO ... %END; conditionals."""
         max_iterations = 100
         for _ in range(max_iterations):
-            new_source = self._process_conditionals_once(source)
+            # Execute source-order %LET statements that precede the next
+            # conditional, but leave assignments inside its branches alone
+            # until that branch has actually been selected.
+            new_source = self._process_let_statements(source)
+            new_source = self._process_conditionals_once(new_source)
             if new_source == source:
                 break
             source = new_source
@@ -672,6 +684,23 @@ class MacroExpander:
         ):
             return None
 
+        # Boolean macro expressions do not necessarily arrive through
+        # %EVAL/%SYSEVALF.  Split only top-level words so quoted labels and
+        # function arguments containing AND/OR stay intact.  OR has the lower
+        # precedence and is therefore handled first.
+        or_parts = self._split_macro_boolean(condition, "OR")
+        if len(or_parts) > 1:
+            results = [self._eval_macro_condition(part) for part in or_parts]
+            if any(result is True for result in results):
+                return True
+            return None if any(result is None for result in results) else False
+        and_parts = self._split_macro_boolean(condition, "AND")
+        if len(and_parts) > 1:
+            results = [self._eval_macro_condition(part) for part in and_parts]
+            if any(result is False for result in results):
+                return False
+            return None if any(result is None for result in results) else True
+
         # Handle comparison operators
         for op in ("<>", " NE ", " GE ", " LE ", " GT ", " LT ", ">=", "<=", "=", ">", "<"):
             if op in condition:
@@ -709,6 +738,51 @@ class MacroExpander:
             return None if inner is None else not inner
         val = condition.strip("'\"")
         return val not in ("", "0", ".", "FALSE")
+
+    @staticmethod
+    def _split_macro_boolean(condition: str, operator: str) -> list[str]:
+        """Split a top-level macro boolean operator outside quotes/parens."""
+        pieces: list[str] = []
+        start = 0
+        depth = 0
+        quote: str | None = None
+        index = 0
+        while index < len(condition):
+            character = condition[index]
+            if quote is not None:
+                if character == quote:
+                    if index + 1 < len(condition) and condition[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+                index += 1
+                continue
+            if character in ("'", '"'):
+                quote = character
+                index += 1
+                continue
+            if character == "(":
+                depth += 1
+                index += 1
+                continue
+            if character == ")":
+                depth = max(0, depth - 1)
+                index += 1
+                continue
+            end = index + len(operator)
+            if (
+                depth == 0
+                and condition[index:end].upper() == operator
+                and (index == 0 or not condition[index - 1].isalnum())
+                and (end == len(condition) or not condition[end].isalnum())
+            ):
+                pieces.append(condition[start:index].strip())
+                start = end
+                index = end
+                continue
+            index += 1
+        pieces.append(condition[start:].strip())
+        return pieces
 
     def _expand_macro_invocations(self, source: str) -> str:
         """Expand %macro_name and %macro_name(args) invocations."""
@@ -897,7 +971,6 @@ class MacroExpander:
             body = self._process_eval(body)
             body = self._process_global_declarations(body)
             body = self._process_let_statements(body)
-            body = self._substitute_vars(body)
             body = self._process_conditionals(body)
             # Expand iterative %DO only after false conditional branches have
             # been discarded; otherwise their %END tokens can be consumed as
@@ -906,8 +979,8 @@ class MacroExpander:
             body = self._process_macro_functions(body)
             body = self._process_eval(body)
             body = self._process_let_statements(body)
-            body = self._substitute_vars(body)
             body = self._process_conditionals(body)
+            body = self._substitute_vars(body)
             body = self._process_put_statements(body)
             body = self._expand_macro_invocations(body)
             return self._apply_return_goto(body)
@@ -975,13 +1048,21 @@ class MacroExpander:
             self._log_symbolgen(var_name, value)
             return ""  # Remove the %LET statement
 
-        source = re.sub(
+        # Macro execution is ordered.  In particular, a %LET in the false
+        # branch of a later %IF must not run while scanning the surrounding
+        # body.  Process only the portion before the next conditional; the
+        # conditional engine removes the unselected branch and then calls us
+        # again on the remaining source.
+        masked = self._mask_quoted_text(source)
+        conditional = re.search(r"%\s*IF\b", masked, flags=re.IGNORECASE)
+        boundary = conditional.start() if conditional is not None else len(source)
+        prefix = re.sub(
             r"%\s*LET\s+(\w+)\s*=\s*(.*?);",
             replacer,
-            source,
+            source[:boundary],
             flags=re.IGNORECASE,
         )
-        return source
+        return prefix + source[boundary:]
 
     def _resolve_let_value(self, value: str) -> str:
         """Resolve macro triggers on a %LET right-hand side in source order.
@@ -1193,7 +1274,6 @@ class MacroExpander:
             source = self._process_global_declarations(source)
             source = self._process_let_statements(source)
             source = self._process_macro_functions(source)
-            source = self._substitute_vars(source)
             source = self._process_conditionals(source)
             source = self._process_put_statements(source)
             source = self._expand_macro_invocations(source)
@@ -1201,7 +1281,6 @@ class MacroExpander:
             source = self._process_do_loops(source)
             source = self._process_eval(source)
             source = self._process_let_statements(source)
-            source = self._substitute_vars(source)
             source = self._process_conditionals(source)
             source = self._process_put_statements(source)
             source = self._substitute_vars(source)

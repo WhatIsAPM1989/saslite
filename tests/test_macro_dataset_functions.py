@@ -88,6 +88,30 @@ class MacroDatasetFunctionTests(unittest.TestCase):
         self.assertEqual(frame.loc[0, "present"], 1)
         self.assertEqual(frame.loc[0, "absent"], 0)
 
+    def test_data_step_open_varnum_attrn_and_close_share_handles(self) -> None:
+        result = self.sas.execute(
+            """
+data metadata;
+  dsid=open("work.subjects");
+  age_number=varnum(dsid,"age");
+  missing_number=varnum(dsid,"unknown");
+  observations=attrn(dsid,"nobs");
+  variables=attrn(dsid,"nvars");
+  close_rc=close(dsid);
+  closed_number=varnum(dsid,"age");
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = self.sas.get_dataset("WORK", "METADATA")
+        self.assertEqual(frame["age_number"].iloc[0], 2)
+        self.assertEqual(frame["missing_number"].iloc[0], 0)
+        self.assertEqual(frame["observations"].iloc[0], 2)
+        self.assertEqual(frame["variables"].iloc[0], 2)
+        self.assertEqual(frame["close_rc"].iloc[0], 0)
+        self.assertEqual(frame["closed_number"].iloc[0], 0)
+
     def test_varnum_is_case_insensitive_and_returns_zero_when_absent(self) -> None:
         self.assertTrue(
             self.sas.execute("%let dsid=%sysfunc(open(subjects));").success

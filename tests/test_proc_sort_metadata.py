@@ -49,6 +49,28 @@ run;
         self.assertIsNotNone(response)
         self.assertEqual((response.dtype, response.length), ("character", 12))
 
+    def test_by_prefix_list_expands_in_column_order(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data source;
+  input group col1 col2 unrelated;
+  datalines;
+1 2 1 9
+1 1 2 8
+1 1 1 7
+;
+run;
+proc sort data=source out=sorted;
+  by group col:;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "SORTED")
+        self.assertEqual(frame["UNRELATED"].tolist(), [7.0, 8.0, 9.0])
+
 
 if __name__ == "__main__":
     unittest.main()
