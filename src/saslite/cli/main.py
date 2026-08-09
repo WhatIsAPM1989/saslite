@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 from saslite.api.facade import SasInterpreter
@@ -49,6 +50,22 @@ def main(argv: list[str] | None = None) -> int:
         default="utf-8",
         help="Encoding used to read SAS script files",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Show only WARNING and ERROR diagnostics",
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop after the first SAS step that reports an error or warning",
+    )
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Colorize WARNING and ERROR diagnostics (default: auto)",
+    )
     profile_group = parser.add_mutually_exclusive_group()
     profile_group.add_argument(
         "--profile",
@@ -81,6 +98,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"SASLite {__version__}")
         return 0
 
+    if args.quiet:
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Note: sas7bdat format currently uses XPT .*",
+            category=UserWarning,
+        )
+
     try:
         sas = SasInterpreter(
             work_dir=args.workdir,
@@ -92,6 +116,14 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ImportError, TypeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+    color = {"auto": None, "always": True, "never": False}[args.color]
+    sas.reporter.configure(
+        color=color,
+        quiet=args.quiet,
+        stop_on_error=args.fail_fast,
+        stop_on_warning=args.fail_fast,
+    )
 
     if args.execute:
         return _run_text(sas, args.execute)
@@ -121,9 +153,8 @@ def _run_file(sas: SasInterpreter, filepath: str, encoding: str = "utf-8") -> in
         return 1
 
     if not summary.success:
-        for step in summary.steps:
-            if step.error:
-                print(f"ERROR: {step.error}", file=sys.stderr)
+        if not sas.reporter.has_errors and summary.error:
+            sas.reporter.error(summary.error)
         return 1
 
     return 0
@@ -133,9 +164,8 @@ def _run_text(sas: SasInterpreter, text: str) -> int:
     """Run a SAS statement."""
     summary = sas.execute(text)
     if not summary.success:
-        for step in summary.steps:
-            if step.error:
-                print(f"ERROR: {step.error}", file=sys.stderr)
+        if not sas.reporter.has_errors and summary.error:
+            sas.reporter.error(summary.error)
         return 1
     return 0
 

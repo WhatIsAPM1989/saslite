@@ -6,6 +6,10 @@
       "type": "process",
       "command": "${workspaceFolder}/scripts/run-saslite",
       "args": [
+        "--quiet",
+        "--fail-fast",
+        "--color",
+        "always",
         "${file}"
       ],
       "options": {
