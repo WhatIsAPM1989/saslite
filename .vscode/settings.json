@@ -1,9 +1,9 @@
 {
   "code-runner.executorMap": {
-    "sas": "\"$workspaceRoot/scripts/run-saslite\""
+    "sas": "\"$workspaceRoot/scripts/run-saslite\" $fullFileName"
   },
   "code-runner.executorMapByFileExtension": {
-    ".sas": "\"$workspaceRoot/scripts/run-saslite\""
+    ".sas": "\"$workspaceRoot/scripts/run-saslite\" $fullFileName"
   },
   "code-runner.defaultLanguage": "sas",
   "code-runner.runInTerminal": true,
