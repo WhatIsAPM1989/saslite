@@ -76,6 +76,10 @@ step that reports a warning or error. A normal `saslite program.sas` command
 continues to use the full uncolored log. The same behavior is available from
 the CLI with `--quiet --fail-fast --color always`.
 
+The optional local `vscode/saslite-runner-menu` extension adds **SASLite: Run
+with Full Log** to the Run dropdown. That action keeps colored diagnostics but
+shows the complete log and does not stop on warnings.
+
 The runner uses `.venv/bin/python` when the repository virtual environment is
 available, otherwise it falls back to `python3`. It always runs the local
 sources from `src/` and stores persistent datasets in `.work/`.

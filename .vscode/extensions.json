@@ -1,5 +1,6 @@
 {
   "recommendations": [
-    "formulahendry.code-runner"
+    "formulahendry.code-runner",
+    "saslite-local.saslite-runner-menu"
   ]
 }
