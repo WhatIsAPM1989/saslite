@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 from typing import TextIO
 
@@ -14,6 +15,27 @@ class Reporter:
     _SUCCESS = "\033[1;32m"
     _WARNING = "\033[1;33m"
     _ERROR = "\033[1;31m"
+    _VARIABLE = "\033[1;36m"
+    _VARIABLE_NAMES_AFTER_LABEL = re.compile(
+        r"(?P<label>\bvariable(?:\(s\)|s)?\s+)"
+        r"(?P<names>[A-Za-z_][A-Za-z0-9_.]*"
+        r"(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)"
+        r"(?=\s+(?:absent|appears|because|by|cannot|does|found|has|is|must|"
+        r"not|referenced|was|were)\b|:)",
+        re.IGNORECASE,
+    )
+    _VARIABLE_LIST = re.compile(
+        r"(?P<label>\b(?:BY\s+)?(?:variables|variable\(s\)|columns|column\(s\))"
+        r"[^:\n]{0,80}:\s*)"
+        r"(?P<names>[A-Za-z_][A-Za-z0-9_.]*"
+        r"(?:\s*,\s*[A-Za-z_][A-Za-z0-9_.]*)*)",
+        re.IGNORECASE,
+    )
+    _VARIABLE_PREFIX = re.compile(
+        r"(?P<label>\bvariables?\s+match(?:es)?\s+prefix\s+)"
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_.]*)",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -61,17 +83,19 @@ class Reporter:
         if marker.startswith("ERROR:"):
             prefix_at = line.upper().find("ERROR:")
             prefix_end = prefix_at + len("ERROR:")
-            return (
+            formatted = (
                 f"{line[:prefix_at]}{self._ERROR}{line[prefix_at:prefix_end]}"
                 f"{self._RESET}{line[prefix_end:]}"
             )
+            return self._highlight_variable_names(formatted)
         if marker.startswith("WARNING:"):
             prefix_at = line.upper().find("WARNING:")
             prefix_end = prefix_at + len("WARNING:")
-            return (
+            formatted = (
                 f"{line[:prefix_at]}{self._WARNING}{line[prefix_at:prefix_end]}"
                 f"{self._RESET}{line[prefix_end:]}"
             )
+            return self._highlight_variable_names(formatted)
         if marker.startswith("SUCCESS:"):
             prefix_at = line.upper().find("SUCCESS:")
             prefix_end = prefix_at + len("SUCCESS:")
@@ -80,6 +104,31 @@ class Reporter:
                 f"{self._RESET}{line[prefix_end:]}"
             )
         return line
+
+    def _highlight_variable_names(self, line: str) -> str:
+        """Highlight variable names recognized in SAS diagnostic wording."""
+        def highlight_name(match: re.Match[str]) -> str:
+            name = match.group("name")
+            return (
+                f"{match.group('label')}{self._VARIABLE}{name}{self._RESET}"
+            )
+
+        def highlight_list(match: re.Match[str]) -> str:
+            names = match.group("names")
+
+            def wrap(token: re.Match[str]) -> str:
+                name = token.group(0)
+                return f"{self._VARIABLE}{name}{self._RESET}"
+
+            return match.group("label") + re.sub(
+                r"[A-Za-z_][A-Za-z0-9_.]*",
+                wrap,
+                names,
+            )
+
+        line = self._VARIABLE_LIST.sub(highlight_list, line)
+        line = self._VARIABLE_PREFIX.sub(highlight_name, line)
+        return self._VARIABLE_NAMES_AFTER_LABEL.sub(highlight_list, line)
 
     def _print_line(self, line: str) -> None:
         print(self._format_line(line), file=self._stream)

@@ -21,6 +21,48 @@ class ReporterModeTests(unittest.TestCase):
         self.assertIn("\033[1;31mERROR:\033[0m failed", output)
         self.assertIn("\033[1;32mSUCCESS:\033[0m completed", output)
 
+    def test_diagnostics_highlight_problem_variable_names(self) -> None:
+        log = io.StringIO()
+        reporter = Reporter(stream=log, color=True)
+
+        reporter.warning(
+            "/tmp/program.sas:42:1: Variable atoxgr is uninitialized and "
+            "is absent from input dataset(s) WORK.ADAE."
+        )
+        reporter.error("Variable CNSR not found in dataset")
+        reporter.error(
+            "BY variable(s) not found in UPDATE master: STUDYID, USUBJID"
+        )
+        reporter.error(
+            "BY variable(s) SITEID, USUBJID not found in input dataset"
+        )
+
+        output = log.getvalue()
+        self.assertIn(
+            "/tmp/program.sas:42:1: Variable \033[1;36matoxgr\033[0m",
+            output,
+        )
+        self.assertIn("Variable \033[1;36mCNSR\033[0m not found", output)
+        self.assertIn(
+            "UPDATE master: \033[1;36mSTUDYID\033[0m, "
+            "\033[1;36mUSUBJID\033[0m",
+            output,
+        )
+        self.assertIn(
+            "variable(s) \033[1;36mSITEID\033[0m, "
+            "\033[1;36mUSUBJID\033[0m not found",
+            output,
+        )
+        self.assertNotIn("\033[1;36mbefore\033[0m", output)
+
+    def test_diagnostic_does_not_treat_prose_as_a_variable_name(self) -> None:
+        log = io.StringIO()
+        reporter = Reporter(stream=log, color=True)
+
+        reporter.error("CLASS variable must have exactly 2 levels")
+
+        self.assertNotIn("\033[1;36mmust\033[0m", log.getvalue())
+
     def test_quiet_mode_hides_notes_and_regular_output(self) -> None:
         log = io.StringIO()
         reporter = Reporter(stream=log, quiet=True)
