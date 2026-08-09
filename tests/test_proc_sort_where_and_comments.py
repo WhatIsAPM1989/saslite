@@ -52,6 +52,50 @@ run;
 
 
 class SasStatementCommentTests(unittest.TestCase):
+    def test_nested_block_comment_markers_do_not_leak_disabled_code(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+/* outer disabled section
+   /* compatibility annotation */
+   proc unsupported;
+*/
+data result;
+  value=1;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas.get_dataset("WORK", "RESULT")["value"].tolist(), [1])
+
+    def test_nested_comments_do_not_split_runtime_macro_body(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+%macro build;
+  data source;
+    value=1;
+  run;
+  /* disabled section
+     /* compatibility annotation */
+     %mend;
+     run;
+  */
+  proc sql noprint;
+    select count(*) into :row_count trimmed from source;
+  quit;
+  data result;
+    value=&row_count.;
+  run;
+%mend build;
+%build;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas.get_dataset("WORK", "RESULT")["value"].tolist(), [1])
+
     def test_unclosed_block_comment_discards_remaining_source(self) -> None:
         expander = MacroExpander()
         expanded = expander.expand(

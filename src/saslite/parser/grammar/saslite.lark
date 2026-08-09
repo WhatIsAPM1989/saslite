@@ -29,6 +29,9 @@ statement: data_step
          | proc_lifetest
          | proc_phreg
          | proc_genmod
+         | proc_mixed
+         | proc_icphreg
+         | proc_iclifetest
          | ods_stmt
          | libname_stmt ";"
          | filename_stmt ";"
@@ -403,6 +406,61 @@ genmod_stmt: "WHERE"i expr ";" -> genmod_where_stmt
 genmod_model_opt: NAME ("=" (STRING | NAME | NUMBER))?
 genmod_estimate_opt: NAME ("=" (STRING | NAME | NUMBER))?
 signed_number: ("+" | "-")? NUMBER
+
+// ─── PROC MIXED ──────────────────────────────────
+
+proc_mixed: "PROC"i "MIXED"i (mixed_opt)* ";" (mixed_stmt)* ("RUN"i ";")?
+
+mixed_opt: "DATA"i "=" dataset_ref -> mixed_data_opt
+         | NAME ("=" mixed_option_value)? -> mixed_generic_opt
+
+mixed_stmt: "WHERE"i expr ";" -> mixed_where_stmt
+          | "CLASS"i phreg_class_item+ ";" -> mixed_class_stmt
+          | "MODEL"i NAME "=" mixed_effect_list ("/" mixed_model_opt*)? ";" -> mixed_model_stmt
+          | "REPEATED"i NAME ("/" mixed_repeated_opt*)? ";" -> mixed_repeated_stmt
+          | "LSMEANS"i NAME ("/" mixed_lsmeans_opt*)? ";" -> mixed_lsmeans_stmt
+          | "BY"i name_list ";" -> mixed_by_stmt
+          | ods_stmt -> mixed_ods_stmt
+
+mixed_effect_list: mixed_effect+
+mixed_effect: NAME ("*" NAME)*
+mixed_option_value: STRING | NUMBER | NAME ("(" NUMBER ")")?
+mixed_model_opt: NAME ("=" mixed_option_value)?
+mixed_repeated_opt: NAME ("=" mixed_option_value)?
+mixed_lsmeans_opt: NAME ("=" mixed_option_value)?
+
+// ─── PROC ICPHREG ────────────────────────────────
+
+proc_icphreg: "PROC"i "ICPHREG"i (icphreg_opt)* ";" (icphreg_stmt)* ("RUN"i ";")?
+
+icphreg_opt: "DATA"i "=" dataset_ref -> icphreg_data_opt
+           | NAME ("=" (NAME | NUMBER | STRING))? -> icphreg_generic_opt
+
+icphreg_stmt: "WHERE"i expr ";" -> icphreg_where_stmt
+            | "CLASS"i phreg_class_item+ ";" -> icphreg_class_stmt
+            | "MODEL"i "(" NAME "," NAME ")" "=" name_list ("/" icphreg_model_opt*)? ";" -> icphreg_interval_model_stmt
+            | "MODEL"i NAME "*" NAME "(" in_expr_list? ")" "=" name_list ("/" icphreg_model_opt*)? ";" -> icphreg_censor_model_stmt
+            | "HAZARDRATIO"i STRING? NAME ("/" phreg_hr_opt*)? ";" -> icphreg_hazardratio_stmt
+            | "STRATA"i name_list ";" -> icphreg_strata_stmt
+            | "BY"i name_list ";" -> icphreg_by_stmt
+            | ods_stmt -> icphreg_ods_stmt
+
+icphreg_model_opt: "BASE"i "=" NAME "(" "NINTERVAL"i "=" NUMBER ")" -> icphreg_base_opt
+                  | NAME ("=" (STRING | NAME | NUMBER))? -> icphreg_named_model_opt
+
+// ─── PROC ICLIFETEST ─────────────────────────────
+
+proc_iclifetest: "PROC"i "ICLIFETEST"i (iclifetest_opt)* ";" (iclifetest_stmt)* ("RUN"i ";")?
+
+iclifetest_opt: "DATA"i "=" dataset_ref -> iclifetest_data_opt
+              | NAME "=" (NAME | NUMBER | STRING) -> iclifetest_named_opt
+              | NAME "(" NAME "=" NUMBER ")" -> iclifetest_call_opt
+              | NAME -> iclifetest_flag_opt
+
+iclifetest_stmt: "TIME"i "(" NAME "," NAME ")" ";" -> iclifetest_time_stmt
+               | "BY"i name_list ";" -> iclifetest_by_stmt
+               | "WHERE"i expr ";" -> iclifetest_where_stmt
+               | ods_stmt -> iclifetest_ods_stmt
 
 // ─── PROC APPEND ──────────────────────────────────
 

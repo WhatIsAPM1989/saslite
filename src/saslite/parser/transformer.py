@@ -133,16 +133,21 @@ class SasTransformer(Transformer):
         return table, target
 
     def ods_output(self, items: list[Any]) -> ProcNode:
+        table_items = [
+            item for item in items
+            if isinstance(item, tuple) and len(item) == 2 and item[0]
+        ]
         tables = {
             name: target
-            for item in items
-            if isinstance(item, tuple) and len(item) == 2
-            for name, target in [item]
-            if name
+            for name, target in table_items
         }
         return ProcNode(
             proc_name="ODS",
-            options={"ACTION": "OUTPUT", "TABLES": tables},
+            options={
+                "ACTION": "OUTPUT",
+                "TABLES": tables,
+                "TABLE_ITEMS": table_items,
+            },
         )
 
     def ods_output_close(self, items: list[Any]) -> ProcNode:
@@ -2481,7 +2486,276 @@ class SasTransformer(Transformer):
         return {
             "action": "ods",
             "tables": ods.options.get("TABLES", {}),
+            "table_items": ods.options.get("TABLE_ITEMS", []),
         }
+
+    # ── PROC MIXED ────────────────────────────────
+
+    def proc_mixed(self, items: list[Any]) -> ProcNode:
+        options: dict[str, Any] = {}
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, dict) and "action" not in item:
+                options.update(item)
+            elif item is not None:
+                statements.append(item)
+        return ProcNode(proc_name="MIXED", options=options, statements=statements)
+
+    def mixed_opt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def mixed_stmt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def mixed_option_value(self, items: list[Any]) -> Any:
+        tokens = [item for item in items if isinstance(item, Token)]
+        if not tokens:
+            return ""
+        base = _clean_token_value(tokens[0])
+        number = next(
+            (str(item) for item in tokens[1:] if item.type == "NUMBER"),
+            None,
+        )
+        return f"{base}({number})" if number is not None else base
+
+    def mixed_data_opt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_data_opt(items)
+
+    def mixed_generic_opt(self, items: list[Any]) -> dict[str, Any]:
+        key, value = self._mixed_named_option(items)
+        return {key: value} if key else {}
+
+    @staticmethod
+    def _mixed_named_option(items: list[Any]) -> tuple[str, Any]:
+        key = next(
+            (str(item).upper() for item in items
+             if isinstance(item, Token) and item.type == "NAME"),
+            "",
+        )
+        value = next(
+            (item for item in items if not isinstance(item, Token)),
+            True,
+        )
+        return key, value
+
+    def mixed_where_stmt(self, items: list[Any]) -> WhereNode:
+        return self.phreg_where_stmt(items)
+
+    def mixed_class_stmt(self, items: list[Any]) -> dict[str, Any]:
+        classes = [item for item in items if isinstance(item, dict)]
+        return {"action": "class", "classes": classes}
+
+    def mixed_effect(self, items: list[Any]) -> str:
+        names = [str(item).upper() for item in items
+                 if isinstance(item, Token) and item.type == "NAME"]
+        return "*".join(names)
+
+    def mixed_effect_list(self, items: list[Any]) -> list[str]:
+        return [str(item).upper() for item in items if isinstance(item, str)]
+
+    def mixed_model_opt(self, items: list[Any]) -> tuple[str, Any]:
+        return self._mixed_named_option(items)
+
+    def mixed_model_stmt(self, items: list[Any]) -> dict[str, Any]:
+        response = next(
+            (str(item).upper() for item in items
+             if isinstance(item, Token) and item.type == "NAME"
+             and str(item).upper() != "MODEL"),
+            "",
+        )
+        effects = next((item for item in items if isinstance(item, list)), [])
+        options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {
+            "action": "model",
+            "response": response,
+            "effects": effects,
+            "options": options,
+        }
+
+    def mixed_repeated_opt(self, items: list[Any]) -> tuple[str, Any]:
+        return self._mixed_named_option(items)
+
+    def mixed_repeated_stmt(self, items: list[Any]) -> dict[str, Any]:
+        variable = next(
+            (str(item).upper() for item in items
+             if isinstance(item, Token) and item.type == "NAME"
+             and str(item).upper() != "REPEATED"),
+            "",
+        )
+        options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {"action": "repeated", "variable": variable, "options": options}
+
+    def mixed_lsmeans_opt(self, items: list[Any]) -> tuple[str, Any]:
+        return self._mixed_named_option(items)
+
+    def mixed_lsmeans_stmt(self, items: list[Any]) -> dict[str, Any]:
+        effect = next(
+            (str(item).upper() for item in items
+             if isinstance(item, Token) and item.type == "NAME"
+             and str(item).upper() != "LSMEANS"),
+            "",
+        )
+        options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {"action": "lsmeans", "effect": effect, "options": options}
+
+    def mixed_by_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.genmod_by_stmt(items)
+
+    def mixed_ods_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.genmod_ods_stmt(items)
+
+    # ── PROC ICPHREG ──────────────────────────────
+
+    def proc_icphreg(self, items: list[Any]) -> ProcNode:
+        options: dict[str, Any] = {}
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, dict) and "action" not in item:
+                options.update(item)
+            elif item is not None:
+                statements.append(item)
+        return ProcNode(proc_name="ICPHREG", options=options, statements=statements)
+
+    def icphreg_opt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def icphreg_stmt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def icphreg_data_opt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_data_opt(items)
+
+    def icphreg_generic_opt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_generic_opt(items)
+
+    def icphreg_where_stmt(self, items: list[Any]) -> WhereNode:
+        return self.phreg_where_stmt(items)
+
+    def icphreg_class_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_class_stmt(items)
+
+    def icphreg_base_opt(self, items: list[Any]) -> tuple[str, Any]:
+        names = [str(item).upper() for item in items
+                 if isinstance(item, Token) and item.type == "NAME"]
+        count = next(
+            (int(float(str(item))) for item in items
+             if isinstance(item, Token) and item.type == "NUMBER"),
+            1,
+        )
+        return "BASE", {
+            "METHOD": names[0] if names else "PIECEWISE",
+            "NINTERVAL": count,
+        }
+
+    def icphreg_named_model_opt(self, items: list[Any]) -> tuple[str, Any]:
+        return self.phreg_model_opt(items)
+
+    def icphreg_interval_model_stmt(self, items: list[Any]) -> dict[str, Any]:
+        names = [str(item).upper() for item in items
+                 if isinstance(item, Token) and item.type == "NAME"]
+        predictors = next((item for item in items if isinstance(item, list)), [])
+        options = {
+            key: value for item in items
+            if isinstance(item, tuple) and len(item) == 2
+            for key, value in [item] if key
+        }
+        return {
+            "action": "model",
+            "model_type": "interval",
+            "left": names[0] if names else "",
+            "right": names[1] if len(names) > 1 else "",
+            "predictors": [str(name).upper() for name in predictors],
+            "options": options,
+        }
+
+    def icphreg_censor_model_stmt(self, items: list[Any]) -> dict[str, Any]:
+        model = self.phreg_model_stmt(items)
+        model["model_type"] = "right_censored"
+        return model
+
+    def icphreg_hazardratio_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_hazardratio_stmt(items)
+
+    def icphreg_strata_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_strata_stmt(items)
+
+    def icphreg_by_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_by_stmt(items)
+
+    def icphreg_ods_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.genmod_ods_stmt(items)
+
+    # ── PROC ICLIFETEST ───────────────────────────
+
+    def proc_iclifetest(self, items: list[Any]) -> ProcNode:
+        options: dict[str, Any] = {}
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, dict) and "action" not in item:
+                options.update(item)
+            elif item is not None:
+                statements.append(item)
+        return ProcNode(proc_name="ICLIFETEST", options=options, statements=statements)
+
+    def iclifetest_opt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def iclifetest_stmt(self, items: list[Any]) -> Any:
+        non_tokens = _non_tokens(items)
+        return non_tokens[0] if non_tokens else None
+
+    def iclifetest_data_opt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_data_opt(items)
+
+    def iclifetest_named_opt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_generic_opt(items)
+
+    def iclifetest_call_opt(self, items: list[Any]) -> dict[str, Any]:
+        names = [str(item).upper() for item in items
+                 if isinstance(item, Token) and item.type == "NAME"]
+        value = next((_clean_token_value(item) for item in items
+                      if isinstance(item, Token) and item.type == "NUMBER"), "")
+        return {names[0]: {names[1]: value}} if len(names) >= 2 else {}
+
+    def iclifetest_flag_opt(self, items: list[Any]) -> dict[str, Any]:
+        name = next((str(item).upper() for item in items
+                     if isinstance(item, Token) and item.type == "NAME"), "")
+        return {name: True} if name else {}
+
+    def iclifetest_time_stmt(self, items: list[Any]) -> dict[str, Any]:
+        names = [str(item).upper() for item in items
+                 if isinstance(item, Token) and item.type == "NAME"]
+        return {
+            "action": "time",
+            "left": names[0] if names else "",
+            "right": names[1] if len(names) > 1 else "",
+        }
+
+    def iclifetest_by_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.phreg_by_stmt(items)
+
+    def iclifetest_where_stmt(self, items: list[Any]) -> WhereNode:
+        return self.phreg_where_stmt(items)
+
+    def iclifetest_ods_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self.genmod_ods_stmt(items)
 
     # ── PROC IMPORT ─────────────────────────────────
 

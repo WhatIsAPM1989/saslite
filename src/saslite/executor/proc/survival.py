@@ -24,10 +24,21 @@ def handle_ods(proc: ProcNode, session: Session, reporter: Reporter) -> StepResu
     action = str(proc.options.get("ACTION", "")).upper()
     if not hasattr(session, "_ods_output_targets"):
         session._ods_output_targets = {}
+    if not hasattr(session, "_ods_output_items"):
+        session._ods_output_items = []
     if action == "OUTPUT":
+        new_items = list(proc.options.get("TABLE_ITEMS", []))
+        if not new_items:
+            new_items = list(proc.options.get("TABLES", {}).items())
+        replaced = {str(name).upper() for name, _target in new_items}
+        session._ods_output_items = [
+            item for item in session._ods_output_items
+            if str(item[0]).upper() not in replaced
+        ] + new_items
         session._ods_output_targets.update(proc.options.get("TABLES", {}))
     elif action == "OUTPUT_CLOSE":
         session._ods_output_targets.clear()
+        session._ods_output_items.clear()
     return StepResult(success=True)
 
 

@@ -30,6 +30,8 @@ from saslite.executor.proc.survival import (
     handle_proc_phreg,
 )
 from saslite.executor.proc.generalized import handle_proc_genmod
+from saslite.executor.proc.mixed import handle_proc_mixed
+from saslite.executor.proc.interval_survival import handle_proc_icphreg, handle_proc_iclifetest
 from saslite.runtime.execution_result import RunSummary
 from saslite.diagnostics.reporter import Reporter
 from saslite.profiles import CompatibilityProfile, create_profile, load_profile_file
@@ -317,6 +319,9 @@ class SasInterpreter:
             dispatcher.register_proc("LIFETEST", lambda p: handle_proc_lifetest(p, session, reporter))
             dispatcher.register_proc("PHREG", lambda p: handle_proc_phreg(p, session, reporter))
             dispatcher.register_proc("GENMOD", lambda p: handle_proc_genmod(p, session, reporter))
+            dispatcher.register_proc("MIXED", lambda p: handle_proc_mixed(p, session, reporter))
+            dispatcher.register_proc("ICPHREG", lambda p: handle_proc_icphreg(p, session, reporter))
+            dispatcher.register_proc("ICLIFETEST", lambda p: handle_proc_iclifetest(p, session, reporter))
 
             return dispatcher.run(program)
 
@@ -339,19 +344,24 @@ class SasInterpreter:
         datalines_terminator: str | None = None
         macro_depth = 0
         macro_control_depth = 0
-        in_block_comment = False
+        block_comment_depth = 0
 
         def structural_text(line: str) -> str:
             """Return code outside /* ... */ while preserving comment state."""
-            nonlocal in_block_comment
+            nonlocal block_comment_depth
             visible: list[str] = []
             position = 0
             while position < len(line):
-                if in_block_comment:
+                if block_comment_depth:
+                    nested = line.find("/*", position)
                     end = line.find("*/", position)
                     if end < 0:
                         return "".join(visible)
-                    in_block_comment = False
+                    if nested >= 0 and nested < end:
+                        block_comment_depth += 1
+                        position = nested + 2
+                        continue
+                    block_comment_depth -= 1
                     position = end + 2
                     continue
                 start = line.find("/*", position)
@@ -359,7 +369,7 @@ class SasInterpreter:
                     visible.append(line[position:])
                     break
                 visible.append(line[position:start])
-                in_block_comment = True
+                block_comment_depth = 1
                 position = start + 2
             return "".join(visible)
 

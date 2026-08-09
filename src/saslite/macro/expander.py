@@ -191,12 +191,26 @@ class MacroExpander:
                 uncommented.append(source[position:])
                 break
             uncommented.append(source[position:start])
-            end = source.find("*/", start + 2)
-            if end < 0:
-                # SAS treats the rest of the submitted source as commented.
-                position = len(source)
-                break
-            position = end + 2
+            depth = 1
+            scan_at = start + 2
+            while depth:
+                nested_start = source.find("/*", scan_at)
+                end = source.find("*/", scan_at)
+                if end < 0:
+                    # SAS treats the rest of the submitted source as
+                    # commented.  Accepting nested markers is useful when a
+                    # compatibility preprocessor annotates code that was
+                    # already inside a block comment.
+                    position = len(source)
+                    break
+                if nested_start >= 0 and nested_start < end:
+                    depth += 1
+                    scan_at = nested_start + 2
+                    continue
+                depth -= 1
+                scan_at = end + 2
+            else:
+                position = scan_at
         source = "".join(uncommented)
         source = re.sub(r"%\*[^;]*;", "", source)
         # A leading star denotes a comment only where a new statement may
