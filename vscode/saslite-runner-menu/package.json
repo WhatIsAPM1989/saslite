@@ -1,0 +1,40 @@
+{
+  "name": "saslite-runner-menu",
+  "displayName": "SASLite Runner Menu",
+  "description": "Adds a full-log SASLite action to the editor Run menu.",
+  "version": "0.1.0",
+  "publisher": "saslite-local",
+  "license": "MIT",
+  "files": [
+    "extension.js",
+    "README.md"
+  ],
+  "engines": {
+    "vscode": "^1.56.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:sasliteRunner.runFullLog"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "sasliteRunner.runFullLog",
+        "title": "SASLite: Run with Full Log",
+        "icon": "$(output)"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "sasliteRunner.runFullLog",
+          "when": "resourceExtname == .sas",
+          "group": "navigation@2"
+        }
+      ]
+    }
+  }
+}
