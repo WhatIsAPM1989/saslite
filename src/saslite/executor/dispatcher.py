@@ -38,10 +38,20 @@ class Dispatcher:
             if result.error:
                 self.reporter.error(result.error)
 
+            if result.error and self.reporter.stop_on_error:
+                break
+
             for msg in result.notes:
                 self.reporter.note(msg)
             for msg in result.warnings:
                 self.reporter.warning(msg)
+                if self.reporter.stop_on_warning:
+                    break
+
+            if result.warnings and self.reporter.stop_on_warning:
+                summary.success = False
+                summary.error = f"Stopped after warning: {result.warnings[0]}"
+                break
 
         return summary
 

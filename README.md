@@ -70,6 +70,12 @@ This repository recommends the Code Runner extension and maps its editor-title
 play button to SASLite for `.sas` files. After installing the recommended
 extension, open a SAS program and click **Run Code** (the play icon).
 
+Editor runs use a concise fail-fast mode: regular NOTE/table output is hidden,
+warnings are yellow, errors are red, and execution stops after the first SAS
+step that reports a warning or error. A normal `saslite program.sas` command
+continues to use the full uncolored log. The same behavior is available from
+the CLI with `--quiet --fail-fast --color always`.
+
 The runner uses `.venv/bin/python` when the repository virtual environment is
 available, otherwise it falls back to `python3`. It always runs the local
 sources from `src/` and stores persistent datasets in `.work/`.
