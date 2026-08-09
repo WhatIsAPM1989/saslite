@@ -14,7 +14,7 @@ class ProcCompatibilityOptionTests(unittest.TestCase):
 data panel_data;
   x=1;
 run;
-proc sgrender data=panel_data template=butterfly;
+proc sgrender data=panel_data dattrmap=attribute_map template=butterfly;
   dynamic panel="Safety overview";
 run;
 data after;

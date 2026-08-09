@@ -38,11 +38,11 @@ class LagState:
     """Stateful LAG/DIF buffers for DATA step."""
 
     def __init__(self) -> None:
-        self._buffers: dict[int, list] = {}  # key: n, value: [prev1, prev2, ...]
+        self._buffers: dict[object, list] = {}
 
-    def lag(self, value: Any, n: int = 1) -> Any:
+    def lag(self, value: Any, n: int = 1, queue_id: object | None = None) -> Any:
         """LAGn(value) — return value from n observations ago."""
-        buf = self._buffers.setdefault(n, [])
+        buf = self._buffers.setdefault(queue_id if queue_id is not None else n, [])
         # Return oldest value in buffer (observation from n rows ago)
         if len(buf) >= n:
             result = buf.pop(0)
@@ -52,9 +52,9 @@ class LagState:
         buf.append(value)
         return result
 
-    def dif(self, value: Any, n: int = 1) -> Any:
+    def dif(self, value: Any, n: int = 1, queue_id: object | None = None) -> Any:
         """DIFn(value) — return value minus value from n observations ago."""
-        prev = self.lag(value, n)
+        prev = self.lag(value, n, queue_id)
         if is_missing(prev) or is_missing(value):
             return float("nan")
         try:
@@ -100,6 +100,7 @@ class DataStepExecutor:
             input_ds_names: list[str] = []
             merge_nodes = [s for s in step.statements if isinstance(s, MergeNode)]
             set_nodes = [s for s in step.statements if isinstance(s, SetNode)]
+            update_nodes = [s for s in step.statements if isinstance(s, UpdateDataNode)]
             input_nodes = [s for s in step.statements if isinstance(s, InputNode)]
             set_length_warnings: list[str] = []
             in_flag_names: set[str] = set()
@@ -111,6 +112,34 @@ class DataStepExecutor:
                 dl_ds = self._build_datalines_dataset(step, input_nodes[0])
                 input_datasets.append(dl_ds)
                 input_ds_names.append("WORK.DATALINES")
+
+            if update_nodes:
+                update_node = update_nodes[0]
+                for ds_ref in update_node.datasets:
+                    ds_name = self._resolve_ds_name(ds_ref)
+                    try:
+                        ds = self.session.get_dataset(ds_ref.libref, ds_ref.name)
+                        ds = self._apply_dataset_options(ds, ds_ref.options)
+                        input_datasets.append(ds)
+                        input_ds_names.append(ds_name)
+                    except KeyError:
+                        return StepResult(
+                            success=False,
+                            error=f"Dataset {ds_name} does not exist",
+                        )
+
+                by_vars: list[str] = []
+                for stmt in step.statements:
+                    if isinstance(stmt, ByNode):
+                        by_vars = [v.upper() for v in stmt.variables]
+                        break
+                return self._execute_update(
+                    step,
+                    input_datasets,
+                    by_vars,
+                    target_name,
+                    target_libref,
+                )
 
             if merge_nodes:
                 # MERGE mode
@@ -151,22 +180,38 @@ class DataStepExecutor:
                 for set_node in set_nodes:
                     group: list[Dataset] = []
                     for ds_ref in set_node.datasets:
-                        ds_name = self._resolve_ds_name(ds_ref)
-                        try:
-                            ds = self.session.get_dataset(ds_ref.libref, ds_ref.name)
-                            ds = self._apply_dataset_options(ds, ds_ref.options)
-                            in_flag = self._dataset_in_flag(ds_ref)
-                            if in_flag:
-                                ds = self._add_in_flag(ds, in_flag)
-                                in_flag_names.add(in_flag)
-                            input_datasets.append(ds)
-                            input_ds_names.append(ds_name)
-                            group.append(ds)
-                        except KeyError:
+                        expanded_refs = self._expand_dataset_prefix_ref(ds_ref)
+                        if not expanded_refs:
                             return StepResult(
                                 success=False,
-                                error=f"Dataset {ds_name} does not exist",
+                                error=(
+                                    f"No datasets match prefix "
+                                    f"{ds_ref.libref.upper()}.{ds_ref.name[:-1]}:"
+                                ),
                             )
+                        for expanded_ref in expanded_refs:
+                            ds_name = self._resolve_ds_name(expanded_ref)
+                            try:
+                                ds = self.session.get_dataset(
+                                    expanded_ref.libref,
+                                    expanded_ref.name,
+                                )
+                                ds = self._apply_dataset_options(
+                                    ds,
+                                    expanded_ref.options,
+                                )
+                                in_flag = self._dataset_in_flag(expanded_ref)
+                                if in_flag:
+                                    ds = self._add_in_flag(ds, in_flag)
+                                    in_flag_names.add(in_flag)
+                                input_datasets.append(ds)
+                                input_ds_names.append(ds_name)
+                                group.append(ds)
+                            except KeyError:
+                                return StepResult(
+                                    success=False,
+                                    error=f"Dataset {ds_name} does not exist",
+                                )
                     set_groups.append(group)
 
                 set_length_warnings = self._set_length_warnings(set_groups)
@@ -672,10 +717,10 @@ class DataStepExecutor:
             elif isinstance(stmt, CallMissingNode):
                 self._execute_call_missing(stmt, ctx)
 
-            elif isinstance(stmt, UpdateDataNode):
-                self._execute_data_update(stmt, ctx)
-
-            elif isinstance(stmt, (RetainNode, KeepNode, DropNode, RenameNode, MergeNode, ByNode, InputNode, InfileNode)):
+            elif isinstance(stmt, (
+                RetainNode, KeepNode, DropNode, RenameNode, MergeNode,
+                UpdateDataNode, ByNode, InputNode, InfileNode,
+            )):
                 pass  # Handled in build_pdv, merge, or post-processing
 
             elif isinstance(stmt, ArrayNode):
@@ -899,21 +944,6 @@ class DataStepExecutor:
                 else:
                     ctx.pdv.set(arg.name, float("nan"))
 
-    def _execute_data_update(self, stmt: UpdateDataNode, ctx: DataStepContext) -> None:
-        """Execute DATA step UPDATE statement (master dataset update)."""
-        if not stmt.datasets:
-            return
-        ds_ref = stmt.datasets[0]
-        try:
-            ds = ctx.session.get_dataset(ds_ref.libref, ds_ref.name)
-        except KeyError:
-            return
-        # Match current observation to master by index (simplified)
-        row_idx = ctx.pdv._n - 1
-        if row_idx < len(ds.data):
-            row = ds.data.iloc[row_idx].to_dict()
-            ctx.pdv.load_row(row)
-
     def _register_array(self, stmt: ArrayNode, ctx: DataStepContext) -> None:
         """Register an ARRAY statement — link array name to variable list."""
         if stmt.temporary:
@@ -943,6 +973,26 @@ class DataStepExecutor:
 
     def _resolve_ds_name(self, ref: DatasetRefNode) -> str:
         return f"{ref.libref.upper()}.{ref.name.upper()}"
+
+    def _expand_dataset_prefix_ref(
+        self,
+        ref: DatasetRefNode,
+    ) -> list[DatasetRefNode]:
+        if not ref.name.endswith(":"):
+            return [ref]
+        backend = self.session.storage.get_backend(ref.libref)
+        if backend is None:
+            return []
+        prefix = ref.name[:-1].upper()
+        return [
+            DatasetRefNode(
+                name=name,
+                libref=ref.libref,
+                options=list(ref.options),
+            )
+            for name in backend.list_datasets()
+            if str(name).upper().startswith(prefix)
+        ]
 
     @staticmethod
     def _split_output_target(target: str) -> tuple[str, str]:
@@ -1352,6 +1402,125 @@ class DataStepExecutor:
             ],
         )
 
+    def _execute_update(
+        self,
+        step: DataStepNode,
+        datasets: list[Dataset],
+        by_vars: list[str],
+        target_name: str,
+        target_libref: str,
+    ) -> StepResult:
+        """Apply transaction datasets to a master using SAS UPDATE semantics."""
+        if len(datasets) < 2:
+            return StepResult(
+                success=False,
+                error="UPDATE requires a master and at least one transaction dataset",
+            )
+        if not by_vars:
+            return StepResult(success=False, error="UPDATE requires a BY statement")
+
+        canonical: dict[str, str] = {}
+        ordered_columns: list[str] = []
+        frames: list[pd.DataFrame] = []
+        for dataset in datasets:
+            rename: dict[str, str] = {}
+            for column in dataset.data.columns:
+                logical = str(column).upper()
+                output_name = canonical.setdefault(logical, str(column))
+                if output_name not in ordered_columns:
+                    ordered_columns.append(output_name)
+                rename[str(column)] = output_name
+            frames.append(dataset.data.rename(columns=rename).copy())
+
+        key_columns = [canonical.get(name, name) for name in by_vars]
+        missing_keys = [name for name in key_columns if name not in frames[0].columns]
+        if missing_keys:
+            return StepResult(
+                success=False,
+                error=f"BY variable(s) not found in UPDATE master: {', '.join(missing_keys)}",
+            )
+
+        def key_for(row: dict[str, Any]) -> tuple[Any, ...]:
+            return tuple(row.get(column) for column in key_columns)
+
+        rows: list[dict[str, Any]] = []
+        row_indexes: dict[tuple[Any, ...], int] = {}
+        for record in frames[0].to_dict(orient="records"):
+            normalized = {column: record.get(column) for column in ordered_columns}
+            row_indexes[key_for(normalized)] = len(rows)
+            rows.append(normalized)
+
+        for transaction in frames[1:]:
+            for record in transaction.to_dict(orient="records"):
+                key = key_for(record)
+                row_index = row_indexes.get(key)
+                if row_index is None:
+                    row_index = len(rows)
+                    row_indexes[key] = row_index
+                    rows.append({column: None for column in ordered_columns})
+                    for column, value in zip(key_columns, key):
+                        rows[row_index][column] = value
+
+                target = rows[row_index]
+                for column, value in record.items():
+                    # Missing transaction values leave the master value intact.
+                    # Character missing values arrive from INPUT as blanks.
+                    if column in key_columns or is_missing(value) or value == "":
+                        continue
+                    target[column] = value
+
+        updated = pd.DataFrame(rows, columns=ordered_columns)
+        # UPDATE interleaves sorted master and transaction BY groups; a key
+        # present only in a transaction still appears in BY order.
+        updated = updated.sort_values(
+            by=key_columns,
+            kind="mergesort",
+            na_position="first",
+        ).reset_index(drop=True)
+        pdv = self._build_pdv(step, datasets)
+        input_names = [dataset.metadata.qualified_name for dataset in datasets]
+        pdv.set_input_sources(input_names)
+        pdv.set_by_vars(by_vars)
+        self._validate_data_step_references(step.statements, pdv, input_names)
+
+        eval_ctx = DataStepContext(pdv, self._fn_registry, self.session, LagState())
+        has_explicit_output = self._has_explicit_output(step.statements)
+        where_condition = next(
+            (stmt.condition for stmt in step.statements if isinstance(stmt, WhereNode)),
+            None,
+        )
+
+        for index, record in enumerate(updated.to_dict(orient="records")):
+            pdv.increment_n()
+            pdv.reset_for_iteration()
+            pdv.load_row(record)
+            next_row = (
+                updated.iloc[index + 1].to_dict()
+                if index + 1 < len(updated)
+                else None
+            )
+            pdv.update_by_flags(next_row)
+
+            if where_condition and not sas_bool(eval_ctx.evaluator.evaluate(where_condition)):
+                continue
+            self._execute_statements(step.statements, eval_ctx)
+            if pdv.stop_flag:
+                break
+            if not pdv.delete_flag and not has_explicit_output:
+                eval_ctx.output_rows.append(pdv.snapshot_output_row())
+
+        return self._store_declared_outputs(
+            step,
+            eval_ctx,
+            pdv,
+            datasets,
+            set(),
+            [
+                *pdv.character_length_warnings(),
+                *pdv.runtime_warnings(),
+            ],
+        )
+
     @staticmethod
     def _many_to_many_merge_warnings(
         datasets: list[Dataset],
@@ -1566,11 +1735,25 @@ class DataStepExecutor:
             return rows
 
         if delimiter:
+            import csv
+
             for line in raw_data.split("\n"):
                 line = line.rstrip()
                 if not line:
                     continue
-                fields = line.split(delimiter)
+                if dsd and len(delimiter) == 1:
+                    # DSD input follows CSV-style quoting: delimiters inside a
+                    # quoted value are data, doubled quotes are unescaped, and
+                    # adjacent delimiters produce a missing field.
+                    fields = next(csv.reader(
+                        [line],
+                        delimiter=delimiter,
+                        quotechar='"',
+                        doublequote=True,
+                        skipinitialspace=True,
+                    ))
+                else:
+                    fields = line.split(delimiter)
                 rows.append(self._datalines_fields_to_row(
                     fields, variables, input_node, dsd, truncover))
             return rows
@@ -1957,6 +2140,8 @@ class DataStepContext:
     def _register_session_functions(self) -> None:
         """Register DATA-step functions whose result depends on the session."""
         session = self.session
+        dataset_handles: dict[int, Dataset] = {}
+        next_handle = 1
 
         def dataset_exists(dataset_name: Any, member_type: Any = "DATA") -> int:
             requested_type = str(member_type).strip().strip("'\"").upper()
@@ -1976,6 +2161,68 @@ class DataStepContext:
                 return 0
 
         self.evaluator.register_function("EXIST", dataset_exists)
+
+        def open_dataset(dataset_name: Any, mode: Any = "I") -> int:
+            nonlocal next_handle
+            del mode
+            reference = str(dataset_name).strip().strip("'\"")
+            reference = reference.split("(", 1)[0].strip()
+            if not reference:
+                return 0
+            if "." in reference:
+                libref, member = reference.split(".", 1)
+            else:
+                libref, member = "WORK", reference
+            try:
+                dataset = session.get_dataset(libref, member)
+            except (KeyError, OSError, ValueError):
+                return 0
+            handle = next_handle
+            next_handle += 1
+            dataset_handles[handle] = dataset
+            return handle
+
+        def handle_number(value: Any) -> int | None:
+            try:
+                number = int(float(value))
+            except (TypeError, ValueError):
+                return None
+            return number if number > 0 else None
+
+        def varnum(handle: Any, variable_name: Any) -> int:
+            number = handle_number(handle)
+            dataset = dataset_handles.get(number) if number is not None else None
+            if dataset is None:
+                return 0
+            wanted = str(variable_name).strip().strip("'\"").upper()
+            for index, column in enumerate(dataset.columns, start=1):
+                if str(column).upper() == wanted:
+                    return index
+            return 0
+
+        def close_dataset(handle: Any) -> int:
+            number = handle_number(handle)
+            if number is None or number not in dataset_handles:
+                return 1
+            del dataset_handles[number]
+            return 0
+
+        def attrn(handle: Any, attribute: Any) -> float:
+            number = handle_number(handle)
+            dataset = dataset_handles.get(number) if number is not None else None
+            if dataset is None:
+                return float("nan")
+            name = str(attribute).strip().strip("'\"").upper()
+            if name in {"NOBS", "NLOBS"}:
+                return float(dataset.nrow)
+            if name == "NVARS":
+                return float(dataset.ncol)
+            return float("nan")
+
+        self.evaluator.register_function("OPEN", open_dataset)
+        self.evaluator.register_function("VARNUM", varnum)
+        self.evaluator.register_function("CLOSE", close_dataset)
+        self.evaluator.register_function("ATTRN", attrn)
 
         def symget(macro_variable_name: Any) -> str:
             name = str(macro_variable_name).strip()
@@ -2012,18 +2259,18 @@ class DataStepContext:
     def _register_lag_dif(self, lag_state: LagState) -> None:
         """Register LAG/DIF functions with state."""
         def make_lag(n):
-            def lag_fn(val):
-                return lag_state.lag(val, n)
+            def lag_fn(node, val):
+                return lag_state.lag(val, n, id(node))
             return lag_fn
         def make_dif(n):
-            def dif_fn(val):
-                return lag_state.dif(val, n)
+            def dif_fn(node, val):
+                return lag_state.dif(val, n, id(node))
             return dif_fn
         # Register LAG, LAG2..LAG9
-        self.evaluator.register_function("LAG", make_lag(1))
+        self.evaluator.register_stateful_function("LAG", make_lag(1))
         for i in range(2, 10):
-            self.evaluator.register_function(f"LAG{i}", make_lag(i))
+            self.evaluator.register_stateful_function(f"LAG{i}", make_lag(i))
         # Register DIF, DIF2..DIF9
-        self.evaluator.register_function("DIF", make_dif(1))
+        self.evaluator.register_stateful_function("DIF", make_dif(1))
         for i in range(2, 10):
-            self.evaluator.register_function(f"DIF{i}", make_dif(i))
+            self.evaluator.register_stateful_function(f"DIF{i}", make_dif(i))

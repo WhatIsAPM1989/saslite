@@ -24,6 +24,7 @@ class ExpressionEvaluator:
         self._get_var = var_getter or (lambda name: None)
         self._get_variable_metadata = variable_metadata_getter or (lambda name: None)
         self._functions: dict[str, Callable] = {}
+        self._stateful_functions: dict[str, Callable] = {}
         self._session = session
         self._arrays: dict[str, list] = {}
         self._array_vars: dict[str, list[str]] = {}  # array name -> PDV var names
@@ -44,6 +45,15 @@ class ExpressionEvaluator:
 
     def register_function(self, name: str, fn: Callable) -> None:
         self._functions[name.upper()] = fn
+
+    def register_stateful_function(self, name: str, fn: Callable) -> None:
+        """Register a function that also receives its AST call node.
+
+        Stateful SAS functions such as LAG use a separate queue for every
+        syntactic occurrence, so their state cannot be keyed by function name
+        alone.
+        """
+        self._stateful_functions[name.upper()] = fn
 
     def evaluate(self, node: Any) -> Any:
         """Evaluate an expression node, returning its value."""
@@ -269,7 +279,7 @@ class ExpressionEvaluator:
                     return len(self._arrays[array_name])
             raise ExecutionError(f"DIM: array not found")
 
-        fn = self._functions.get(name)
+        fn = self._stateful_functions.get(name) or self._functions.get(name)
         if fn is None:
             raise ExecutionError(f"Unknown function: {name}")
         args = []
@@ -289,7 +299,10 @@ class ExpressionEvaluator:
                 raise ExecutionError(f"OF {arr_name}[*]: array not found")
             args.append(self.evaluate(a))
         try:
-            result = fn(*args)
+            if name in self._stateful_functions:
+                result = fn(node, *args)
+            else:
+                result = fn(*args)
             if self._has_invalid_math_arguments(name, args):
                 self._diagnose_math_failure(f"function {name}", args)
             return result

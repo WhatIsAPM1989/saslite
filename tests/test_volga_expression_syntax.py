@@ -5,6 +5,28 @@ from saslite.runtime.types import is_missing
 
 
 class VolgaExpressionSyntaxTests(unittest.TestCase):
+    def test_in_list_accepts_whitespace_separated_values(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+            data result;
+              input armcdn;
+              selected = armcdn in (1 2 99);
+              excluded = armcdn not in (1 2 99);
+              datalines;
+            1
+            3
+            99
+            ;
+            run;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "RESULT")
+        self.assertEqual(frame["selected"].tolist(), [True, False, True])
+        self.assertEqual(frame["excluded"].tolist(), [False, True, False])
+
     def test_numeric_missing_literal_and_caret_not_operator(self) -> None:
         sas = SasInterpreter()
         result = sas.execute(

@@ -4,6 +4,25 @@ from saslite import SasInterpreter
 
 
 class ProcDatasetsOptionsTests(unittest.TestCase):
+    def test_run_only_is_implicitly_terminated_by_following_data_step(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+            data row1; value=1; run;
+            proc datasets lib=work nolist;
+              delete row1;
+            run;
+            data after; value=2; run;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertFalse(sas.session.dataset_exists("WORK", "ROW1"))
+        self.assertEqual(
+            sas.get_dataset("WORK", "AFTER")["value"].tolist(),
+            [2],
+        )
+
     def test_lib_alias_kill_and_run_quit_are_supported(self) -> None:
         sas = SasInterpreter()
         result = sas.execute(

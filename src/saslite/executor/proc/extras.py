@@ -11,20 +11,56 @@ import pandas as pd
 
 from saslite.ast.proc import ProcNode, VarListNode, ByNode, ClassNode
 from saslite.ast.data_step import DatasetRefNode
+from saslite.executor.expression_eval import ExpressionEvaluator
+from saslite.functions import build_default_registry
 from saslite.runtime.dataset import Dataset
 from saslite.runtime.execution_result import StepResult
+from saslite.runtime.types import sas_bool
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
 
 
 def _resolve_dataset(session: Session, name: Any) -> Dataset:
     """Get a dataset from `lib.name` or bare `name` (WORK default)."""
+    if isinstance(name, DatasetRefNode):
+        dataset = session.get_dataset(name.libref, name.name)
+        return _apply_input_options(dataset, name.options, session)
     name = str(name)
     if "." in name:
         libref, member = name.split(".", 1)
     else:
         libref, member = "WORK", name
     return session.get_dataset(libref, member)
+
+
+def _apply_input_options(
+    dataset: Dataset,
+    options: list[Any],
+    session: Session,
+) -> Dataset:
+    """Apply common DATA= input options used by PROC handlers."""
+    result = dataset.copy()
+    registry = build_default_registry()
+    for option in options:
+        if not isinstance(option, dict):
+            continue
+        if "WHERE" in option:
+            columns = {str(column).upper(): column for column in result.data.columns}
+            mask: list[bool] = []
+            for _, row in result.data.iterrows():
+                evaluator = ExpressionEvaluator(
+                    var_getter=lambda name, current=row: current.get(
+                        columns.get(name.upper(), name)
+                    ),
+                    session=session,
+                )
+                for function_name in registry.names:
+                    function = registry.get(function_name)
+                    if function is not None:
+                        evaluator.register_function(function_name, function)
+                mask.append(sas_bool(evaluator.evaluate(option["WHERE"])))
+            result.data = result.data.loc[mask].reset_index(drop=True)
+    return result
 
 
 def _split_name(name: Any) -> tuple[str, str]:

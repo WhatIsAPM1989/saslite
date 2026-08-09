@@ -26,11 +26,26 @@ statement: data_step
          | proc_logistic
          | proc_corr
          | proc_ttest
+         | proc_lifetest
+         | proc_phreg
+         | proc_genmod
+         | ods_stmt
          | libname_stmt ";"
          | filename_stmt ";"
          | options_stmt ";"
          | macro_let_stmt
+         | "RUN"i ";" -> empty_stmt
          | ";" -> empty_stmt
+
+// ─── ODS routing ─────────────────────────────────
+
+ods_stmt: "ODS"i "OUTPUT"i "CLOSE"i ";" -> ods_output_close
+        | "ODS"i "OUTPUT"i ods_output_item+ ";" -> ods_output
+        | "ODS"i ods_control_name ods_control_value* ";" -> ods_control
+
+ods_output_item: NAME "=" dataset_ref
+ods_control_name: "EXCLUDE"i | "SELECT"i | "GRAPHICS"i | "LISTING"i
+ods_control_value: NAME | NUMBER | "="
 
 // ─── Macro ────────────────────────────────────────
 
@@ -95,6 +110,7 @@ data_stmt: set_stmt ";"
          | attrib_stmt ";"
          | put_stmt ";"
          | call_stmt ";"
+         | ";" -> empty_stmt
 
 output_stmt: "OUTPUT"i (qualified_name)?
 delete_stmt: "DELETE"i
@@ -103,7 +119,7 @@ stop_stmt: "STOP"i
 set_stmt: "SET"i (dataset_ref)+ ("END"i "=" NAME)?
 merge_stmt: "MERGE"i (dataset_ref)+
 by_stmt: "BY"i ("DESCENDING"i)? NAME (("DESCENDING"i)? NAME)*
-array_stmt: "ARRAY"i NAME "[" NUMBER "]" ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
+array_stmt: "ARRAY"i NAME "[" (NUMBER | "*") "]" ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
 infile_stmt: "INFILE"i (NAME | STRING) (infile_option)*
 infile_option: NAME ("=" (STRING | NAME | NUMBER))?
 input_stmt: "INPUT"i (input_var)* ("$")?
@@ -112,8 +128,9 @@ input_var: NAME input_format NUMBER "-" NUMBER -> input_var_colrange_fmt
          | NAME "$"? NUMBER -> input_var_colsingle
          | NAME "$" NUMBER "." -> input_var_charfmt
          | "$"? NAME (":" input_format)?
-input_format: "$"? (NAME | NUMBER) ("." (NAME | NUMBER)?)?
+input_format: "$"? (NAME | NUMBER) ("." NUMBER?)?
 dataset_ref: qualified_name ("(" (dataset_option)* ")")?
+           | qualified_name ":" -> dataset_prefix_ref
 dataset_option: "KEEP"i "=" name_list
               | "DROP"i "=" name_list
               | "WHERE"i "=" "(" expr ")"
@@ -211,9 +228,9 @@ select_item: expr ("AS"i NAME)? (col_attr)* -> select_aliased
            | NAME "." "*" -> select_qualified_star
            | "*" -> select_star
 
-col_attr: "LENGTH"i "=" NUMBER
-        | "FORMAT"i "=" format_spec
-        | "LABEL"i "=" STRING
+col_attr: "LENGTH"i "="? NUMBER
+        | "FORMAT"i "="? format_spec
+        | "LABEL"i "="? STRING
 
 from_clause: "FROM"i table_expr
 table_expr: table_factor (("," table_factor) | join_clause)*
@@ -259,6 +276,7 @@ print_stmt: "VAR"i name_list ";"
 proc_sgrender: "PROC"i "SGRENDER"i (sgrender_opt)* ";" (sgrender_stmt)* ("RUN"i ";")?
 
 sgrender_opt: "DATA"i "=" qualified_name
+            | "DATTRMAP"i "=" qualified_name
             | "TEMPLATE"i "=" qualified_name
 
 sgrender_stmt: "DYNAMIC"i NAME "=" STRING ";"
@@ -273,7 +291,9 @@ sort_opt: "DATA"i "=" dataset_ref
         | "NODUPRECS"i
         | "FORCE"i
 
-sort_body: (where_stmt ";")* "BY"i ("DESCENDING"i)? NAME (("DESCENDING"i)? NAME)* ";" (where_stmt ";")*
+sort_body: (where_stmt ";")* "BY"i ("DESCENDING"i)? sort_name (("DESCENDING"i)? sort_name)* ";" (where_stmt ";")*
+?sort_name: NAME
+          | NAME ":" -> name_prefix
 
 // ─── PROC CONTENTS ────────────────────────────────
 
@@ -299,7 +319,7 @@ stat_name: "N"i | "MEAN"i | "SUM"i | "MIN"i | "MAX"i | "STD"i | "MEDIAN"i | "Q1"
 means_stmt: "VAR"i name_list ";"
           | "CLASS"i name_list ";"
           | "BY"i name_list ";"
-          | "OUTPUT"i ("OUT"i "=" qualified_name)? (means_output_kv)* ";"
+          | "OUTPUT"i ("OUT"i "=" dataset_ref)? (means_output_kv)* ";"
 
 means_output_kv: NAME "=" NAME
 
@@ -307,7 +327,8 @@ means_output_kv: NAME "=" NAME
 
 proc_freq: "PROC"i "FREQ"i (freq_opt)* ";" freq_body ("RUN"i ";")?
 
-freq_opt: "DATA"i "=" qualified_name -> freq_opt_data
+freq_opt: "DATA"i "=" dataset_ref -> freq_opt_data
+        | "OUT"i "=" qualified_name -> freq_opt_out
         | "NOPRINT"i -> freq_opt_flag
         | "NOROW"i -> freq_opt_flag
         | "NOCOL"i -> freq_opt_flag
@@ -324,6 +345,65 @@ freq_table_spec: qualified_name ("." qualified_name)? ("/" freq_opt+)? (( "*" qu
 
 freq_by: "BY"i name_list ";"?
 
+// ─── PROC LIFETEST ───────────────────────────────
+
+proc_lifetest: "PROC"i "LIFETEST"i (lifetest_opt)* ";" (lifetest_stmt)* ("RUN"i ";")?
+
+lifetest_opt: "DATA"i "=" dataset_ref -> lifetest_data_opt
+            | "OUTSURV"i "=" dataset_ref -> lifetest_outsurv_opt
+            | "METHOD"i "=" NAME -> lifetest_named_opt
+            | "CONFTYPE"i "=" NAME -> lifetest_named_opt
+            | "PLOTS"i "=" lifetest_plot_opt -> lifetest_plots_opt
+            | "TIMELIST"i "=" NUMBER+ -> lifetest_timelist_opt
+            | NAME -> lifetest_flag_opt
+
+lifetest_plot_opt: NAME ("(" lifetest_plot_piece* ")")?
+lifetest_plot_piece: NAME | NUMBER | "="
+
+lifetest_stmt: "TIME"i NAME "*" NAME "(" in_expr_list? ")" ";" -> lifetest_time_stmt
+             | "STRATA"i name_list ("/" lifetest_strata_opt*)? ";" -> lifetest_strata_stmt
+             | "WHERE"i expr ";" -> lifetest_where_stmt
+             | "TEST"i name_list ";" -> lifetest_test_stmt
+
+lifetest_strata_opt: NAME ("=" (NAME | "(" name_list ")"))?
+
+// ─── PROC PHREG ──────────────────────────────────
+
+proc_phreg: "PROC"i "PHREG"i (phreg_opt)* ";" (phreg_stmt)* ("RUN"i ";")?
+
+phreg_opt: "DATA"i "=" dataset_ref -> phreg_data_opt
+         | NAME ("=" (NAME | NUMBER | STRING))? -> phreg_generic_opt
+
+phreg_stmt: "WHERE"i expr ";" -> phreg_where_stmt
+          | "CLASS"i phreg_class_item+ ";" -> phreg_class_stmt
+          | "MODEL"i NAME "*" NAME "(" in_expr_list? ")" "=" name_list ("/" phreg_model_opt*)? ";" -> phreg_model_stmt
+          | "HAZARDRATIO"i STRING? NAME ("/" phreg_hr_opt*)? ";" -> phreg_hazardratio_stmt
+          | "STRATA"i name_list ";" -> phreg_strata_stmt
+          | "BY"i name_list ";" -> phreg_by_stmt
+
+phreg_class_item: NAME ("(" phreg_class_opt* ")")?
+phreg_class_opt: NAME "=" (STRING | NAME)
+phreg_model_opt: NAME ("=" (STRING | NAME | NUMBER))?
+phreg_hr_opt: NAME ("=" (STRING | NAME | NUMBER))?
+
+// ─── PROC GENMOD ─────────────────────────────────
+
+proc_genmod: "PROC"i "GENMOD"i (genmod_opt)* ";" (genmod_stmt)* ("RUN"i ";")?
+
+genmod_opt: "DATA"i "=" dataset_ref -> genmod_data_opt
+          | NAME ("=" (NAME | NUMBER | STRING))? -> genmod_generic_opt
+
+genmod_stmt: "WHERE"i expr ";" -> genmod_where_stmt
+           | "CLASS"i phreg_class_item+ ";" -> genmod_class_stmt
+           | "MODEL"i NAME ("(" "EVENT"i "=" STRING ")")? "=" name_list ("/" genmod_model_opt*)? ";" -> genmod_model_stmt
+           | "ESTIMATE"i STRING NAME signed_number+ ("/" genmod_estimate_opt*)? ";" -> genmod_estimate_stmt
+           | "BY"i name_list ";" -> genmod_by_stmt
+           | ods_stmt -> genmod_ods_stmt
+
+genmod_model_opt: NAME ("=" (STRING | NAME | NUMBER))?
+genmod_estimate_opt: NAME ("=" (STRING | NAME | NUMBER))?
+signed_number: ("+" | "-")? NUMBER
+
 // ─── PROC APPEND ──────────────────────────────────
 
 proc_append: "PROC"i "APPEND"i (append_opt)* ";" ("RUN"i ";")?
@@ -333,7 +413,7 @@ append_opt: "DATA"i "=" qualified_name
 
 // ─── PROC DATASETS ─────────────────────────────────
 
-proc_datasets: "PROC"i "DATASETS"i (ds_opt)* ";" (ds_stmt)* ("RUN"i ";")? "QUIT"i ";"
+proc_datasets: "PROC"i "DATASETS"i (ds_opt)* ";" (ds_stmt)* ("RUN"i ";")? ("QUIT"i ";")?
 
 ds_opt: ("LIBRARY"i | "LIB"i) "=" qualified_name
       | "NOLIST"i                         -> ds_nolist_opt
@@ -386,7 +466,7 @@ export_stmt: "DATA"i "=" dataset_ref ";"
 
 proc_transpose: "PROC"i "TRANSPOSE"i (transpose_opt)* ";" (transpose_stmt)* ("RUN"i ";")?
 
-transpose_opt: "DATA"i "=" qualified_name
+transpose_opt: "DATA"i "=" dataset_ref
              | "OUT"i "=" dataset_ref
              | "PREFIX"i "=" NAME
              | "NAME"i "=" NAME
@@ -438,7 +518,8 @@ format_proc_opt: ("LIBRARY"i | "LIB"i) "=" qualified_name
 
 value_stmt: "VALUE"i "$"? NAME (value_range)+ ";"
 
-value_range: value_key ("," value_key)* "=" STRING
+value_range: value_key ("," value_key)* "=" value_label
+value_label: STRING | NUMBER
 value_key: NUMBER "-" NUMBER -> value_key_range
          | "LOW"i "-" NUMBER -> value_key_low
          | NUMBER "-" "HIGH"i -> value_key_high
@@ -566,15 +647,17 @@ ttest_stmt: "VAR"i name_list ";" -> ttest_var
              | compare_expr ">" concat_expr -> binop
              | compare_expr GT_OP concat_expr -> binop
              | compare_expr ">=" concat_expr -> binop
+             | compare_expr ">" "=" concat_expr -> ge_spaced
              | compare_expr GE_OP concat_expr -> binop
              | compare_expr "<" concat_expr -> binop
              | compare_expr LT_OP concat_expr -> binop
              | compare_expr "<=" concat_expr -> binop
+             | compare_expr "<" "=" concat_expr -> le_spaced
              | compare_expr LE_OP concat_expr -> binop
              | compare_expr "IN"i "(" select_stmt ")" -> in_subquery
              | compare_expr "NOT"i "IN"i "(" select_stmt ")" -> not_in_subquery
-             | compare_expr "IN"i "(" expr_list ")" -> in_list
-             | compare_expr "NOT"i "IN"i "(" expr_list ")" -> not_in_list
+             | compare_expr "IN"i "(" in_expr_list ")" -> in_list
+             | compare_expr "NOT"i "IN"i "(" in_expr_list ")" -> not_in_list
              | compare_expr "NOT"i "LIKE"i concat_expr -> not_like_op
              | compare_expr "LIKE"i concat_expr -> like_op
              | compare_expr "NOT"i "CONTAINS"i concat_expr -> not_contains_op
@@ -608,6 +691,7 @@ ttest_stmt: "VAR"i name_list ";" -> ttest_var
 ?primary: MISSING_NUMERIC -> missing_numeric
         | NUMBER -> number
         | DATE_LITERAL -> date_literal
+        | HEX_LITERAL -> hex_literal
         | STRING -> string
         | "NULL"i -> null_val
         | "CALCULATED"i NAME -> calculated_ref
@@ -631,6 +715,8 @@ case_expr: "CASE"i expr? (case_when)+ ("ELSE"i expr)? "END"i
 case_when: "WHEN"i expr "THEN"i expr
 
 expr_list: expr ("," expr)*
+// SAS permits either commas or whitespace between values in an IN list.
+in_expr_list: expr ((",")? expr)*
 func_args: func_arg ("," func_arg)*
 func_arg: "*" -> star_arg
         | "DISTINCT"i expr -> distinct_arg
@@ -666,6 +752,7 @@ LE_OP: /LE(?![A-Za-z0-9_])/i
 NUMBER: /[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?|\.[0-9]+([eE][+-]?[0-9]+)?/
 MISSING_NUMERIC: "."
 DATE_LITERAL.2: /("[^"]*"|'[^']*')(dt|d|t)\b/i
+HEX_LITERAL.2: /("[0-9A-Fa-f]*"|'[0-9A-Fa-f]*')x\b/i
 STRING: /"[^"]*"|'[^']*'/
 REPORT_STYLE_OPTION.2: /STYLE\s*\(\s*(REPORT|HEADER|COLUMN)\s*\)\s*=\s*(\{[^}]*\}|\[[^\]]*\])/i
 

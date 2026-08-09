@@ -6,6 +6,30 @@ from saslite.diagnostics.reporter import Reporter
 
 
 class NestedMacroDefinitionTests(unittest.TestCase):
+    def test_single_statement_else_executes_only_selected_let(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+%macro choose(use_default=);
+  %local selected maxresp;
+  %let maxresp=;
+  %if &use_default. = Y %then %let selected=7;
+  %else %let selected=9;
+  %if %superq(maxresp)= or &maxresp. = 0 %then %let maxresp=1;
+  data result;
+    value = &selected.;
+    maximum = &maxresp.;
+  run;
+%mend choose;
+%choose(use_default=Y);
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "RESULT")
+        self.assertEqual(frame["value"].tolist(), [7])
+        self.assertEqual(frame["maximum"].tolist(), [1])
+
     def _interpreter(self) -> tuple[SasInterpreter, io.StringIO]:
         sas = SasInterpreter()
         log = io.StringIO()

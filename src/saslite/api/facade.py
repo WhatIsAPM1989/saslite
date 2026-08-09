@@ -24,6 +24,12 @@ from saslite.executor.proc.extras import (
     handle_proc_report,
 )
 from saslite.executor.proc.stats import handle_proc_reg, handle_proc_logistic, handle_proc_corr, handle_proc_ttest
+from saslite.executor.proc.survival import (
+    handle_ods,
+    handle_proc_lifetest,
+    handle_proc_phreg,
+)
+from saslite.executor.proc.generalized import handle_proc_genmod
 from saslite.runtime.execution_result import RunSummary
 from saslite.diagnostics.reporter import Reporter
 from saslite.profiles import CompatibilityProfile, create_profile, load_profile_file
@@ -307,6 +313,10 @@ class SasInterpreter:
             dispatcher.register_proc("LOGISTIC", lambda p: handle_proc_logistic(p, session, reporter))
             dispatcher.register_proc("CORR", lambda p: handle_proc_corr(p, session, reporter))
             dispatcher.register_proc("TTEST", lambda p: handle_proc_ttest(p, session, reporter))
+            dispatcher.register_proc("ODS", lambda p: handle_ods(p, session, reporter))
+            dispatcher.register_proc("LIFETEST", lambda p: handle_proc_lifetest(p, session, reporter))
+            dispatcher.register_proc("PHREG", lambda p: handle_proc_phreg(p, session, reporter))
+            dispatcher.register_proc("GENMOD", lambda p: handle_proc_genmod(p, session, reporter))
 
             return dispatcher.run(program)
 
@@ -326,7 +336,7 @@ class SasInterpreter:
         chunks: list[str] = []
         lines = source.split("\n")
         current: list[str] = []
-        in_datalines = False
+        datalines_terminator: str | None = None
         macro_depth = 0
         macro_control_depth = 0
         in_block_comment = False
@@ -356,9 +366,9 @@ class SasInterpreter:
         for line in lines:
             current.append(line)
 
-            if in_datalines:
-                if line.strip() == ";":
-                    in_datalines = False
+            if datalines_terminator is not None:
+                if line.strip() == datalines_terminator:
+                    datalines_terminator = None
                 continue
 
             active_line = structural_text(line)
@@ -366,8 +376,14 @@ class SasInterpreter:
             if not stripped:
                 continue
 
-            if _re.match(r"^(DATALINES|CARDS|LINES4)\s*;\s*$", stripped):
-                in_datalines = True
+            datalines_match = _re.match(
+                r"^(DATALINES4|CARDS4|LINES4|DATALINES|CARDS)\s*;\s*$",
+                stripped,
+            )
+            if datalines_match:
+                datalines_terminator = (
+                    ";;;;" if datalines_match.group(1).endswith("4") else ";"
+                )
                 continue
 
             macro_depth += len(_re.findall(r"%\s*MACRO\b", active_line, flags=_re.IGNORECASE))
@@ -517,12 +533,16 @@ class SasInterpreter:
         ranges: list[tuple[int, int]] = []
         pos = 0
         raw_start: int | None = None
+        terminator = ";"
         for line in source.splitlines(keepends=True):
             stripped = line.strip().upper()
             if raw_start is None:
-                if stripped in ("DATALINES;", "CARDS;", "LINES4;"):
+                if stripped in (
+                    "DATALINES;", "CARDS;", "DATALINES4;", "CARDS4;", "LINES4;",
+                ):
                     raw_start = pos + len(line)
-            elif line.strip() == ";":
+                    terminator = ";;;;" if stripped.rstrip(";").endswith("4") else ";"
+            elif line.strip() == terminator:
                 ranges.append((raw_start, pos + len(line)))
                 raw_start = None
             pos += len(line)
@@ -645,24 +665,20 @@ class SasInterpreter:
         Returns (modified_source, list_of_raw_data_strings).
         """
         datalines_list: list[str] = []
-        _EMPTY_PLACEHOLDER = "\x01"  # placeholder for "" and '' empty strings
-
-        def _replace_empty_strings(data: str) -> str:
-            """Replace \"\" and '' with placeholder so they survive escaping."""
-            return data.replace('""', _EMPTY_PLACEHOLDER).replace("''", _EMPTY_PLACEHOLDER)
 
         # Pass 1: Handle inline DATALINES (same line as keyword)
         # Pattern: DATALINES; non_semicolon_data ;
         def _replace_inline(m: re.Match) -> str:
             data = m.group(1)
-            data = _replace_empty_strings(data)
             idx = len(datalines_list)
             datalines_list.append(data)
-            escaped = data.replace("\\", "\\\\").replace('"', '\\"')
-            return f'__DATALINES_{idx}__ = "{escaped}";'
+            # Keep raw input outside the generated SAS source. Embedding it in
+            # a quoted assignment breaks as soon as a data record itself
+            # contains quotes (for example a normal DSD/CSV record).
+            return f"__DATALINES_{idx}__ = {idx};"
 
         source = re.sub(
-            r"(?i)(?:DATALINES|CARDS|LINES4)\s*;\s*([^;]+?)\s*;",
+            r"(?i)(?:DATALINES|CARDS)\s*;\s*([^;]+?)\s*;",
             _replace_inline,
             source,
         )
@@ -673,20 +689,21 @@ class SasInterpreter:
         i = 0
         while i < len(lines):
             stripped = lines[i].strip().upper()
-            if stripped in ("DATALINES;", "CARDS;", "LINES4;"):
+            if stripped in (
+                "DATALINES;", "CARDS;", "DATALINES4;", "CARDS4;", "LINES4;",
+            ):
                 data_lines: list[str] = []
+                terminator = ";;;;" if stripped.rstrip(";").endswith("4") else ";"
                 i += 1
                 while i < len(lines):
-                    if lines[i].strip() == ";":
+                    if lines[i].strip() == terminator:
                         break
                     data_lines.append(lines[i])
                     i += 1
                 idx = len(datalines_list)
                 datalines_data = "\n".join(data_lines)
-                datalines_data = _replace_empty_strings(datalines_data)
                 datalines_list.append(datalines_data)
-                escaped = datalines_data.replace("\\", "\\\\").replace('"', '\\"')
-                result_lines.append(f'  __DATALINES_{idx}__ = "{escaped}";')
+                result_lines.append(f"  __DATALINES_{idx}__ = {idx};")
                 i += 1
             else:
                 result_lines.append(lines[i])
@@ -700,7 +717,6 @@ class SasInterpreter:
         from saslite.ast.data_step import DataStepNode, InputNode, AssignNode
         from saslite.ast.expressions import LiteralNode
 
-        datalines_idx = 0
         for step in program.steps:
             if not isinstance(step, DataStepNode):
                 continue
@@ -713,14 +729,15 @@ class SasInterpreter:
                     input_node = stmt
                 elif (isinstance(stmt, AssignNode)
                       and stmt.target.startswith("__DATALINES_")
-                      and isinstance(stmt.expr, LiteralNode)
-                      and stmt.expr.literal_type == "string"):
+                      and isinstance(stmt.expr, LiteralNode)):
                     placeholder_idx = j
 
             if input_node is not None and placeholder_idx is not None:
-                # Extract data from the placeholder assignment
                 placeholder = step.statements[placeholder_idx]
-                raw_data = placeholder.expr.value
-                input_node.datalines_data = raw_data
+                match = re.fullmatch(r"__DATALINES_(\d+)__", placeholder.target)
+                if match:
+                    raw_index = int(match.group(1))
+                    if raw_index < len(datalines_list):
+                        input_node.datalines_data = datalines_list[raw_index]
                 # Remove the placeholder statement
                 step.statements.pop(placeholder_idx)
