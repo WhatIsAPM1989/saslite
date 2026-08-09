@@ -7,7 +7,7 @@ from typing import Any
 
 from lark import Transformer, Token, Tree
 
-from saslite.ast.base import Span
+from saslite.ast.base import Node, Span
 from saslite.ast.expressions import (
     LiteralNode, VariableNode, BinaryOpNode, UnaryOpNode, FunctionCallNode,
     CaseNode, BetweenNode, LikeNode, ExistsNode, ArrayRefNode,
@@ -105,6 +105,31 @@ class SasTransformer(Transformer):
 
     def __init__(self) -> None:
         super().__init__()
+        self._source_name = ""
+        self._line_map: dict[int, int] = {}
+
+    def set_source_context(
+        self,
+        *,
+        source_name: str,
+        line_map: dict[int, int],
+    ) -> None:
+        self._source_name = source_name
+        self._line_map = line_map
+
+    def _call_userfunc(self, tree: Tree, new_children: list[Any] | None = None) -> Any:
+        result = super()._call_userfunc(tree, new_children)
+        if isinstance(result, Node) and result.span.start_line == 0:
+            span = _span_from_tree(tree)
+            if self._line_map:
+                mapped_line = self._line_map.get(span.start_line, 0)
+                mapped_end_line = self._line_map.get(span.end_line, mapped_line)
+                span.start_line = mapped_line
+                span.end_line = mapped_end_line
+            if span.start_line > 0:
+                span.source = self._source_name
+            result.span = span
+        return result
 
     # ── Top level ──────────────────────────────────
 

@@ -14,8 +14,8 @@ class ReporterModeTests(unittest.TestCase):
         reporter.error("failed")
 
         output = log.getvalue()
-        self.assertIn("\033[1;33mWARNING: check this\033[0m", output)
-        self.assertIn("\033[1;31mERROR: failed\033[0m", output)
+        self.assertIn("\033[1;33mWARNING:\033[0m check this", output)
+        self.assertIn("\033[1;31mERROR:\033[0m failed", output)
 
     def test_quiet_mode_hides_notes_and_regular_output(self) -> None:
         log = io.StringIO()
@@ -47,7 +47,7 @@ class ReporterModeTests(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
-        self.assertIn("Stopped after warning", result.error)
+        self.assertIsNone(result.error)
         self.assertTrue(sas.session.dataset_exists("WORK", "FIRST"))
         self.assertFalse(sas.session.dataset_exists("WORK", "SHOULD_NOT_RUN"))
         self.assertEqual(log.getvalue().count("WARNING:"), 1)
@@ -70,6 +70,50 @@ class ReporterModeTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertFalse(sas.session.dataset_exists("WORK", "SHOULD_NOT_RUN"))
         self.assertEqual(log.getvalue().count("ERROR:"), 1)
+
+    def test_runtime_warning_contains_clickable_source_location(self) -> None:
+        source = """
+data result;
+  value=missing_source-1;
+run;
+"""
+        sas = SasInterpreter()
+        result = sas.execute(source, source_name="/tmp/program.sas")
+
+        warning = next(
+            warning for warning in result.steps[-1].warnings
+            if "operator -" in warning
+        )
+        self.assertTrue(warning.startswith("/tmp/program.sas:3:"), warning)
+
+    def test_execution_error_contains_clickable_source_location(self) -> None:
+        log = io.StringIO()
+        sas = SasInterpreter()
+        sas.reporter._stream = log
+
+        result = sas.execute(
+            "\ndata result;\n  set work.absent;\nrun;\n",
+            source_name="/tmp/program.sas",
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn(
+            "ERROR: /tmp/program.sas:2:1: Dataset WORK.ABSENT does not exist",
+            log.getvalue(),
+        )
+
+    def test_parse_error_contains_clickable_source_location(self) -> None:
+        log = io.StringIO()
+        sas = SasInterpreter()
+        sas.reporter._stream = log
+
+        result = sas.execute(
+            "\ndata result;\n  value = ;\nrun;\n",
+            source_name="/tmp/program.sas",
+        )
+
+        self.assertFalse(result.success)
+        self.assertIn("ERROR: /tmp/program.sas:3:", log.getvalue())
 
 
 if __name__ == "__main__":

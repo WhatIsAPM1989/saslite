@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any, Callable
 
+from saslite.ast.base import Node
 from saslite.ast.expressions import (
     BinaryOpNode, FunctionCallNode, LiteralNode, UnaryOpNode, VariableNode,
     CaseNode, BetweenNode, LikeNode, ExistsNode, ArrayRefNode,
@@ -20,7 +21,7 @@ class ExpressionEvaluator:
     def __init__(self, var_getter: Callable[[str], Any] | None = None,
                  session: Any = None,
                  variable_metadata_getter: Callable[[str], Any] | None = None,
-                 diagnostic_callback: Callable[[str, str], None] | None = None) -> None:
+                 diagnostic_callback: Callable[[str, str, Any], None] | None = None) -> None:
         self._get_var = var_getter or (lambda name: None)
         self._get_variable_metadata = variable_metadata_getter or (lambda name: None)
         self._functions: dict[str, Callable] = {}
@@ -30,6 +31,7 @@ class ExpressionEvaluator:
         self._array_vars: dict[str, list[str]] = {}  # array name -> PDV var names
         self._calculated_getter: Callable[[str], Any] | None = None
         self._diagnostic_callback = diagnostic_callback
+        self._diagnostic_node: Node | None = None
 
     def register_array_vars(self, name: str, var_names: list[str]) -> None:
         """Register a DATA step array as a list of PDV variable names."""
@@ -57,6 +59,15 @@ class ExpressionEvaluator:
 
     def evaluate(self, node: Any) -> Any:
         """Evaluate an expression node, returning its value."""
+        previous_node = self._diagnostic_node
+        if isinstance(node, Node):
+            self._diagnostic_node = node
+        try:
+            return self._evaluate_node(node)
+        finally:
+            self._diagnostic_node = previous_node
+
+    def _evaluate_node(self, node: Any) -> Any:
         if node is None:
             return None
 
@@ -454,7 +465,13 @@ class ExpressionEvaluator:
 
     def _diagnose(self, key: str, message: str) -> None:
         if self._diagnostic_callback is not None:
-            self._diagnostic_callback(key, message)
+            node = self._diagnostic_node
+            if node is not None and node.span.start_line > 0:
+                key = (
+                    f"{key}@{node.span.source}:"
+                    f"{node.span.start_line}:{node.span.start_col}"
+                )
+            self._diagnostic_callback(key, message, node)
 
     def register_array(self, name: str, values: list) -> None:
         """Register an array for subscript access."""

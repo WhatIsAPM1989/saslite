@@ -269,6 +269,12 @@ class PDV:
         """Return aggregated DATA-step diagnostics in first-occurrence order."""
         warnings: list[str] = []
         for event in self._runtime_diagnostics.values():
+            source_location = ""
+            if event.get("source") and event.get("line"):
+                source_location = (
+                    f"{event['source']}:{event['line']}:"
+                    f"{event.get('column') or 1}: "
+                )
             location = (
                 f"_N_={event['first_n']}"
                 if event["first_n"] > 0
@@ -280,7 +286,8 @@ class PDV:
                 else ""
             )
             warnings.append(
-                f"{event['message']} First occurrence at {location}.{repeated}"
+                f"{source_location}{event['message']} "
+                f"First occurrence at {location}.{repeated}"
             )
         return warnings
 
@@ -288,14 +295,23 @@ class PDV:
         """Whether a diagnostic key was observed during iteration."""
         return key in self._runtime_diagnostics
 
-    def record_runtime_diagnostic(self, key: str, message: str) -> None:
+    def record_runtime_diagnostic(
+        self,
+        key: str,
+        message: str,
+        node: Any = None,
+    ) -> None:
         """Aggregate a warning-worthy SAS DATA-step log condition."""
         event = self._runtime_diagnostics.get(key)
         if event is None:
+            span = getattr(node, "span", None)
             self._runtime_diagnostics[key] = {
                 "message": message,
                 "first_n": self._n,
                 "count": 1,
+                "source": getattr(span, "source", ""),
+                "line": getattr(span, "start_line", 0),
+                "column": getattr(span, "start_col", 0),
             }
         else:
             event["count"] += 1

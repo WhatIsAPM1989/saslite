@@ -102,6 +102,7 @@ class SasInterpreter:
         include_errors: str = "strict",
     ) -> RunSummary:
         """Execute SAS source code."""
+        original_source = source
         try:
             if self._profile is not None:
                 source = self._profile.prepare_source(
@@ -117,8 +118,9 @@ class SasInterpreter:
                 errors=include_errors,
             )
         except Exception as e:
-            summary = RunSummary(success=False, error=str(e))
-            self._reporter.error(str(e))
+            message = self._format_exception(e)
+            summary = RunSummary(success=False, error=message)
+            self._reporter.error(message)
             return summary
 
         # PROC SQL INTO creates macro variables while the program is running.
@@ -126,9 +128,17 @@ class SasInterpreter:
         # step has executed, so consumers see the newly assigned values.
         if self._has_later_runtime_macro_reference(source):
             chunks = self._split_into_step_chunks(source)
-            return self._execute_chunks(chunks)
+            return self._execute_chunks(
+                chunks,
+                source_name=source_name,
+                original_source=original_source,
+            )
 
-        summary = self._execute_expanded(source)
+        summary = self._execute_expanded(
+            source,
+            source_name=source_name,
+            original_source=original_source,
+        )
 
         # Retry in chunked mode when a macro variable could not be resolved:
         # CALL SYMPUT / SELECT INTO create macro vars mid-run, so later steps
@@ -137,11 +147,30 @@ class SasInterpreter:
                 and "No terminal matches '&'" in str(summary.error)):
             chunks = self._split_into_step_chunks(source)
             if len(chunks) > 1:
-                return self._execute_chunks(chunks)
+                return self._execute_chunks(
+                    chunks,
+                    source_name=source_name,
+                    original_source=original_source,
+                )
 
         return summary
 
-    def _execute_chunks(self, chunks: list[str]) -> RunSummary:
+    @staticmethod
+    def _format_exception(exception: Exception) -> str:
+        """Prefix parser failures with a terminal-clickable source location."""
+        message = str(exception)
+        location = getattr(exception, "saslite_source_location", "")
+        if location and not message.startswith(f"{location}:"):
+            return f"{location}: {message}"
+        return message
+
+    def _execute_chunks(
+        self,
+        chunks: list[str],
+        *,
+        source_name: str = "",
+        original_source: str | None = None,
+    ) -> RunSummary:
         """Execute source chunks sequentially, syncing runtime macro values."""
         combined = RunSummary(success=True)
         for chunk in chunks:
@@ -160,9 +189,17 @@ class SasInterpreter:
                 for line in self._macro.put_output:
                     self._reporter.log(line)
                 self._macro.put_output.clear()
-                part = self._execute_staged_macro_source(expanded_chunk)
+                part = self._execute_staged_macro_source(
+                    expanded_chunk,
+                    source_name=source_name,
+                    original_source=original_source,
+                )
             else:
-                part = self._execute_expanded(chunk)
+                part = self._execute_expanded(
+                    chunk,
+                    source_name=source_name,
+                    original_source=original_source,
+                )
             for step in part.steps:
                 combined.add_step(step)
             if not part.success:
@@ -171,7 +208,13 @@ class SasInterpreter:
                 break
         return combined
 
-    def _execute_staged_macro_source(self, source: str) -> RunSummary:
+    def _execute_staged_macro_source(
+        self,
+        source: str,
+        *,
+        source_name: str = "",
+        original_source: str | None = None,
+    ) -> RunSummary:
         """Execute an expanded macro body while preserving runtime flow.
 
         A macro can create a value in one SAS step and consume it in a later
@@ -202,7 +245,12 @@ class SasInterpreter:
                 queue[0:0] = nested
                 continue
 
-            part = self._execute_expanded(expanded, macro_fragment=True)
+            part = self._execute_expanded(
+                expanded,
+                macro_fragment=True,
+                source_name=source_name,
+                original_source=original_source,
+            )
             for step in part.steps:
                 combined.add_step(step)
             if not part.success:
@@ -260,6 +308,8 @@ class SasInterpreter:
         source: str,
         *,
         macro_fragment: bool = False,
+        source_name: str = "",
+        original_source: str | None = None,
     ) -> RunSummary:
         """Run the preprocess → macro-expand → parse → dispatch pipeline."""
         try:
@@ -282,7 +332,11 @@ class SasInterpreter:
                 return RunSummary(success=True)
 
             # Step 2: Parse
-            program = self._parser.parse(expanded)
+            program = self._parser.parse(
+                expanded,
+                source_name=source_name,
+                original_source=original_source,
+            )
 
             # Step 2.5: Inject DATALINES data into InputNodes
             self._inject_datalines(program, datalines_list)
@@ -326,8 +380,9 @@ class SasInterpreter:
             return dispatcher.run(program)
 
         except Exception as e:
-            summary = RunSummary(success=False, error=str(e))
-            self._reporter.error(str(e))
+            message = self._format_exception(e)
+            summary = RunSummary(success=False, error=message)
+            self._reporter.error(message)
             return summary
 
     @staticmethod

@@ -76,6 +76,10 @@ step that reports a warning or error. A normal `saslite program.sas` command
 continues to use the full uncolored log. The same behavior is available from
 the CLI with `--quiet --fail-fast --color always`.
 
+Diagnostics include `path:line:column` locations. In Devin and VS Code's
+integrated terminal, click that location to open the SAS file and place the
+cursor at the reported expression or step.
+
 The optional local `vscode/saslite-runner-menu` extension adds **SASLite: Run
 with Full Log** to the Run dropdown. That action keeps colored diagnostics but
 shows the complete log and does not stop on warnings.

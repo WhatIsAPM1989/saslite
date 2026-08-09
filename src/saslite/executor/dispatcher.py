@@ -36,7 +36,7 @@ class Dispatcher:
             summary.add_step(result)
 
             if result.error:
-                self.reporter.error(result.error)
+                self.reporter.error(self._with_location(result.error, step))
 
             if result.error and self.reporter.stop_on_error:
                 break
@@ -44,16 +44,27 @@ class Dispatcher:
             for msg in result.notes:
                 self.reporter.note(msg)
             for msg in result.warnings:
-                self.reporter.warning(msg)
+                self.reporter.warning(self._with_location(msg, step))
                 if self.reporter.stop_on_warning:
                     break
 
             if result.warnings and self.reporter.stop_on_warning:
                 summary.success = False
-                summary.error = f"Stopped after warning: {result.warnings[0]}"
                 break
 
         return summary
+
+    @staticmethod
+    def _with_location(message: str, node: Any) -> str:
+        span = getattr(node, "span", None)
+        if span is None or not span.source or span.start_line <= 0:
+            return message
+        if message.startswith(f"{span.source}:"):
+            return message
+        return (
+            f"{span.source}:{span.start_line}:{span.start_col or 1}: "
+            f"{message}"
+        )
 
     def _dispatch_step(self, step: Any) -> StepResult:
         """Dispatch a single step to its executor."""

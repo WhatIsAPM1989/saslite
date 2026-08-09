@@ -58,9 +58,19 @@ class Reporter:
             return line
         marker = line.lstrip().upper()
         if marker.startswith("ERROR:"):
-            return f"{self._ERROR}{line}{self._RESET}"
+            prefix_at = line.upper().find("ERROR:")
+            prefix_end = prefix_at + len("ERROR:")
+            return (
+                f"{line[:prefix_at]}{self._ERROR}{line[prefix_at:prefix_end]}"
+                f"{self._RESET}{line[prefix_end:]}"
+            )
         if marker.startswith("WARNING:"):
-            return f"{self._WARNING}{line}{self._RESET}"
+            prefix_at = line.upper().find("WARNING:")
+            prefix_end = prefix_at + len("WARNING:")
+            return (
+                f"{line[:prefix_at]}{self._WARNING}{line[prefix_at:prefix_end]}"
+                f"{self._RESET}{line[prefix_end:]}"
+            )
         return line
 
     def _print_line(self, line: str) -> None:
