@@ -157,6 +157,7 @@ def _run_file(sas: SasInterpreter, filepath: str, encoding: str = "utf-8") -> in
             sas.reporter.error(summary.error)
         return 1
 
+    _report_quiet_success(sas)
     return 0
 
 
@@ -167,7 +168,18 @@ def _run_text(sas: SasInterpreter, text: str) -> int:
         if not sas.reporter.has_errors and summary.error:
             sas.reporter.error(summary.error)
         return 1
+    _report_quiet_success(sas)
     return 0
+
+
+def _report_quiet_success(sas: SasInterpreter) -> None:
+    """Confirm a clean quiet-mode run without adding noise to full logs."""
+    if (
+        sas.reporter.quiet
+        and sas.reporter.warning_count == 0
+        and not sas.reporter.has_errors
+    ):
+        sas.reporter.success("Program completed without warnings or errors.")
 
 
 def _run_repl(sas: SasInterpreter) -> int:

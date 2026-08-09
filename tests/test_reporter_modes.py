@@ -1,7 +1,9 @@
 import io
 import unittest
+from contextlib import redirect_stderr
 
 from saslite import SasInterpreter
+from saslite.cli.main import main
 from saslite.diagnostics.reporter import Reporter
 
 
@@ -12,10 +14,12 @@ class ReporterModeTests(unittest.TestCase):
 
         reporter.warning("check this")
         reporter.error("failed")
+        reporter.success("completed")
 
         output = log.getvalue()
         self.assertIn("\033[1;33mWARNING:\033[0m check this", output)
         self.assertIn("\033[1;31mERROR:\033[0m failed", output)
+        self.assertIn("\033[1;32mSUCCESS:\033[0m completed", output)
 
     def test_quiet_mode_hides_notes_and_regular_output(self) -> None:
         log = io.StringIO()
@@ -114,6 +118,34 @@ run;
 
         self.assertFalse(result.success)
         self.assertIn("ERROR: /tmp/program.sas:3:", log.getvalue())
+
+    def test_quiet_cli_confirms_clean_run(self) -> None:
+        log = io.StringIO()
+        with redirect_stderr(log):
+            exit_code = main([
+                "--quiet",
+                "--color", "never",
+                "-e", "data result; value=1; run;",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            log.getvalue().strip(),
+            "SUCCESS: Program completed without warnings or errors.",
+        )
+
+    def test_quiet_cli_does_not_report_success_after_warning(self) -> None:
+        log = io.StringIO()
+        with redirect_stderr(log):
+            exit_code = main([
+                "--quiet",
+                "--color", "never",
+                "-e", "data result; value=missing_source-1; run;",
+            ])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("WARNING:", log.getvalue())
+        self.assertNotIn("SUCCESS:", log.getvalue())
 
 
 if __name__ == "__main__":

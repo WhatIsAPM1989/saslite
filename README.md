@@ -74,7 +74,8 @@ Editor runs use a concise fail-fast mode: regular NOTE/table output is hidden,
 warnings are yellow, errors are red, and execution stops after the first SAS
 step that reports a warning or error. A normal `saslite program.sas` command
 continues to use the full uncolored log. The same behavior is available from
-the CLI with `--quiet --fail-fast --color always`.
+the CLI with `--quiet --fail-fast --color always`. A clean editor run prints a
+green `SUCCESS: Program completed without warnings or errors.` confirmation.
 
 Diagnostics include `path:line:column` locations. In Devin and VS Code's
 integrated terminal, click that location to open the SAS file and place the

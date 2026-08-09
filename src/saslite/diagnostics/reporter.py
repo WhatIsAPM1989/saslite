@@ -8,9 +8,10 @@ from typing import TextIO
 
 
 class Reporter:
-    """SAS-style diagnostic reporter (NOTE/WARNING/ERROR)."""
+    """SAS-style diagnostic reporter (NOTE/WARNING/ERROR/SUCCESS)."""
 
     _RESET = "\033[0m"
+    _SUCCESS = "\033[1;32m"
     _WARNING = "\033[1;33m"
     _ERROR = "\033[1;31m"
 
@@ -71,6 +72,13 @@ class Reporter:
                 f"{line[:prefix_at]}{self._WARNING}{line[prefix_at:prefix_end]}"
                 f"{self._RESET}{line[prefix_end:]}"
             )
+        if marker.startswith("SUCCESS:"):
+            prefix_at = line.upper().find("SUCCESS:")
+            prefix_end = prefix_at + len("SUCCESS:")
+            return (
+                f"{line[:prefix_at]}{self._SUCCESS}{line[prefix_at:prefix_end]}"
+                f"{self._RESET}{line[prefix_end:]}"
+            )
         return line
 
     def _print_line(self, line: str) -> None:
@@ -91,6 +99,10 @@ class Reporter:
         line = f"ERROR: {message}"
         self._errors.append(line)
         self._print_line(line)
+
+    def success(self, message: str) -> None:
+        """Print an explicit successful-run marker, including in quiet mode."""
+        self._print_line(f"SUCCESS: {message}")
 
     def log(self, message: str) -> None:
         lines = message.splitlines()
