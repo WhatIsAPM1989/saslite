@@ -64,6 +64,26 @@ Run a SAS program:
 saslite path/to/program.sas
 ```
 
+### Devin IDE / VS Code
+
+This repository recommends the Code Runner extension and maps its editor-title
+play button to SASLite for `.sas` files. After installing the recommended
+extension, open a SAS program and click **Run Code** (the play icon).
+
+The runner uses `.venv/bin/python` when the repository virtual environment is
+available, otherwise it falls back to `python3`. It always runs the local
+sources from `src/` and stores persistent datasets in `.work/`.
+
+If the Python dependencies are not installed yet, prepare the environment with:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e .
+```
+
+Without Code Runner, use **Tasks: Run Test Task** from the command palette to
+run the current SAS file.
+
 Run one statement:
 
 ```bash
