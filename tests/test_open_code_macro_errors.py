@@ -12,11 +12,32 @@ class OpenCodeMacroErrorTests(unittest.TestCase):
         sas._reporter = Reporter(stream=log)
         return sas.execute(source), log.getvalue()
 
-    def test_modern_open_code_if_is_allowed(self) -> None:
-        result, log = self._execute("%if 1 %then %put yes;")
+    def test_open_code_if_requires_do_group(self) -> None:
+        result, log = self._execute(
+            "%let value=0; "
+            "%if %sysevalf(&value < 12) %then %let value=12;"
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "Expected %DO not found.")
+        self.assertEqual(log, "ERROR: Expected %DO not found.\n")
+
+    def test_open_code_if_accepts_do_group(self) -> None:
+        result, log = self._execute(
+            "%if 1 %then %do; %put yes; %end;"
+        )
 
         self.assertTrue(result.success, result.error)
         self.assertEqual(log, "yes\n")
+
+    def test_open_code_else_requires_do_group(self) -> None:
+        result, log = self._execute(
+            "%if 0 %then %do; %put yes; %end; %else %put no;"
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "Expected %DO not found.")
+        self.assertEqual(log, "ERROR: Expected %DO not found.\n")
 
     def test_scope_only_statement_in_open_code_is_an_error(self) -> None:
         result, log = self._execute("%local orphan;")
@@ -37,6 +58,19 @@ class OpenCodeMacroErrorTests(unittest.TestCase):
 
         self.assertTrue(result.success, result.error)
         self.assertEqual(log, "yes\n")
+
+    def test_no_argument_macro_call_does_not_require_semicolon(self) -> None:
+        source = """
+            %macro build;
+                data result; value=1; run;
+            %mend;
+            %build
+        """
+
+        result, log = self._execute(source)
+
+        self.assertTrue(result.success, result.error)
+        self.assertNotIn("ERROR:", log)
 
     def test_open_code_macro_text_inside_string_is_not_an_error(self) -> None:
         source = "data example; value = '%if is text'; run;"

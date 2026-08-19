@@ -153,6 +153,57 @@ The external module must define
 `saslite.profiles.CompatibilityProfile`. Do not load profile files from an
 untrusted source.
 
+### Project schema policies
+
+Create a project structure with:
+
+```bash
+./scripts/create-saslite-project.py /path/to/new-project
+```
+
+The generated `saslite-project.json` contains no library list:
+
+```json
+{
+  "version": 1,
+  "default_schema": "weak",
+  "metadata_dir": "_local/config/metadata"
+}
+```
+
+The CLI discovers the file under `--profile-root` or beside the input SAS
+program. Use `--project-file /path/to/saslite-project.json` to select it
+explicitly.
+
+SASLite scans every metadata CSV in that directory. A file such as `sdtm.csv`
+automatically makes `SDTM` strict; libraries without metadata use
+`default_schema`. Strict metadata supplies full descriptors and zero-row
+schema-only datasets. When local XPT/SAS7BDAT rows exist, they are viewed through
+the manifest descriptor without modifying the source file.
+
+After copying metadata from the SAS log, remove form-feed page breaks and
+`The SAS System` page headers with the cleaner generated in that directory:
+
+```bash
+python3 _local/config/metadata/clean-sas-log-metadata.py
+```
+
+It cleans every metadata CSV beside it and retains the original as a `.bak` file.
+
+With `weak`, an absent source variable uses missing-value semantics and is
+reported as an assumption. With metadata-driven `strict`, a variable absent
+from the manifest emits a schema warning. Both policies follow source lineage
+through intermediate `WORK` datasets.
+
+Variables read without an input dataset remain ordinary uninitialized-variable
+warnings. Dummy fixture loading is planned but is not implemented yet.
+
+### Starting a new local project
+
+The new-project workflow, including automatic metadata-driven strict schemas,
+the project generator, future dummy data, and corporate metadata export, is documented in
+[NEW_PROJECT.md](NEW_PROJECT.md).
+
 ## GUI
 
 Install the GUI extra:

@@ -12,7 +12,7 @@ from saslite.runtime.types import is_missing
 _SAS_EPOCH = date(1960, 1, 1)
 
 
-def input_sas(source: Any, informat: str) -> Any:
+def input_sas(source: Any, informat: Any) -> Any:
     """INPUT(source, informat.) — read character as numeric/date."""
     if is_missing(source):
         return float("nan")
@@ -20,7 +20,10 @@ def input_sas(source: Any, informat: str) -> Any:
     if not s or s == ".":
         return float("nan")
 
-    inf = informat.upper().rstrip(".")
+    # Numeric SAS informats such as 5.1 are parsed as numeric literals by the
+    # expression grammar. Treat their textual representation as the informat
+    # specification instead of assuming a string argument.
+    inf = str(informat).upper().rstrip(".")
 
     # Numeric informats
     if inf in ("BEST", "BEST32", "BEST12", "F", "COMMA", "DOLLAR", "NUMERIC") or inf.startswith("COMMA") or inf.startswith("DOLLAR"):
@@ -59,12 +62,14 @@ def input_sas(source: Any, informat: str) -> Any:
         return float("nan")
 
 
-def put_sas(source: Any, format_spec: str) -> str:
+def put_sas(source: Any, format_spec: Any) -> str:
     """PUT(source, format.) — convert numeric/date to character."""
     if is_missing(source):
         return "."
 
-    fmt = format_spec.upper().rstrip(".")
+    # PUT(value, 5.1) supplies a numeric-looking format token, which reaches
+    # the runtime as a float. Convert it back to its SAS format spelling.
+    fmt = str(format_spec).upper().rstrip(".")
 
     # ISO 8601 date format: e8601da. -> yyyymmdd
     if fmt in ("E8601DA", "E8601DA10", "YYMMDD10", "B8601DA", "B8601DA10"):

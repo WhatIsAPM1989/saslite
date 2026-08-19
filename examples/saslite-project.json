@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "default_schema": "weak",
+  "metadata_dir": "_local/config/metadata"
+}

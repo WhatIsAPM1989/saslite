@@ -53,6 +53,26 @@ run;
             ["North America"],
         )
 
+    def test_str_masks_comma_inside_keyword_argument(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+%macro build(title=);
+  data result;
+    length title $20;
+    title="&title.";
+  run;
+%mend;
+%build(title=%str(Alpha, Beta));
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            sas.get_dataset("WORK", "RESULT")["title"].tolist(),
+            ["Alpha, Beta"],
+        )
+
     def test_unquoted_keyword_expression_keeps_its_trailing_quote(self) -> None:
         sas = SasInterpreter()
         result = sas.execute(

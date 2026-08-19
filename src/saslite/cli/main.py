@@ -86,6 +86,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Project root used by the selected compatibility profile",
     )
     parser.add_argument(
+        "--project-file",
+        type=str,
+        default=None,
+        help=(
+            "Project configuration file (default: saslite-project.json under "
+            "--profile-root or beside the input SAS program)"
+        ),
+    )
+    parser.add_argument(
         "--version",
         action="store_true",
         help="Show version",
@@ -106,12 +115,25 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     try:
+        project_file = args.project_file
+        if project_file is None:
+            discovery_root = args.profile_root
+            if discovery_root is None and args.file:
+                discovery_root = str(Path(args.file).expanduser().resolve().parent)
+            if discovery_root is not None:
+                candidate = (
+                    Path(discovery_root).expanduser().resolve()
+                    / "saslite-project.json"
+                )
+                if candidate.is_file():
+                    project_file = str(candidate)
         sas = SasInterpreter(
             work_dir=args.workdir,
             sas_format=args.format,
             profile=args.profile,
             profile_file=args.profile_file,
             profile_root=args.profile_root,
+            project_file=project_file,
         )
     except (FileNotFoundError, ImportError, TypeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

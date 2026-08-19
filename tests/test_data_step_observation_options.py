@@ -166,7 +166,7 @@ run;
         self.assertEqual(frame["ID"].tolist(), [2, 3])
         self.assertEqual(frame["amount"].tolist(), [20, 30])
 
-    def test_missing_input_schema_references_warn_even_when_where_removes_all_rows(self) -> None:
+    def test_missing_generated_work_schema_references_are_warnings(self) -> None:
         sas = SasInterpreter()
         result = sas.execute(
             """
@@ -190,12 +190,11 @@ run;
 
         self.assertTrue(result.success, result.error)
         warnings = "\n".join(result.steps[-1].warnings)
-        self.assertIn("MISSING_WHERE referenced by WHERE=", warnings)
-        self.assertIn("MISSING_KEEP referenced by KEEP=", warnings)
-        self.assertIn("MISSING_DROP referenced by DROP=", warnings)
-        self.assertIn("MISSING_DIRECT referenced by DATA step is uninitialized", warnings)
-        self.assertEqual(warnings.count("MISSING_DIRECT referenced by DATA step"), 1)
-        self.assertIn("WORK.SOURCE", warnings)
+        for variable in (
+            "MISSING_WHERE", "MISSING_KEEP", "MISSING_DROP", "MISSING_DIRECT"
+        ):
+            self.assertIn(variable, warnings)
+        self.assertFalse(sas.session.schema_expectations)
 
 
 if __name__ == "__main__":

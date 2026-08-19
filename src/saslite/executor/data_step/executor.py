@@ -221,7 +221,10 @@ class DataStepExecutor:
 
             # Build PDV
             pdv = self._build_pdv(step, input_datasets)
-            pdv.set_input_sources(input_ds_names)
+            pdv.set_input_sources(list(
+                self.session.schema_sources_for(input_ds_names)
+                or input_ds_names
+            ))
             self._validate_data_step_references(step.statements, pdv, input_ds_names)
 
             # Detect BY variables for FIRST./LAST. tracking
@@ -404,6 +407,7 @@ class DataStepExecutor:
         # SAS decides whether a variable is uninitialized from the compiled
         # DATA step, not from the branch taken by an individual observation.
         # Record every executable source before the implicit loop starts.
+        self._mark_array_assignment_targets(step.statements, pdv)
         self._mark_produced_variables(step.statements, pdv)
 
         # Process RETAIN statements
@@ -426,8 +430,19 @@ class DataStepExecutor:
         self,
         variable: str,
         context: str,
-        dataset_name: str,
-    ) -> None:
+        dataset_names: str | list[str],
+    ) -> bool:
+        sources = (
+            [dataset_names]
+            if isinstance(dataset_names, str)
+            else list(dataset_names)
+        )
+        weak_sources = self.session.weak_schema_sources_for(sources)
+        if weak_sources:
+            self.session.record_schema_expectation(variable, weak_sources, context)
+            return True
+        schema_sources = self.session.schema_sources_for(sources)
+        dataset_name = ", ".join(schema_sources or sources)
         key = f"{context.upper()}:{dataset_name.upper()}:{variable.upper()}"
         status = " is uninitialized and" if context == "DATA step" else " is"
         self._schema_warnings.setdefault(
@@ -436,6 +451,7 @@ class DataStepExecutor:
             f"from input dataset(s) {dataset_name.upper()}. SASLite used "
             "missing-value semantics; check the local fixture schema.",
         )
+        return False
 
     @staticmethod
     def _name_list_matches(name: str, specifications: list[str] | set[str]) -> bool:
@@ -502,7 +518,6 @@ class DataStepExecutor:
                     expressions.extend(VariableNode(name=name) for name in stmt.variables)
 
         collect(statements)
-        sources = ", ".join(input_names)
         automatic_prefixes = ("FIRST.", "LAST.")
         for variable in sorted(set().union(*(
             referenced_variables(expression) for expression in expressions
@@ -515,10 +530,23 @@ class DataStepExecutor:
                 or pdv.has_compile_time_source(logical_name)
             ):
                 continue
-            self._record_missing_schema_variable(
-                logical_name, "DATA step", sources
+            assumed = self._record_missing_schema_variable(
+                logical_name, "DATA step", input_names
             )
-            self._pending_data_step_schema[logical_name] = sources
+            if assumed:
+                # Treat the name as supplied by an open input schema without
+                # adding it to the PDV or the source Dataset metadata. PDV.get
+                # then returns a numeric missing value without an
+                # uninitialized-variable warning.
+                pdv.mark_produced(logical_name)
+            else:
+                strict_sources = (
+                    self.session.schema_sources_for(input_names)
+                    or tuple(input_names)
+                )
+                self._pending_data_step_schema[logical_name] = ", ".join(
+                    strict_sources
+                )
 
     def _finalize_data_step_schema_warnings(self, pdv: PDV) -> None:
         """Keep static warnings only when no runtime read could report them."""
@@ -585,6 +613,51 @@ class DataStepExecutor:
                         ),
                     )
                     pdv.mark_produced(name)
+
+    def _mark_array_assignment_targets(
+        self,
+        statements: list[Any],
+        pdv: PDV,
+    ) -> None:
+        """Compile variables that can be assigned through an array reference."""
+        arrays: dict[str, ArrayNode] = {}
+        assignments: dict[str, list[ArrayAssignNode]] = {}
+
+        def collect(items: list[Any]) -> None:
+            for stmt in items:
+                if isinstance(stmt, ArrayNode):
+                    arrays[stmt.name.upper()] = stmt
+                elif isinstance(stmt, ArrayAssignNode):
+                    assignments.setdefault(stmt.array_name.upper(), []).append(stmt)
+                elif isinstance(stmt, DoNode):
+                    collect(stmt.body)
+                elif isinstance(stmt, IfNode):
+                    if stmt.then_stmt is not None:
+                        collect([stmt.then_stmt])
+                    if stmt.else_stmt is not None:
+                        collect([stmt.else_stmt])
+
+        collect(statements)
+        for array_name, array_assignments in assignments.items():
+            definition = arrays.get(array_name)
+            if definition is None:
+                continue
+            dtype = "character" if definition.is_character else "numeric"
+            for assignment in array_assignments:
+                variables = definition.variables
+                if (
+                    isinstance(assignment.index, LiteralNode)
+                    and assignment.index.literal_type == "number"
+                ):
+                    index = int(assignment.index.value) - 1
+                    variables = (
+                        [definition.variables[index]]
+                        if 0 <= index < len(definition.variables)
+                        else []
+                    )
+                for variable in variables:
+                    pdv.ensure_variable(variable, dtype=dtype)
+                    pdv.mark_produced(variable)
 
     @staticmethod
     def _expression_dtype(expression: Any, pdv: PDV) -> str:
@@ -868,16 +941,18 @@ class DataStepExecutor:
         """Execute PUT statement — write to log."""
         parts = []
         for item in stmt.items:
-            if isinstance(item, str):
+            if isinstance(item, PutItemNode):
+                val = ctx.evaluator.evaluate(item.expr)
+                if item.format_spec:
+                    rendered = self._apply_put_format(val, item.format_spec)
+                else:
+                    rendered = str(val) if val is not None else "."
+                if item.show_name and isinstance(item.expr, VariableNode):
+                    rendered = f"{item.expr.name}={rendered}"
+                parts.append(rendered)
+            elif isinstance(item, str):
                 # String literal
                 parts.append(item.strip('"').strip("'"))
-            elif hasattr(item, "name") and hasattr(item, "format_spec"):
-                # PutItemNode with format
-                val = ctx.pdv.get(item.name)
-                if item.format_spec:
-                    parts.append(self._apply_put_format(val, item.format_spec))
-                else:
-                    parts.append(str(val) if val is not None else ".")
             elif hasattr(item, "name"):
                 val = ctx.pdv.get(item.name)
                 parts.append(str(val) if val is not None else ".")
@@ -980,9 +1055,6 @@ class DataStepExecutor:
     ) -> list[DatasetRefNode]:
         if not ref.name.endswith(":"):
             return [ref]
-        backend = self.session.storage.get_backend(ref.libref)
-        if backend is None:
-            return []
         prefix = ref.name[:-1].upper()
         return [
             DatasetRefNode(
@@ -990,7 +1062,7 @@ class DataStepExecutor:
                 libref=ref.libref,
                 options=list(ref.options),
             )
-            for name in backend.list_datasets()
+            for name in self.session.list_datasets(ref.libref)
             if str(name).upper().startswith(prefix)
         ]
 
@@ -1090,6 +1162,11 @@ class DataStepExecutor:
             ], errors="ignore")
 
         out_ds = Dataset.from_dataframe(df, name=member, libref=libref)
+        out_ds.weak_schema_sources = tuple(dict.fromkeys(
+            source
+            for input_ds in input_datasets
+            for source in (input_ds.weak_schema_sources or ())
+        ))
         for column in out_ds.data.columns:
             target_meta = out_ds.metadata.get_variable(str(column))
             if target_meta is None:
@@ -1341,9 +1418,13 @@ class DataStepExecutor:
         # Build the PDV from input metadata and declarations so character
         # LENGTH checks also apply to values loaded by MERGE.
         pdv = self._build_pdv(step, datasets)
-        pdv.set_input_sources([
+        merge_input_names = [
             dataset.metadata.qualified_name for dataset in datasets
-        ])
+        ]
+        pdv.set_input_sources(list(
+            self.session.schema_sources_for(merge_input_names)
+            or merge_input_names
+        ))
         self._validate_data_step_references(
             step.statements,
             pdv,
@@ -1479,7 +1560,10 @@ class DataStepExecutor:
         ).reset_index(drop=True)
         pdv = self._build_pdv(step, datasets)
         input_names = [dataset.metadata.qualified_name for dataset in datasets]
-        pdv.set_input_sources(input_names)
+        pdv.set_input_sources(list(
+            self.session.schema_sources_for(input_names)
+            or input_names
+        ))
         pdv.set_by_vars(by_vars)
         self._validate_data_step_references(step.statements, pdv, input_names)
 

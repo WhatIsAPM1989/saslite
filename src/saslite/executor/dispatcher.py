@@ -35,6 +35,12 @@ class Dispatcher:
             result = self._dispatch_step(step)
             summary.add_step(result)
 
+            # SAS updates SYSNOBS at step boundaries.  rows_affected is the
+            # common executor contract for the observations handled by DATA
+            # and PROC steps, and is sufficient for subsequent macro flow.
+            if isinstance(step, (DataStepNode, ProcSqlNode, ProcNode)):
+                self.session.set_macro_var("SYSNOBS", str(result.rows_affected))
+
             if result.error:
                 self.reporter.error(self._with_location(result.error, step))
 

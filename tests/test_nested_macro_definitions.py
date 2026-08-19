@@ -206,6 +206,23 @@ class NestedMacroDefinitionTests(unittest.TestCase):
         self.assertEqual(sas._macro.get_var("mode"), "existing")
         self.assertEqual(log.getvalue(), "MODE=existing\n")
 
+    def test_conditional_global_declaration_executes_in_selected_branch(self) -> None:
+        sas, log = self._interpreter()
+        result = sas.execute(
+            """
+            %macro initialize;
+              %if not %symexist(marker) %then %global marker;
+              %if %superq(marker)= %then %let marker=ready;
+              %put MARKER=&marker;
+            %mend;
+            %initialize;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas._macro.get_var("marker"), "ready")
+        self.assertEqual(log.getvalue(), "MARKER=ready\n")
+
     def test_nested_if_do_else_blocks_choose_only_matching_branch(self) -> None:
         sas, log = self._interpreter()
         defined = sas.execute(

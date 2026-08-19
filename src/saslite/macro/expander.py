@@ -24,10 +24,13 @@ class MacroExpander:
     _OPEN_CODE_MACRO_ERROR = "Macro code is not allowed in open code."
     _QUOTED_AMPERSAND = "\ue000"
     _QUOTED_PERCENT = "\ue001"
+    _QUOTED_COMMA = "\ue002"
+    _QUOTED_SEMICOLON = "\ue003"
     _MACRO_SCOPE_KEYWORDS = (
-        # Modern SAS accepts %IF and %DO control flow in open code.  Only the
-        # following statements inherently require a macro-local scope or
-        # return target.
+        # Modern SAS accepts %IF with a following %DO/%END group in open code.
+        # Only the following statements inherently require a macro-local
+        # scope or return target; the stricter open-code %IF shape is checked
+        # while conditionals are parsed.
         "GOTO", "RETURN", "LOCAL", "MEND",
     )
 
@@ -51,6 +54,7 @@ class MacroExpander:
         self._global_vars["SYSDAY"] = now.strftime("%A")
         self._global_vars["SYSVER"] = "9.4"
         self._global_vars["SYSERR"] = "0"
+        self._global_vars["SYSNOBS"] = "0"
         if sys.platform.startswith("win"):
             self._global_vars["SYSSCP"] = "WIN"
         elif sys.platform == "darwin":
@@ -148,7 +152,7 @@ class MacroExpander:
         # Step 6: Process %IF/%THEN/%ELSE conditionals.  Conditions resolve
         # their own variables in source order; substituting the entire tail
         # here would freeze references before a selected branch can %LET them.
-        source = self._process_conditionals(source)
+        source = self._process_conditionals(source, require_do=True)
 
         # Step 8: Process %PUT statements
         source = self._process_put_statements(source)
@@ -162,6 +166,9 @@ class MacroExpander:
         source = self._process_do_loops(source)
         source = self._process_eval(source)
         source = self._process_let_statements(source)
+        # Open-code conditionals were already shape-validated before macro
+        # invocation. Any conditionals emitted here originate inside an
+        # invoked macro and may legally use a single statement after %THEN.
         source = self._process_conditionals(source)
         source = self._process_put_statements(source)
 
@@ -512,21 +519,40 @@ class MacroExpander:
         if re.search(rf"%\s*(?:{keywords})\b", "".join(unquoted), re.IGNORECASE):
             raise SyntaxError(self._OPEN_CODE_MACRO_ERROR)
 
-    def _process_conditionals(self, source: str) -> str:
-        """Process %IF ... %THEN ... %ELSE ... %DO ... %END; conditionals."""
+    def _process_conditionals(
+        self,
+        source: str,
+        *,
+        require_do: bool = False,
+    ) -> str:
+        """Process macro conditionals.
+
+        SAS 9.4M5 and later permit ``%IF`` in open code only when every
+        selected action is a ``%DO``/``%END`` group.  Macro definitions still
+        permit a single statement after ``%THEN`` or ``%ELSE``.
+        """
         max_iterations = 100
         for _ in range(max_iterations):
-            # Execute source-order %LET statements that precede the next
-            # conditional, but leave assignments inside its branches alone
-            # until that branch has actually been selected.
-            new_source = self._process_let_statements(source)
-            new_source = self._process_conditionals_once(new_source)
+            # Execute source-order declarations and assignments that precede
+            # the next conditional, but leave directives inside its branches
+            # alone until that branch has actually been selected.
+            new_source = self._process_global_declarations(source)
+            new_source = self._process_let_statements(new_source)
+            new_source = self._process_conditionals_once(
+                new_source,
+                require_do=require_do,
+            )
             if new_source == source:
                 break
             source = new_source
         return source
 
-    def _process_conditionals_once(self, source: str) -> str:
+    def _process_conditionals_once(
+        self,
+        source: str,
+        *,
+        require_do: bool = False,
+    ) -> str:
         """Evaluate the first conditional using balanced macro DO/END pairs."""
         masked = self._mask_quoted_text(source)
         if_match = re.search(r"%\s*IF\b", masked, flags=re.IGNORECASE)
@@ -547,6 +573,7 @@ class MacroExpander:
             source,
             masked,
             then_end,
+            require_do=require_do,
         )
         else_body = ""
         conditional_end = branch_end
@@ -557,6 +584,8 @@ class MacroExpander:
                 masked, else_at + else_match.end()
             )
             if re.match(r"%\s*IF\b", masked[else_branch_at:], re.IGNORECASE):
+                if require_do:
+                    raise SyntaxError("Expected %DO not found.")
                 conditional_end = self._macro_conditional_end(
                     source, masked, else_branch_at
                 )
@@ -566,6 +595,7 @@ class MacroExpander:
                     source,
                     masked,
                     else_branch_at,
+                    require_do=require_do,
                 )
 
         condition_result = self._eval_macro_condition(condition)
@@ -576,7 +606,7 @@ class MacroExpander:
             # it after that step has run.
             return source
         chosen = then_body if condition_result else else_body
-        chosen = self._process_conditionals(chosen)
+        chosen = self._process_conditionals(chosen, require_do=require_do)
         return source[:if_match.start()] + chosen + source[conditional_end:]
 
     def _macro_conditional_end(
@@ -624,6 +654,8 @@ class MacroExpander:
         source: str,
         masked: str,
         position: int,
+        *,
+        require_do: bool = False,
     ) -> tuple[str, int]:
         """Return branch text and end offset for block or single statement."""
         branch_start = self._skip_whitespace(masked, position)
@@ -635,6 +667,9 @@ class MacroExpander:
                 content_start,
             )
             return source[content_start:end_start], end_after
+
+        if require_do:
+            raise SyntaxError("Expected %DO not found.")
 
         semicolon = masked.find(";", branch_start)
         if semicolon < 0:
@@ -846,8 +881,10 @@ class MacroExpander:
 
     def _expand_once(self, source: str) -> str:
         """Single pass of macro expansion."""
-        # %name without arguments: %name;
-        pattern_no_args = r"%(\w+)\s*;"
+        # A no-argument macro call does not require a semicolon in SAS. Keep
+        # newlines outside the match so expanding a bare call on its own line
+        # cannot accidentally concatenate neighboring SAS statements.
+        pattern_no_args = r"%(\w+)\b(?!\s*\()[ \t]*;?"
 
         skip_keywords = {"LET", "MACRO", "MEND", "IF", "THEN", "ELSE", "DO", "END",
                          "PUT", "INCLUDE", "GOTO", "RETURN", "EVAL", "SYSEVALF",
@@ -867,12 +904,14 @@ class MacroExpander:
                     continue
                 kw = re.match(r"^(\w+)\s*=\s*(.*)$", arg, flags=re.DOTALL)
                 if kw and kw.group(1).upper() in macro.params:
-                    local_vars[kw.group(1).upper()] = self._strip_matching_quotes(
-                        kw.group(2)
-                    )
+                    # Quotes in a macro argument are ordinary source text in
+                    # SAS, not delimiters owned by the macro invocation. Keep
+                    # them so an argument such as label="Weight group (kg)"
+                    # remains a valid SQL character literal when substituted.
+                    local_vars[kw.group(1).upper()] = kw.group(2).strip()
                 else:
                     if pos_idx < len(macro.params):
-                        local_vars[macro.params[pos_idx]] = self._strip_matching_quotes(arg)
+                        local_vars[macro.params[pos_idx]] = arg.strip()
                     pos_idx += 1
             # Expand body with local vars
             return self._expand_invoked_macro(macro, local_vars)
@@ -945,17 +984,6 @@ class MacroExpander:
 
         source = re.sub(pattern_no_args, replacer_no_args, source, flags=re.IGNORECASE)
         return source
-
-    @staticmethod
-    def _strip_matching_quotes(value: str) -> str:
-        text = value.strip()
-        if (
-            len(text) >= 2
-            and text[0] in ("'", '"')
-            and text[-1] == text[0]
-        ):
-            return text[1:-1]
-        return text
 
     def _expand_invoked_macro(
         self,
@@ -1101,12 +1129,20 @@ class MacroExpander:
                 self._global_vars.setdefault(name.upper(), "")
             return ""
 
-        return re.sub(
+        # Preserve execution order: a %GLOBAL inside an unselected %IF branch
+        # must not run while the surrounding macro body is being prepared.
+        # Process only declarations before the next conditional; the
+        # conditional engine will revisit the selected branch and remainder.
+        masked = self._mask_quoted_text(source)
+        conditional = re.search(r"%\s*IF\b", masked, flags=re.IGNORECASE)
+        boundary = conditional.start() if conditional is not None else len(source)
+        prefix = re.sub(
             r"%\s*GLOBAL\s+([^;]*);",
             declare,
-            source,
+            source[:boundary],
             flags=re.IGNORECASE,
         )
+        return prefix + source[boundary:]
 
     def _substitute_vars(self, source: str) -> str:
         """Substitute &var references with their values.
@@ -1132,7 +1168,19 @@ class MacroExpander:
             self._log_symbolgen(m.group(1), val)
             return val
 
-        source = re.sub(r"&(\w+)\.?", _direct, source)
+        # A macro variable value can itself contain another macro reference
+        # (for example ``%let n=&sqlobs;`` staged before PROC SQL finishes).
+        # Rescan resolved text as SAS does, while bounding cycles such as
+        # A=&B / B=&A.
+        seen: set[str] = set()
+        for _ in range(20):
+            if source in seen:
+                break
+            seen.add(source)
+            resolved = re.sub(r"&(\w+)\.?", _direct, source)
+            if resolved == source:
+                break
+            source = resolved
         return source
 
     def _process_put_statements(self, source: str) -> str:
@@ -1423,11 +1471,8 @@ class MacroExpander:
             return self._quote_macro_value(value)
 
         if func in ("STR", "NRSTR"):
-            return (
-                self._quote_macro_value(raw_args)
-                if func == "NRSTR"
-                else raw_args
-            )
+            value = self._quote_macro_punctuation(raw_args)
+            return self._quote_macro_value(value) if func == "NRSTR" else value
 
         if func == "SYMEXIST":
             return "1" if self.get_var(raw_args.strip()) is not None else "0"
@@ -1490,10 +1535,21 @@ class MacroExpander:
         )
 
     @classmethod
+    def _quote_macro_punctuation(cls, value: str) -> str:
+        """Mask separators protected by %STR/%NRSTR until final emission."""
+        return str(value).replace(",", cls._QUOTED_COMMA).replace(
+            ";",
+            cls._QUOTED_SEMICOLON,
+        )
+
+    @classmethod
     def _unquote_macro_value(cls, value: str) -> str:
-        return str(value).replace(cls._QUOTED_AMPERSAND, "&").replace(
-            cls._QUOTED_PERCENT,
-            "%",
+        return (
+            str(value)
+            .replace(cls._QUOTED_AMPERSAND, "&")
+            .replace(cls._QUOTED_PERCENT, "%")
+            .replace(cls._QUOTED_COMMA, ",")
+            .replace(cls._QUOTED_SEMICOLON, ";")
         )
 
     _sysfunc_registry = None
@@ -1567,6 +1623,15 @@ class MacroExpander:
             return int(self._session.dataset_exists(libref, member))
         except (KeyError, OSError, ValueError):
             return 0
+
+    def _sysfunc_libref(self, libref: Any) -> int:
+        """Return zero when a libref is assigned, as SAS LIBREF does."""
+        if self._session is None:
+            return 1
+        name = str(libref).strip().strip("'\"")
+        if not name:
+            return 1
+        return int(self._session.storage.get_backend(name) is None)
 
     def _sysfunc_open(self, dataset_name: Any, mode: Any = "I") -> int:
         """OPEN a session dataset and return a stable, positive handle.

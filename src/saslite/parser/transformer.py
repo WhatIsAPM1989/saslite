@@ -20,6 +20,7 @@ from saslite.ast.data_step import (
     DropNode, RenameNode, FormatNode, FormatResetNode, InformatResetNode,
     LabelNode, MergeNode, ArrayNode,
     InputNode, InfileNode, SubstrAssignNode, LengthNode, AttribNode, PutNode,
+    PutItemNode,
     UpdateDataNode, CallSymputNode,
 )
 from saslite.ast.sql import (
@@ -317,12 +318,12 @@ class SasTransformer(Transformer):
         return LiteralNode(value="*", literal_type="string")
 
     def of_array_arg(self, items: list[Any]) -> FunctionCallNode:
-        """OF arr[*] — expand to all array elements at evaluation time."""
+        """OF arr[*] / OF arr{*} — expand to all array elements at evaluation time."""
         name = ""
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
-                if t.upper() == "OF" or t in ("[", "]", "*"):
+                if t.upper() == "OF" or t in ("[", "]", "{", "}", "*"):
                     continue
                 if not name:
                     name = t.upper()
@@ -580,7 +581,7 @@ class SasTransformer(Transformer):
         return ByNode(variables=names)
 
     def array_stmt(self, items: list[Any]) -> ArrayNode:
-        # ARRAY name[size] [var_list] [(init_values)]
+        # ARRAY name[size] / name{size} [var_list] [(init_values)]
         name = ""
         size = None
         variables: list[str] = []
@@ -597,10 +598,10 @@ class SasTransformer(Transformer):
                 if not name and getattr(item, "type", "") == "NAME":
                     name = t
                     continue
-                if t == "[":
+                if t in ("[", "{"):
                     in_bounds = True
                     continue
-                if t == "]":
+                if t in ("]", "}"):
                     in_bounds = False
                     continue
                 if t == "$":
@@ -957,14 +958,14 @@ class SasTransformer(Transformer):
         return AssignNode(target=target, expr=expr)
 
     def arr_assign_stmt(self, items: list[Any]) -> Any:
-        """arr[index] = expr;"""
+        """arr[index] / arr{index} = expr;"""
         from saslite.ast.data_step import ArrayAssignNode
         name = ""
         exprs: list[Any] = []
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
-                if t in ("[", "]", "="):
+                if t in ("[", "]", "{", "}", "="):
                     continue
                 if not name:
                     name = t.upper()
@@ -1843,16 +1844,25 @@ class SasTransformer(Transformer):
     # ── PROC PRINT ──────────────────────────────────
 
     def proc_print(self, items: list[Any]) -> ProcNode:
-        data_name = ""
+        options: dict[str, Any] = {}
         body_statements = []
         for item in _non_tokens(items):
-            if isinstance(item, VariableNode):
-                data_name = item.name
+            if isinstance(item, dict):
+                options.update(item)
             elif isinstance(item, list):
                 body_statements.extend(item)
             elif item is not None:
                 body_statements.append(item)
-        return ProcNode(proc_name="PRINT", options={"DATA": data_name}, statements=body_statements)
+        return ProcNode(proc_name="PRINT", options=options, statements=body_statements)
+
+    def print_opt(self, items: list[Any]) -> dict[str, Any]:
+        if not items:
+            return {}
+        key = _get_text(items[0]).upper()
+        values = _non_tokens(items)
+        if key == "DATA" and values:
+            return {key: _get_text(values[0])}
+        return {key: True}
 
     def proc_print_body(self, items: list[Any]) -> list[Any]:
         return [item for item in items if item is not None]
@@ -2110,10 +2120,21 @@ class SasTransformer(Transformer):
         val_items = _non_tokens(items)
         if val_items:
             value = val_items[0]
+            if isinstance(value, DatasetRefNode):
+                return {"OUT": value}
             if hasattr(value, "name"):
                 return {"OUT": value.name}
             return {"OUT": _get_text(value)}
         return {}
+
+    def freq_opt_named(self, items: list[Any]) -> dict[str, Any]:
+        """Handle named PROC FREQ options such as ORDER=FREQ."""
+        names = [
+            str(item).upper()
+            for item in items
+            if isinstance(item, Token) and str(item) != "="
+        ]
+        return {names[0]: names[1]} if len(names) >= 2 else {}
 
     def freq_opt_flag(self, items: list[Any]) -> dict[str, Any]:
         """Handle boolean flag options like NOPRINT, NOROW, NOCOL, NOPERCENT, MISSING."""
@@ -2134,6 +2155,11 @@ class SasTransformer(Transformer):
             elif isinstance(item, list):
                 specs.extend([s for s in item if isinstance(s, FreqTableSpec)])
         return specs
+
+    def freq_by(self, items: list[Any]) -> ByNode:
+        """Handle a PROC FREQ BY statement."""
+        names = next((item for item in items if isinstance(item, list)), [])
+        return ByNode(variables=[str(name) for name in names])
 
     def freq_table_spec(self, items: list[Any]) -> FreqTableSpec:
         """Handle freq_table_spec — single table like 'a * b / norow'."""
@@ -3126,21 +3152,20 @@ class SasTransformer(Transformer):
         start_expr = None
         length_expr = None
         value_expr = None
-        non_tok = _non_tokens(items)
-        tok_names = [str(it) for it in items if isinstance(it, Token)]
-
         # Find target name
         for it in items:
-            if isinstance(it, Token) and it not in ("SUBSTR", "(", ")", ",", "=", ";"):
+            if (
+                isinstance(it, Token)
+                and str(it).upper() not in ("SUBSTR", "(", ")", ",", "=", ";")
+            ):
                 target = str(it)
                 break
 
         exprs = _non_tokens(items)
         if len(exprs) >= 1:
             start_expr = exprs[0]
-        if len(exprs) >= 2:
-            length_expr = exprs[1]
         if len(exprs) >= 3:
+            length_expr = exprs[1]
             value_expr = exprs[2]
         elif len(exprs) >= 2:
             value_expr = exprs[1]
@@ -3294,6 +3319,17 @@ class SasTransformer(Transformer):
             return None
         return items[0] if not isinstance(items[0], Token) else _get_text(items[0])
 
+    def put_string(self, items: list[Any]) -> str:
+        return _get_text(items[0]) if items else ""
+
+    def put_variable(self, items: list[Any]) -> PutItemNode:
+        name = _get_text(items[0]) if items else ""
+        return PutItemNode(expr=VariableNode(name=name))
+
+    def put_named(self, items: list[Any]) -> PutItemNode:
+        name = _get_text(items[0]) if items else ""
+        return PutItemNode(expr=VariableNode(name=name), show_name=True)
+
     def put_format(self, items: list[Any]) -> str:
         parts = [_get_text(it) for it in items if not isinstance(it, Token) or str(it) not in (";",)]
         return "".join(parts)
@@ -3328,7 +3364,7 @@ class SasTransformer(Transformer):
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
-                if t in ("[", "]"):
+                if t in ("[", "]", "{", "}"):
                     continue
                 if not name:
                     name = t.upper()

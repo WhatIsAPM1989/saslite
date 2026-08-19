@@ -246,6 +246,12 @@ class SqlExecutor:
                 else:
                     continue
 
+                # SAS exposes the number of rows processed by the most
+                # recent SQL statement through the automatic macro variable
+                # SQLOBS.  Keep it in the session so staged macro expansion
+                # after QUIT can consume it.
+                self.session.set_macro_var("SQLOBS", str(result.rows_affected))
+
                 result.warnings.extend(
                     message
                     for key, message in self._schema_warnings.items()
@@ -277,7 +283,7 @@ class SqlExecutor:
 
     def _select_source_names(self, sel: SelectNode) -> list[str]:
         names: list[str] = []
-        for item in sel.from_clause:
+        for item in sel.from_clause or []:
             table = item if isinstance(item, FromTableNode) else getattr(item, "table", None)
             if isinstance(table, FromTableNode):
                 names.append(self._table_display_name(table))
@@ -299,7 +305,20 @@ class SqlExecutor:
             logical_name = variable.upper()
             if logical_name in allowed or self._resolve_col(variable, col_map) is not None:
                 continue
-            source_text = ", ".join(sources) if sources else "the query input"
+            schema_sources = self.session.schema_sources_for(sources)
+            source_text = (
+                ", ".join(schema_sources or sources)
+                if sources
+                else "the query input"
+            )
+            weak_sources = self.session.weak_schema_sources_for(sources)
+            if weak_sources:
+                self.session.record_schema_expectation(
+                    logical_name,
+                    weak_sources,
+                    context,
+                )
+                continue
             key = f"{context.upper()}:{source_text.upper()}:{logical_name}"
             self._schema_warnings.setdefault(
                 key,
@@ -1155,6 +1174,7 @@ class SqlExecutor:
         import io
 
         # Build per-row evaluator
+        source_columns = list(df.columns)
         col_map = {c.upper(): c for c in df.columns}
         temp_col_idx = 0
         group_cols = []
@@ -1231,6 +1251,22 @@ class SqlExecutor:
             return StepResult(success=True)
 
         grouped = df.groupby(group_cols)
+
+        # SAS PROC SQL permits detail columns alongside summary functions and
+        # GROUP BY. With SELECT * it "remerges" each group summary back onto
+        # every contributing detail row instead of collapsing to one row per
+        # group. Reporting code uses this to retain COUNT while adding a
+        # group-level total such as SUM(COUNT).
+        remerged = self._execute_select_grouped_remerge(
+            sel,
+            df,
+            group_cols,
+            source_columns,
+            return_df=return_df,
+            apply_outobs=apply_outobs,
+        )
+        if remerged is not None:
+            return remerged
 
         # Resolve aggregate columns
         agg_funcs = {}
@@ -1486,11 +1522,228 @@ class SqlExecutor:
         )
         return (result, result_df) if return_df else result
 
+    def _execute_select_grouped_remerge(
+        self,
+        sel: SelectNode,
+        df: pd.DataFrame,
+        group_cols: list[str],
+        source_columns: list[str],
+        *,
+        return_df: bool,
+        apply_outobs: bool,
+    ):
+        """Execute SAS-style detail-column remerge for grouped queries.
+
+        Return ``None`` when the SELECT list is outside this compatibility
+        path so the regular one-row-per-group implementation can handle it.
+        """
+        aggregate_names = {
+            "COUNT", "SUM", "AVG", "MEAN", "MIN", "MAX", "STD", "MEDIAN"
+        }
+        has_star = False
+        has_detail_column = False
+        aggregate_columns: list[tuple[SelectColumnNode, FunctionCallNode, Any]] = []
+        group_expressions = {self._expr_repr(expr) for expr in sel.group_by}
+
+        for column in sel.columns:
+            if not isinstance(column, SelectColumnNode):
+                return None
+            if isinstance(column.expr, VariableNode) and column.expr.name == "*":
+                has_star = True
+                continue
+
+            expression = column.expr
+            fallback = None
+            if (
+                isinstance(expression, FunctionCallNode)
+                and expression.name.upper() == "COALESCE"
+                and expression.args
+                and isinstance(expression.args[0], FunctionCallNode)
+            ):
+                fallback = expression.args[1] if len(expression.args) > 1 else None
+                expression = expression.args[0]
+            if not (
+                isinstance(expression, FunctionCallNode)
+                and expression.name.upper() in aggregate_names
+            ):
+                if (
+                    not isinstance(expression, LiteralNode)
+                    and self._expr_repr(expression) not in group_expressions
+                ):
+                    has_detail_column = True
+                continue
+            aggregate_columns.append((column, expression, fallback))
+
+        if (
+            not aggregate_columns
+            or (not has_star and not has_detail_column)
+            or sel.having_clause is not None
+        ):
+            return None
+
+        working = df.copy()
+        grouped = working.groupby(group_cols, sort=False, dropna=False)
+        aggregate_aliases: dict[int, str] = {}
+
+        for aggregate_index, (column, expression, fallback) in enumerate(aggregate_columns):
+            function_name = expression.name.upper()
+            argument = expression.args[0] if expression.args else None
+            distinct = (
+                isinstance(argument, FunctionCallNode)
+                and argument.name.upper() == "_DISTINCT_"
+                and bool(argument.args)
+            )
+            if distinct:
+                argument = argument.args[0]
+
+            alias = column.alias or function_name
+            aggregate_aliases[id(column)] = alias
+            if (
+                function_name == "COUNT"
+                and isinstance(argument, LiteralNode)
+                and argument.value == "*"
+            ):
+                values = grouped[group_cols[0]].transform("size")
+            else:
+                argument_name = self._expr_to_column_name(argument)
+                actual = self._find_column(df, argument_name) if argument_name else None
+                if actual is None:
+                    # Weak input schemas may not have a physical column.  The
+                    # aggregate still belongs to the CREATE TABLE descriptor
+                    # and materializes as missing instead of disappearing.
+                    if argument_name:
+                        values = pd.Series([None] * len(working), index=working.index)
+                    else:
+                        temp_name = f"__remerge_arg_{aggregate_index}__"
+                        working[temp_name] = self._eval_per_row(
+                            argument,
+                            working,
+                            self._build_col_map(working, False),
+                        )
+                        grouped = working.groupby(
+                            group_cols,
+                            sort=False,
+                            dropna=False,
+                        )
+                        actual = temp_name
+                if actual is None:
+                    working[alias] = values
+                    continue
+                grouped_values = grouped[actual]
+                if distinct:
+                    values = grouped_values.transform("nunique")
+                elif function_name == "COUNT":
+                    values = grouped_values.transform("count")
+                elif function_name == "SUM":
+                    values = grouped_values.transform(
+                        lambda series: series.sum(min_count=1)
+                    )
+                elif function_name in {"AVG", "MEAN"}:
+                    values = grouped_values.transform("mean")
+                elif function_name == "MIN":
+                    values = grouped_values.transform("min")
+                elif function_name == "MAX":
+                    values = grouped_values.transform("max")
+                elif function_name == "STD":
+                    values = grouped_values.transform("std")
+                else:
+                    values = grouped_values.transform("median")
+
+            values = values.reset_index(drop=True)
+            if isinstance(fallback, LiteralNode):
+                values = values.fillna(fallback.value)
+            working[alias] = values
+
+        # Project in SELECT-list order.  In particular, simple detail columns
+        # that are not part of GROUP BY remain present on every contributing
+        # observation, matching SAS's remerge behavior.
+        result_df = pd.DataFrame(index=working.index)
+        working_col_map = self._build_col_map(working, False)
+        for column_index, column in enumerate(sel.columns):
+            if not isinstance(column, SelectColumnNode):
+                continue
+            if isinstance(column.expr, VariableNode) and column.expr.name == "*":
+                for source_column in source_columns:
+                    result_df[source_column] = working[source_column].values
+                continue
+
+            aggregate_alias = aggregate_aliases.get(id(column))
+            if aggregate_alias is not None:
+                result_df[aggregate_alias] = working[aggregate_alias].values
+                continue
+
+            expression_name = self._expr_to_column_name(column.expr)
+            output_name = column.alias or expression_name or f"_COL{column_index + 1}"
+            if "." in output_name:
+                output_name = output_name.split(".", 1)[-1]
+            actual = (
+                self._find_column(working, expression_name)
+                if expression_name
+                else None
+            )
+            if actual is not None:
+                result_df[output_name] = working[actual].values
+            elif isinstance(column.expr, LiteralNode):
+                result_df[output_name] = column.expr.value
+            else:
+                result_df[output_name] = self._eval_per_row(
+                    column.expr,
+                    working,
+                    working_col_map,
+                )
+
+        if sel.distinct:
+            result_df = result_df.drop_duplicates().reset_index(drop=True)
+
+        if sel.order_by:
+            sort_cols: list[str] = []
+            ascending: list[bool] = []
+            for item in sel.order_by:
+                if not isinstance(item, OrderItemNode):
+                    continue
+                name = self._expr_to_column_name(item.expr)
+                actual = self._find_column(result_df, name) if name else None
+                if actual:
+                    sort_cols.append(actual)
+                    ascending.append(item.ascending)
+            if sort_cols:
+                result_df = result_df.sort_values(
+                    by=sort_cols,
+                    ascending=ascending,
+                ).reset_index(drop=True)
+
+        if apply_outobs:
+            result_df = self._apply_outobs(result_df)
+
+        import io
+
+        buf = io.StringIO()
+        buf.write(f"\n{'=' * 60}\n")
+        buf.write(f"  PROC SQL: {len(result_df)} rows selected (remerged)\n")
+        buf.write(f"{'=' * 60}\n\n")
+        display = result_df.copy()
+        display.index = range(1, len(display) + 1)
+        display.index.name = "Obs"
+        buf.write(display.to_string())
+        buf.write("\n")
+        output = buf.getvalue()
+        self.reporter.log(output)
+        self._assign_into_vars(sel, result_df)
+
+        result = StepResult(
+            success=True,
+            rows_affected=len(result_df),
+            notes=[f"PROC SQL: {len(result_df)} rows selected (remerged)."],
+            output_messages=[output],
+        )
+        return (result, result_df) if return_df else result
+
     def _execute_create_table(self, node: CreateTableNode) -> StepResult:
         """CREATE TABLE AS SELECT."""
         if node.select and isinstance(node.select, (SelectNode, SetOperationNode)):
             df = self._select_to_df(node.select)
             out_ds = Dataset.from_dataframe(df, name=node.name, libref=node.libref)
+            out_ds.weak_schema_sources = self._query_weak_schema_sources(node.select)
             # Apply column attributes from SELECT
             if isinstance(node.select, SelectNode):
                 self._apply_col_attrs(out_ds, node.select.columns)
@@ -1502,6 +1755,20 @@ class SqlExecutor:
                 notes=[f"Table {node.libref.upper()}.{node.name.upper()} created with {len(df)} rows."],
             )
         return StepResult(success=True)
+
+    def _query_weak_schema_sources(
+        self,
+        query: SelectNode | SetOperationNode,
+    ) -> tuple[str, ...]:
+        """Collect open source-schema roots used by a SQL query."""
+        if isinstance(query, SetOperationNode):
+            return tuple(dict.fromkeys([
+                *self._query_weak_schema_sources(query.left),
+                *self._query_weak_schema_sources(query.right),
+            ]))
+
+        names = self._select_source_names(query)
+        return self.session.weak_schema_sources_for(names)
 
     def _apply_outobs(self, df: pd.DataFrame) -> pd.DataFrame:
         """Apply the active PROC SQL OUTOBS= cap to a final query result."""

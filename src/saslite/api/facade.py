@@ -35,6 +35,7 @@ from saslite.executor.proc.interval_survival import handle_proc_icphreg, handle_
 from saslite.runtime.execution_result import RunSummary
 from saslite.diagnostics.reporter import Reporter
 from saslite.profiles import CompatibilityProfile, create_profile, load_profile_file
+from saslite.project_config import discover_project_config
 
 
 class SasInterpreter:
@@ -46,6 +47,8 @@ class SasInterpreter:
         profile: Optional environment compatibility profile name or instance
         profile_file: Trusted external Python profile kept outside the package
         profile_root: Explicit project root for the selected profile
+        project_file: Optional ``saslite-project.json`` path. When omitted,
+            the file is discovered under ``profile_root``.
 
     Example:
         >>> # Use default sas7bdat format
@@ -65,9 +68,14 @@ class SasInterpreter:
         profile: str | CompatibilityProfile | None = None,
         profile_file: str | Path | None = None,
         profile_root: str | None = None,
+        project_file: str | Path | None = None,
     ) -> None:
         self._parser = ProgramParser()
         self._session = Session(StorageRouter(work_dir, sas_format=sas_format))
+        self._session.configure_project(discover_project_config(
+            explicit=project_file,
+            project_root=profile_root,
+        ))
         # Macro functions such as OPEN/VARNUM inspect datasets in this same
         # session.  Keep one expander for the interpreter lifetime so dataset
         # handles remain valid across separately executed source chunks.
@@ -101,7 +109,51 @@ class SasInterpreter:
         include_encoding: str = "utf-8",
         include_errors: str = "strict",
     ) -> RunSummary:
-        """Execute SAS source code."""
+        """Execute SAS source and report weak-schema assumptions once."""
+        self._session.clear_schema_expectations()
+        summary = self._execute_source(
+            source,
+            source_name=source_name,
+            include_encoding=include_encoding,
+            include_errors=include_errors,
+        )
+        expectations = self._session.schema_expectations
+        if expectations:
+            lines = ["Expected source variables (weak schema):"]
+            for expectation in expectations:
+                if len(expectation.sources) == 1:
+                    label = f"{expectation.sources[0]}.{expectation.variable}"
+                else:
+                    label = (
+                        f"{expectation.variable} in one of "
+                        f"{', '.join(expectation.sources)}"
+                    )
+                contexts = ", ".join(expectation.contexts)
+                lines.append(f"  {label} ({contexts})")
+            count = len(expectations)
+            noun = "variable was" if count == 1 else "variables were"
+            lines.append("")
+            if self._session.has_strict_schema_policy:
+                lines.append(
+                    f"Schema validation: mixed; {count} source {noun} "
+                    "assumed from weak libraries."
+                )
+            else:
+                lines.append(
+                    f"Validation level: weak; {count} source {noun} assumed."
+                )
+            self._reporter.schema_summary("\n".join(lines))
+        return summary
+
+    def _execute_source(
+        self,
+        source: str,
+        source_name: str = "<input>",
+        *,
+        include_encoding: str = "utf-8",
+        include_errors: str = "strict",
+    ) -> RunSummary:
+        """Execute SAS source code without resetting or reporting schema state."""
         original_source = source
         try:
             if self._profile is not None:
@@ -185,7 +237,14 @@ class SasInterpreter:
                 and self._has_later_runtime_macro_reference(chunk)
             ):
                 self._sync_runtime_macro_values()
-                expanded_chunk = self._macro.expand(chunk)
+                try:
+                    expanded_chunk = self._macro.expand(chunk)
+                except Exception as exc:
+                    message = self._format_exception(exc)
+                    self._reporter.error(message)
+                    combined.success = False
+                    combined.error = message
+                    break
                 for line in self._macro.put_output:
                     self._reporter.log(line)
                 self._macro.put_output.clear()
@@ -287,6 +346,17 @@ class SasInterpreter:
     def _has_later_runtime_macro_reference(cls, source: str) -> bool:
         """Return whether a runtime-assigned macro variable is used later."""
         if cls._has_later_sql_into_reference(source):
+            return True
+
+        sql_step = re.search(r"\bPROC\s+SQL\b", source, flags=re.IGNORECASE)
+        if sql_step is not None and re.search(
+            r"&SQLOBS(?:\.|\b)",
+            source[sql_step.end():],
+            flags=re.IGNORECASE,
+        ):
+            return True
+
+        if re.search(r"&SYSNOBS(?:\.|\b)", source, flags=re.IGNORECASE):
             return True
 
         symput = re.compile(
@@ -498,6 +568,7 @@ class SasInterpreter:
         """Create a dataset from a pandas DataFrame."""
         from saslite.runtime.dataset import Dataset
         ds = Dataset.from_dataframe(df, name=name, libref=libref)
+        ds.weak_schema_sources = (f"{libref.upper()}.{name.upper()}",)
         self._session.put_dataset(libref, name, ds)
 
     def get_dataset(self, libref: str, name: str) -> pd.DataFrame:

@@ -268,6 +268,58 @@ class SqlIntoTests(unittest.TestCase):
         self.assertTrue(result.success, result.error)
         self.assertEqual(sas.get_dataset("WORK", "RESULT").iloc[0]["value"], 2)
 
+    def test_runtime_value_drives_single_statement_macro_conditional(self) -> None:
+        sas = SasInterpreter()
+        sas.create_dataset("source", pd.DataFrame({"choice": [2]}))
+
+        result = sas.execute(
+            """
+            %macro choose;
+              %local selected result_value;
+              data _null_;
+                set source;
+                call symputx("selected", choice);
+              run;
+
+              %if &selected. = 2 %then %let result_value=2;
+              data result;
+                value=&result_value.;
+              run;
+            %mend;
+            %choose;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas.get_dataset("WORK", "RESULT").iloc[0]["value"], 2)
+
+    def test_sqlobs_drives_later_macro_conditional(self) -> None:
+        sas = SasInterpreter()
+        sas.create_dataset(
+            "source",
+            pd.DataFrame({"group": ["A", "A", "B"]}),
+        )
+
+        result = sas.execute(
+            """
+            proc sql noprint;
+              select distinct group into :groups separated by ","
+              from source;
+              %let group_count=&sqlobs;
+            quit;
+
+            %if &group_count=2 %then %do;
+              data result;
+                value=&group_count;
+              run;
+            %end;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas.session.get_macro_var("SQLOBS"), "2")
+        self.assertEqual(sas.get_dataset("WORK", "RESULT").iloc[0]["value"], 2)
+
     def test_create_table_accepts_union_all_query(self) -> None:
         sas = SasInterpreter()
         sas.create_dataset(
@@ -449,6 +501,38 @@ class SqlIntoTests(unittest.TestCase):
                 {"key": "status_key", "value": "Eligible", "arm": 1,
                  "denominator": 1, "responders": 1},
             ],
+        )
+
+    def test_grouped_select_star_remerges_sum_onto_detail_rows(self) -> None:
+        sas = SasInterpreter()
+        sas.create_dataset(
+            "frequencies",
+            pd.DataFrame(
+                {
+                    "group": ["A", "A", "B"],
+                    "level": [1, 2, 1],
+                    "count": [3, 2, 4],
+                }
+            ),
+        )
+
+        result = sas.execute(
+            """
+            proc sql;
+              create table totals as
+              select *, sum(count) as total_count
+              from frequencies
+              group by group
+              order by group, level;
+            quit;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "TOTALS")
+        self.assertEqual(
+            frame[["group", "level", "count", "total_count"]].values.tolist(),
+            [["A", 1, 3, 5], ["A", 2, 2, 5], ["B", 1, 4, 4]],
         )
 
     def test_into_numbered_range_assigns_rows_to_macro_variables(self) -> None:

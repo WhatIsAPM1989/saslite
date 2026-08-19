@@ -122,7 +122,7 @@ stop_stmt: "STOP"i
 set_stmt: "SET"i (dataset_ref)+ ("END"i "=" NAME)?
 merge_stmt: "MERGE"i (dataset_ref)+
 by_stmt: "BY"i ("DESCENDING"i)? NAME (("DESCENDING"i)? NAME)*
-array_stmt: "ARRAY"i NAME "[" (NUMBER | "*") "]" ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
+array_stmt: "ARRAY"i NAME ("[" (NUMBER | "*") "]" | "{" (NUMBER | "*") "}") ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
 infile_stmt: "INFILE"i (NAME | STRING) (infile_option)*
 infile_option: NAME ("=" (STRING | NAME | NUMBER))?
 input_stmt: "INPUT"i (input_var)* ("$")?
@@ -143,7 +143,7 @@ dataset_option: "KEEP"i "=" name_list
               | "OBS"i "=" NUMBER
 
 assign_stmt: NAME "=" expr
-arr_assign_stmt: NAME "[" expr "]" "=" expr
+arr_assign_stmt: NAME ("[" expr "]" | "{" expr "}") "=" expr
 sum_stmt: NAME "+" expr
 
 if_stmt: IF_KW expr THEN_KW data_stmt (ELSE_KW data_stmt)?
@@ -190,7 +190,10 @@ attr_tag: "FORMAT"i "="? format_spec | "LABEL"i "="? STRING | "LENGTH"i "="? NUM
 format_spec: "$"? NAME ("." NUMBER?)? | "$"? NUMBER ("." NUMBER?)?
 
 put_stmt: "PUT"i (put_item)+
-put_item: STRING | NAME | put_format
+put_item: STRING -> put_string
+        | NAME "=" -> put_named
+        | NAME -> put_variable
+        | put_format
 put_format: NAME ("." NUMBER?)?
 
 call_stmt: "CALL"i NAME "(" expr_list ")"
@@ -263,7 +266,10 @@ delete_sql_stmt: "DELETE"i "FROM"i qualified_name where_clause?
 
 // ─── PROC PRINT ───────────────────────────────────
 
-proc_print: "PROC"i "PRINT"i ("DATA"i "=" qualified_name)? ";" (print_stmt)* ("RUN"i ";")?
+proc_print: "PROC"i "PRINT"i (print_opt)* ";" (print_stmt)* ("RUN"i ";")?
+
+print_opt: "DATA"i "=" qualified_name
+         | "NOOBS"i
 
 print_stmt: "VAR"i name_list ";"
           | "ID"i name_list ";"
@@ -331,7 +337,8 @@ means_output_kv: NAME "=" NAME
 proc_freq: "PROC"i "FREQ"i (freq_opt)* ";" freq_body ("RUN"i ";")?
 
 freq_opt: "DATA"i "=" dataset_ref -> freq_opt_data
-        | "OUT"i "=" qualified_name -> freq_opt_out
+        | "OUT"i "=" dataset_ref -> freq_opt_out
+        | "ORDER"i "=" NAME -> freq_opt_named
         | "NOPRINT"i -> freq_opt_flag
         | "NOROW"i -> freq_opt_flag
         | "NOCOL"i -> freq_opt_flag
@@ -767,7 +774,7 @@ window_spec: ("PARTITION"i "BY"i window_name_list)? ("ORDER"i "BY"i window_order
 window_name_list: NAME ("," NAME)*
 window_order_item: NAME ("ASC"i | "DESC"i)?
 
-arr_ref: NAME "[" or_expr "]"
+arr_ref: NAME ("[" or_expr "]" | "{" or_expr "}")
 
 case_expr: "CASE"i expr? (case_when)+ ("ELSE"i expr)? "END"i
 case_when: "WHEN"i expr "THEN"i expr
@@ -778,7 +785,7 @@ in_expr_list: expr ((",")? expr)*
 func_args: func_arg ("," func_arg)*
 func_arg: "*" -> star_arg
         | "DISTINCT"i expr -> distinct_arg
-        | "OF"i NAME "[" "*" "]" -> of_array_arg
+        | "OF"i NAME ("[" "*" "]" | "{" "*" "}") -> of_array_arg
         | "??" function_format -> suppress_notes_format_arg
         | function_format -> format_arg
         | expr -> expr_arg

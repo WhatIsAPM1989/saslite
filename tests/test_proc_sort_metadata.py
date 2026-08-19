@@ -71,6 +71,31 @@ run;
         frame = sas.get_dataset("WORK", "SORTED")
         self.assertEqual(frame["UNRELATED"].tolist(), [7.0, 8.0, 9.0])
 
+    def test_out_drop_option_removes_column_and_metadata(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data source;
+  length secret $12;
+  id=2; secret="hidden"; output;
+  id=1; secret="removed"; output;
+run;
+proc sort data=source out=sorted(drop=secret);
+  by id;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        source = sas.get_dataset("WORK", "SOURCE")
+        sorted_frame = sas.get_dataset("WORK", "SORTED")
+        sorted_dataset = sas.session.get_dataset("WORK", "SORTED")
+        self.assertEqual({column.upper() for column in source.columns}, {"ID", "SECRET"})
+        self.assertEqual([column.upper() for column in sorted_frame.columns], ["ID"])
+        id_column = next(column for column in sorted_frame.columns if column.upper() == "ID")
+        self.assertEqual(sorted_frame[id_column].tolist(), [1, 2])
+        self.assertIsNone(sorted_dataset.metadata.get_variable("SECRET"))
+
 
 if __name__ == "__main__":
     unittest.main()

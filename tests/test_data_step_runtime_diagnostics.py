@@ -102,8 +102,8 @@ run;
             for warning in warnings
         ))
 
-    def test_repeated_diagnostic_is_aggregated(self) -> None:
-        _, result, _ = self._run(
+    def test_repeated_missing_generated_work_reference_warns_once(self) -> None:
+        sas, result, _ = self._run(
             """
 data source;
   input id;
@@ -121,11 +121,19 @@ run;
         )
 
         self.assertTrue(result.success, result.error)
-        warning = next(
-            w for w in result.steps[-1].warnings
-            if "Variable never_initialized is uninitialized" in w
+        warnings = result.steps[-1].warnings
+        self.assertEqual(
+            sum(
+                "NEVER_INITIALIZED" in warning.upper()
+                for warning in warnings
+            ),
+            1,
         )
-        self.assertIn("occurred 3 times", warning)
+        self.assertTrue(any(
+            "operator +" in warning and "occurred 3 times" in warning
+            for warning in warnings
+        ))
+        self.assertFalse(sas.session.schema_expectations)
 
     def test_conditionally_assigned_variable_is_not_called_uninitialized(self) -> None:
         _, result, _ = self._run(

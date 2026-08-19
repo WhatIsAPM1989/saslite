@@ -153,6 +153,11 @@ class Reporter:
         """Print an explicit successful-run marker, including in quiet mode."""
         self._print_line(f"SUCCESS: {message}")
 
+    def schema_summary(self, message: str) -> None:
+        """Print a schema-audit summary, including in quiet mode."""
+        for line in message.splitlines():
+            self._print_line(line)
+
     def log(self, message: str) -> None:
         lines = message.splitlines()
         if self.quiet:

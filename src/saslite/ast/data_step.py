@@ -212,6 +212,7 @@ class PutItemNode(Node):
     """A single item in a PUT list: variable, literal, or formatting."""
     expr: Any = None
     format_spec: str = ""
+    show_name: bool = False
 
 
 @dataclass

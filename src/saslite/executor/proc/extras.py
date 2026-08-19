@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import io
 import math
+import numbers
+import re
 from typing import Any
 
 import pandas as pd
@@ -75,6 +77,27 @@ def _col_map(df: pd.DataFrame) -> dict[str, str]:
     return {c.upper(): c for c in df.columns}
 
 
+def _transpose_id_component(value: Any) -> str:
+    """Render one PROC TRANSPOSE ID value using SAS-like numeric spelling."""
+    if pd.isna(value):
+        return ""
+    if isinstance(value, numbers.Real) and not isinstance(value, bool):
+        numeric = float(value)
+        if numeric.is_integer():
+            return str(int(numeric))
+        return format(numeric, ".12g")
+    return str(value).strip()
+
+
+def _transpose_id_name(values: list[Any]) -> str:
+    """Build a valid SAS variable name from one or more ID values."""
+    raw_name = "".join(_transpose_id_component(value) for value in values)
+    name = re.sub(r"[^A-Za-z0-9_]", "_", raw_name)
+    if not name or not re.match(r"[A-Za-z_]", name[0]):
+        name = f"_{name}"
+    return name[:32].upper()
+
+
 # ─── PROC TRANSPOSE ────────────────────────────────────
 
 
@@ -116,7 +139,7 @@ def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) 
     if not var_cols:
         return StepResult(success=False, error="PROC TRANSPOSE: no variables to transpose")
 
-    id_col = cmap.get(id_names[0]) if id_names else None
+    id_cols = [cmap[name] for name in id_names if name in cmap]
     by_cols = [cmap[b] for b in by_names if b in cmap]
 
     def _transpose_block(block: pd.DataFrame) -> pd.DataFrame:
@@ -127,10 +150,10 @@ def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) 
             if label_col:
                 metadata = ds.metadata.get_variable(str(vc))
                 row[label_col] = metadata.label if metadata and metadata.label else vc
-            if id_col is not None:
+            if id_cols:
                 for _, src in block.iterrows():
-                    col_label = str(src[id_col])
-                    row[col_label.upper()] = src[vc]
+                    col_label = _transpose_id_name([src[column] for column in id_cols])
+                    row[col_label] = src[vc]
             else:
                 for j, (_, src) in enumerate(block.iterrows(), 1):
                     row[f"{prefix}{j}".upper()] = src[vc]

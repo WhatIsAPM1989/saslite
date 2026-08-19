@@ -49,7 +49,14 @@ def handle_proc_print(proc: ProcNode, session: Session, reporter: Reporter) -> S
     """PROC PRINT — display dataset contents."""
     data_name = proc.options.get("DATA", "")
     if not data_name:
-        return StepResult(success=False, error="PROC PRINT requires DATA=")
+        data_name = session.get_macro_var("SYSLAST") or ""
+    if not data_name:
+        return StepResult(
+            success=False,
+            error="PROC PRINT has no DATA= and no previously created dataset",
+        )
+
+    noobs = bool(proc.options.get("NOOBS", False))
 
     try:
         if "." in data_name:
@@ -123,9 +130,12 @@ def handle_proc_print(proc: ProcNode, session: Session, reporter: Reporter) -> S
 
                 # Print group rows
                 group_display = group_df.drop(columns=actual_by, errors="ignore").copy()
-                group_display.index = range(obs_num, obs_num + len(group_display))
-                group_display.index.name = "Obs"
-                buf.write(group_display.to_string())
+                if noobs:
+                    buf.write(group_display.to_string(index=False))
+                else:
+                    group_display.index = range(obs_num, obs_num + len(group_display))
+                    group_display.index.name = "Obs"
+                    buf.write(group_display.to_string())
                 buf.write("\n")
                 obs_num += len(group_display)
 
@@ -147,9 +157,9 @@ def handle_proc_print(proc: ProcNode, session: Session, reporter: Reporter) -> S
                     buf.write(f"    {sv} = {total}\n")
         else:
             # BY vars not found in data
-            _print_plain(buf, display_df, sum_vars)
+            _print_plain(buf, display_df, sum_vars, noobs=noobs)
     else:
-        _print_plain(buf, display_df, sum_vars)
+        _print_plain(buf, display_df, sum_vars, noobs=noobs)
 
     output = buf.getvalue()
     reporter.log(output)
@@ -162,12 +172,21 @@ def handle_proc_print(proc: ProcNode, session: Session, reporter: Reporter) -> S
     )
 
 
-def _print_plain(buf: io.StringIO, display_df: pd.DataFrame, sum_vars: list[str]) -> None:
+def _print_plain(
+    buf: io.StringIO,
+    display_df: pd.DataFrame,
+    sum_vars: list[str],
+    *,
+    noobs: bool = False,
+) -> None:
     """Print dataframe with optional SUM totals."""
     display = display_df.copy()
-    display.index = range(1, len(display) + 1)
-    display.index.name = "Obs"
-    buf.write(display.to_string())
+    if noobs:
+        buf.write(display.to_string(index=False))
+    else:
+        display.index = range(1, len(display) + 1)
+        display.index.name = "Obs"
+        buf.write(display.to_string())
     buf.write("\n")
 
     # SUM totals
@@ -348,9 +367,12 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
         sorted_df = sorted_df.drop(columns="__sas_sort_ord__")
 
     # Resolve output libref and name
+    out_options: list[Any] = []
     if isinstance(out_ref, DatasetRefNode):
         out_libref = out_ref.libref
         out_member = out_ref.name
+        if "OUT" in proc.options:
+            out_options = out_ref.options
     elif isinstance(out_ref, str):
         if "." in out_ref:
             parts = out_ref.split(".", 1)
@@ -368,7 +390,13 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
     output_metadata.member_name = out_member.upper()
     output_metadata.row_count = len(sorted_df)
     output_metadata.sort_keys = [str(name) for name in resolved_by]
-    out_ds = Dataset(name=out_member, data=sorted_df, metadata=output_metadata)
+    out_ds = Dataset(
+        name=out_member,
+        data=sorted_df,
+        metadata=output_metadata,
+        weak_schema_sources=working_ds.weak_schema_sources,
+    )
+    out_ds = _apply_export_dataset_options(out_ds, out_options, session)
     session.put_dataset(out_libref, out_member, out_ds)
 
     return StepResult(
@@ -647,14 +675,41 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
 
     # Collect FreqTableSpec from statements
     table_specs: list[FreqTableSpec] = []
+    by_names: list[str] = []
     for stmt in proc.statements:
         if isinstance(stmt, list):
             table_specs.extend([s for s in stmt if isinstance(s, FreqTableSpec)])
         elif isinstance(stmt, FreqTableSpec):
             table_specs.append(stmt)
+        elif isinstance(stmt, ByNode):
+            by_names = stmt.variables
 
     if not table_specs:
         return StepResult(success=False, error="PROC FREQ requires TABLES statement")
+
+    order = str(proc.options.get("ORDER", "INTERNAL")).upper()
+    if order not in {"DATA", "FORMATTED", "FREQ", "INTERNAL"}:
+        return StepResult(
+            success=False,
+            error=f"PROC FREQ ORDER={order} is not supported",
+        )
+
+    by_resolved: list[str] = []
+    for name in by_names:
+        actual = col_map.get(name.upper())
+        if actual is None:
+            return StepResult(
+                success=False,
+                error=f"BY variable {name} not found in dataset",
+            )
+        by_resolved.append(actual)
+
+    if by_resolved:
+        grouped_data = list(
+            ds.data.groupby(by_resolved, sort=False, dropna=False)
+        )
+    else:
+        grouped_data = [((), ds.data)]
 
     for spec in table_specs:
         # Resolve variable names (case-insensitive)
@@ -675,32 +730,87 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
         show_col = not opts.get("NOCOL", False)
         show_pct = not opts.get("NOPERCENT", False)
 
-        if len(vars_resolved) == 1:
-            _freq_one_way(buf, ds.data, vars_resolved[0], include_missing)
-        else:
-            _freq_crosstab(buf, ds.data, vars_resolved, include_missing,
-                           show_row, show_col, show_pct)
+        for group_key, block in grouped_data:
+            if by_resolved:
+                key_values = group_key if isinstance(group_key, tuple) else (group_key,)
+                description = ", ".join(
+                    f"{name}={_fmt_freq_val(value)}"
+                    for name, value in zip(by_resolved, key_values)
+                )
+                buf.write(f"\n  BY {description}\n")
 
-        out_name = opts.get("OUT", "")
-        if out_name:
-            frequency = (
-                ds.data[vars_resolved]
-                .value_counts(dropna=not include_missing, sort=False)
-                .rename("COUNT")
-                .reset_index()
-            )
-            total = frequency["COUNT"].sum()
-            frequency["PERCENT"] = (
-                frequency["COUNT"] / total * 100 if total else 0.0
-            )
-            if "." in out_name:
-                out_libref, out_member = out_name.split(".", 1)
+            if len(vars_resolved) == 1:
+                _freq_one_way(
+                    buf,
+                    block,
+                    vars_resolved[0],
+                    include_missing,
+                    order=order,
+                )
             else:
-                out_libref, out_member = "WORK", out_name
+                _freq_crosstab(
+                    buf,
+                    block,
+                    vars_resolved,
+                    include_missing,
+                    show_row,
+                    show_col,
+                    show_pct,
+                )
+
+        out_ref = opts.get("OUT", "")
+        if out_ref:
+            output_parts: list[pd.DataFrame] = []
+            for group_key, block in grouped_data:
+                frequency = (
+                    block[vars_resolved]
+                    .value_counts(
+                        dropna=not include_missing,
+                        sort=order == "FREQ",
+                    )
+                    .rename("COUNT")
+                    .reset_index()
+                )
+                total = frequency["COUNT"].sum()
+                frequency["PERCENT"] = (
+                    frequency["COUNT"] / total * 100 if total else 0.0
+                )
+                if by_resolved:
+                    key_values = (
+                        group_key if isinstance(group_key, tuple) else (group_key,)
+                    )
+                    for position, (name, value) in enumerate(
+                        zip(by_resolved, key_values)
+                    ):
+                        if name not in frequency.columns:
+                            frequency.insert(position, name, value)
+                output_parts.append(frequency)
+
+            frequency = (
+                pd.concat(output_parts, ignore_index=True)
+                if output_parts
+                else pd.DataFrame(columns=[*by_resolved, *vars_resolved, "COUNT", "PERCENT"])
+            )
+            if isinstance(out_ref, DatasetRefNode):
+                out_libref = out_ref.libref
+                out_member = out_ref.name
+                out_options = out_ref.options
+            else:
+                out_name = str(out_ref)
+                if "." in out_name:
+                    out_libref, out_member = out_name.split(".", 1)
+                else:
+                    out_libref, out_member = "WORK", out_name
+                out_options = []
             out_ds = Dataset.from_dataframe(
                 frequency,
                 name=out_member,
                 libref=out_libref,
+            )
+            out_ds = _apply_export_dataset_options(
+                out_ds,
+                out_options,
+                session,
             )
             session.put_dataset(out_libref, out_member, out_ds)
 
@@ -711,12 +821,21 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
 
 
 def _freq_one_way(buf: io.StringIO, df: pd.DataFrame, var_name: str,
-                  include_missing: bool) -> None:
+                  include_missing: bool, *, order: str = "INTERNAL") -> None:
     """Write a one-way frequency table."""
     if include_missing:
-        freq = df[var_name].value_counts(dropna=False).sort_index()
+        values = df[var_name]
     else:
-        freq = df[var_name].dropna().value_counts().sort_index()
+        values = df[var_name].dropna()
+
+    if order == "FREQ":
+        freq = values.value_counts(dropna=not include_missing, sort=True)
+    elif order == "DATA":
+        freq = values.value_counts(dropna=not include_missing, sort=False)
+    else:
+        # FORMATTED currently has the same ordering as INTERNAL because
+        # PROC FREQ display formatting is not applied to level comparison.
+        freq = values.value_counts(dropna=not include_missing).sort_index()
 
     total = freq.sum()
     cum_freq = 0
@@ -864,10 +983,12 @@ def handle_proc_append(proc: ProcNode, session: Session, reporter: Reporter) -> 
     # Align columns — use base columns
     base_cols = list(base_ds.data.columns)
     data_df = data_ds.data.copy()
+    data_cols = {str(col).upper(): col for col in data_df.columns}
+    aligned_data = pd.DataFrame(index=data_df.index)
     for col in base_cols:
-        if col not in data_df.columns:
-            data_df[col] = None
-    data_df = data_df[[c for c in base_cols if c in data_df.columns]]
+        source_col = data_cols.get(str(col).upper())
+        aligned_data[col] = data_df[source_col] if source_col is not None else None
+    data_df = aligned_data
 
     new_df = pd.concat([base_ds.data, data_df], ignore_index=True)
     out_ds = Dataset.from_dataframe(new_df, name=base_ds.metadata.member_name,

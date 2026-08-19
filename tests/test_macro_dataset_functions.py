@@ -73,6 +73,15 @@ class MacroDatasetFunctionTests(unittest.TestCase):
             "ONE=1 TWO=1 OPTIONS=1 MISSING=0\n",
         )
 
+    def test_libref_reports_assigned_and_unassigned_libraries(self) -> None:
+        result = self.sas.execute(
+            "%put WORK=%sysfunc(libref(work)) "
+            "MISSING=%sysfunc(libref(does_not_exist));"
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(self.log.getvalue(), "WORK=0 MISSING=1\n")
+
     def test_data_step_exist_uses_the_same_session_datasets(self) -> None:
         result = self.sas.execute(
             """

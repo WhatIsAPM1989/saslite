@@ -38,6 +38,84 @@ run;
         self.assertEqual(frame["COUNT"].tolist(), [2, 1, 1])
         self.assertAlmostEqual(frame["PERCENT"].sum(), 100.0)
 
+    def test_proc_freq_order_freq_sorts_output_by_descending_count(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data responses;
+  input category;
+  datalines;
+1
+2
+2
+2
+3
+3
+;
+run;
+proc freq data=responses order=freq noprint;
+  tables category / out=ordered;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "ORDERED")
+        self.assertEqual(frame["CATEGORY"].tolist(), [2, 3, 1])
+        self.assertEqual(frame["COUNT"].tolist(), [3, 2, 1])
+
+    def test_proc_freq_out_accepts_drop_dataset_option(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data responses;
+  input category;
+  datalines;
+1
+1
+2
+;
+run;
+proc freq data=responses noprint;
+  tables category / out=counts(drop=percent);
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "COUNTS")
+        self.assertEqual(list(frame.columns), ["CATEGORY", "COUNT"])
+
+    def test_proc_freq_by_groups_counts_and_keeps_by_variable(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data responses;
+  input treatment category;
+  datalines;
+1 10
+1 10
+1 20
+2 10
+2 20
+2 20
+2 20
+;
+run;
+proc freq data=responses order=freq noprint;
+  by treatment;
+  tables category / out=counts(drop=percent);
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "COUNTS")
+        self.assertEqual(
+            frame[["TREATMENT", "CATEGORY", "COUNT"]].values.tolist(),
+            [[1, 10, 2], [1, 20, 1], [2, 20, 3], [2, 10, 1]],
+        )
+
     def test_standalone_run_after_quit_is_a_noop(self) -> None:
         sas = SasInterpreter()
         result = sas.execute(
@@ -170,6 +248,55 @@ quit;
         variable = dataset.metadata.get_variable("text")
         self.assertEqual(variable.length, 200)
         self.assertEqual(variable.label, "Display value")
+
+    def test_quoted_macro_argument_remains_literal_before_sql_length(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data source;
+  arm=1;
+run;
+%macro counts(order=, heading=);
+  proc sql;
+    create table result as
+    select arm, &order as groupn,
+           &heading as group_label length=200
+    from source;
+  quit;
+%mend;
+%counts(order=3, heading="Weight group (kg) at baseline");
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        dataset = sas.session.get_dataset("WORK", "RESULT")
+        self.assertEqual(
+            dataset.data["group_label"].tolist(),
+            ["Weight group (kg) at baseline"],
+        )
+        self.assertEqual(
+            dataset.metadata.get_variable("group_label").length,
+            200,
+        )
+
+    def test_put_and_input_accept_numeric_w_d_format_argument(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data result;
+  length rendered $5;
+  count=1;
+  total=3;
+  rendered=put((count/total)*100, 5.1);
+  percentage=input(rendered, 5.1);
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "RESULT")
+        self.assertEqual(frame["rendered"].iloc[0], " 33.3")
+        self.assertAlmostEqual(frame["percentage"].iloc[0], 33.3)
 
 
 if __name__ == "__main__":

@@ -78,6 +78,53 @@ run;
         self.assertEqual(frame["USUBJID"].tolist(), ["01", "02"])
         self.assertEqual(frame["D_NEOADJ"].tolist(), [4, 2])
 
+    def test_numeric_and_multiple_id_values_form_sas_variable_names(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data source;
+  input symptom $ trt _name_ $ value;
+  datalines;
+A 1 pcnt 10
+A 1 count 2
+A 2 pcnt 20
+A 2 count 4
+;
+run;
+
+data numeric_source;
+  input symptom $ trt value;
+  datalines;
+A 1 10
+A 2 20
+;
+run;
+
+proc transpose data=source out=wide;
+  by symptom;
+  id trt _name_;
+  var value;
+run;
+
+proc transpose data=numeric_source out=numeric_ids;
+  by symptom;
+  id trt;
+  var value;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        wide = sas.get_dataset("WORK", "WIDE")
+        self.assertEqual(
+            [column.upper() for column in wide.columns],
+            ["SYMPTOM", "_NAME_", "_1PCNT", "_1COUNT", "_2PCNT", "_2COUNT"],
+        )
+        self.assertEqual(wide[["_1PCNT", "_1COUNT", "_2PCNT", "_2COUNT"]].iloc[0].tolist(), [10, 2, 20, 4])
+        numeric_ids = sas.get_dataset("WORK", "NUMERIC_IDS")
+        self.assertIn("_1", {column.upper() for column in numeric_ids.columns})
+        self.assertIn("_2", {column.upper() for column in numeric_ids.columns})
+
 
 if __name__ == "__main__":
     unittest.main()
