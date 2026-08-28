@@ -1468,6 +1468,28 @@ class SqlExecutor:
             if not isinstance(col_node, SelectColumnNode):
                 continue
             name = col_node.alias or self._expr_to_column_name(col_node.expr) or ""
+            # An unaliased grouped aggregate is materialized under its input
+            # column name above (for example MAX(MONTH) becomes MONTH).  The
+            # function expression itself has no direct column name, so recover
+            # the simple aggregate argument here.  Otherwise reset_index()
+            # leaves GROUP BY columns first and positional consumers such as
+            # SELECT INTO can receive values in a different order than the
+            # original SELECT list.
+            if (
+                not name
+                and isinstance(col_node.expr, FunctionCallNode)
+                and col_node.expr.name.upper()
+                in ("COUNT", "SUM", "AVG", "MEAN", "MIN", "MAX", "STD", "MEDIAN")
+                and col_node.expr.args
+            ):
+                aggregate_arg = col_node.expr.args[0]
+                if (
+                    isinstance(aggregate_arg, FunctionCallNode)
+                    and aggregate_arg.name.upper() == "_DISTINCT_"
+                    and aggregate_arg.args
+                ):
+                    aggregate_arg = aggregate_arg.args[0]
+                name = self._expr_to_column_name(aggregate_arg) or ""
             if "." in name:
                 name = name.split(".", 1)[-1]
             actual = self._find_column(result_df, name) if name else None

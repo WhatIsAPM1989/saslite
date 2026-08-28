@@ -348,6 +348,8 @@ SASLite includes support for:
 ### Other Procedures
 - **PROC SORT**: Multi-key sorting with `BY`, `DESCENDING`, `NODUPKEY`
 - **PROC PRINT**: Data display with `VAR`, `WHERE`, `BY`
+- **PROC REPORT**: `COLUMN`/`DEFINE`, grouping and analysis columns, `OUT=`,
+  plus file output through `ODS RTF FILE=` and `ODS LISTING FILE=`
 - **PROC CONTENTS**: Dataset metadata
 - **PROC DATASETS**: Library management, dataset operations
 - **PROC APPEND**: Append datasets
@@ -478,9 +480,10 @@ environment-specific SAS features are not currently supported:
 - Advanced macro features (MACRO PROC, compiled macros)
 - Remote libraries and server integration
 - Complete format/informat catalog system
-- ODS (Output Delivery System)
+- Complete ODS styling and destination catalog (RTF/LISTING for PROC REPORT
+  and ODS OUTPUT datasets for supported statistical procedures are available)
 - Graphics procedures (SGPLOT, GPLOT, etc.)
-- Some specialized PROCs (IML, REPORT, TABULATE, etc.)
+- Some specialized PROCs (for example IML)
 - BY-group processing in all contexts
 - Full index support
 - Hash objects and data structures

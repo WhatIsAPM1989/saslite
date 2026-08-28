@@ -102,6 +102,34 @@ class SqlIntoTests(unittest.TestCase):
         self.assertEqual(sas.session.get_macro_var("first_group"), "A")
         self.assertEqual(sas.session.get_macro_var("first_count"), "2")
 
+    def test_unaliased_grouped_aggregate_keeps_select_order_for_into(self) -> None:
+        sas = SasInterpreter()
+        sas.create_dataset(
+            "longitudinal",
+            pd.DataFrame(
+                {
+                    "patient_id": ["P001", "P001", "P002"],
+                    "month": [0, 6, 3],
+                }
+            ),
+        )
+
+        result = sas.execute(
+            """
+            proc sql noprint;
+              select max(month), patient_id
+                into :maxtime trimmed, :patient trimmed
+              from longitudinal
+              group by patient_id
+              order by patient_id;
+            quit;
+            """
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas.session.get_macro_var("maxtime"), "6")
+        self.assertEqual(sas.session.get_macro_var("patient"), "P001")
+
     def test_separated_by_collects_all_ordered_rows_for_each_target(self) -> None:
         sas = SasInterpreter()
         sas.create_dataset(

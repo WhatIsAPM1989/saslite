@@ -180,7 +180,31 @@ class SasTransformer(Transformer):
         return ProcNode(proc_name="ODS", options={"ACTION": "OUTPUT_CLOSE"})
 
     def ods_control(self, items: list[Any]) -> ProcNode:
-        return ProcNode(proc_name="ODS", options={"ACTION": "CONTROL"})
+        parts = [
+            item for item in items
+            if isinstance(item, str) and not isinstance(item, Token)
+        ]
+        destination = parts[0].upper() if parts else ""
+        values = parts[1:]
+        options: dict[str, Any] = {
+            "ACTION": "CONTROL",
+            "DESTINATION": destination,
+        }
+        position = 0
+        while position < len(values):
+            key = values[position].upper()
+            if key == "=":
+                position += 1
+                continue
+            if position + 1 < len(values) and values[position + 1] == "=":
+                value_position = position + 2
+                if value_position < len(values):
+                    options[key] = _clean_token_value(values[value_position])
+                    position = value_position + 1
+                    continue
+            options[key] = True
+            position += 1
+        return ProcNode(proc_name="ODS", options=options)
 
     def ods_control_name(self, items: list[Any]) -> str:
         return _get_text(items[0]).upper() if items else ""

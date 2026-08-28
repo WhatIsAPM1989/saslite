@@ -47,8 +47,8 @@ ods_stmt: "ODS"i "OUTPUT"i "CLOSE"i ";" -> ods_output_close
         | "ODS"i ods_control_name ods_control_value* ";" -> ods_control
 
 ods_output_item: NAME "=" dataset_ref
-ods_control_name: "EXCLUDE"i | "SELECT"i | "GRAPHICS"i | "LISTING"i
-ods_control_value: NAME | NUMBER | "="
+ods_control_name: "EXCLUDE"i | "SELECT"i | "GRAPHICS"i | "LISTING"i | "RTF"i
+ods_control_value: NAME | NUMBER | STRING | "="
 
 // ─── Macro ────────────────────────────────────────
 

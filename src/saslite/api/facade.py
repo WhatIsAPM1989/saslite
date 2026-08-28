@@ -24,11 +24,8 @@ from saslite.executor.proc.extras import (
     handle_proc_report,
 )
 from saslite.executor.proc.stats import handle_proc_reg, handle_proc_logistic, handle_proc_corr, handle_proc_ttest
-from saslite.executor.proc.survival import (
-    handle_ods,
-    handle_proc_lifetest,
-    handle_proc_phreg,
-)
+from saslite.executor.ods import handle_ods
+from saslite.executor.proc.survival import handle_proc_lifetest, handle_proc_phreg
 from saslite.executor.proc.generalized import handle_proc_genmod
 from saslite.executor.proc.mixed import handle_proc_mixed
 from saslite.executor.proc.interval_survival import handle_proc_icphreg, handle_proc_iclifetest

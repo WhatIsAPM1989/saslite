@@ -14,6 +14,7 @@ import pandas as pd
 from saslite.ast.proc import ProcNode, VarListNode, ByNode, ClassNode
 from saslite.ast.data_step import DatasetRefNode
 from saslite.executor.expression_eval import ExpressionEvaluator
+from saslite.executor.ods import write_report_destinations
 from saslite.functions import build_default_registry
 from saslite.runtime.dataset import Dataset
 from saslite.runtime.execution_result import StepResult
@@ -830,13 +831,24 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
     else:
         report_df = df[actual_cols]
 
-    # Apply column labels from DEFINE
+    # Apply presentation attributes from DEFINE. NOPRINT columns still take
+    # part in grouping/ordering but are excluded from LST and RTF output.
+    hidden_columns = {
+        cmap[cu]
+        for cu, definition in defines.items()
+        if cu in cmap
+        and "NOPRINT" in [
+            str(attr).upper() for attr in definition.get("attrs", [])
+        ]
+    }
     rename_labels = {}
     for cu, d in defines.items():
         label = d.get("label", "")
         if label and cu in cmap and cmap[cu] in report_df.columns:
             rename_labels[cmap[cu]] = label
-    display_df = report_df.rename(columns=rename_labels)
+    display_df = report_df[
+        [column for column in report_df.columns if column not in hidden_columns]
+    ].rename(columns=rename_labels)
 
     buf = io.StringIO()
     buf.write(f"\n{'=' * 60}\n")
@@ -851,9 +863,24 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
     output = buf.getvalue()
     reporter.log(output)
 
+    try:
+        destination_notes = write_report_destinations(
+            session,
+            display_df,
+            title=f"PROC REPORT: {ds.metadata.libref}.{ds.metadata.member_name}",
+            listing_text=output,
+        )
+    except OSError as exc:
+        return StepResult(success=False, error=f"PROC REPORT output error: {exc}")
+
     if out_name:
         out_libref, out_member = _split_name(out_name)
         out_ds = Dataset.from_dataframe(report_df, name=out_member, libref=out_libref)
         session.put_dataset(out_libref, out_member, out_ds)
 
-    return StepResult(success=True, rows_affected=len(report_df), output_messages=[output])
+    return StepResult(
+        success=True,
+        rows_affected=len(report_df),
+        output_messages=[output],
+        notes=destination_notes,
+    )
