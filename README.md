@@ -356,11 +356,19 @@ SASLite includes support for:
 - **PROC IMPORT/EXPORT**: CSV and delimited file I/O
 
 ### Macro System
-- **Macro variables**: `%LET`, `%PUT`, macro variable resolution
-- **Macro functions**: `%MACRO`, `%MEND`, `%DO`, `%IF/%THEN/%ELSE`
-- **%SYSFUNC** (new in 0.3.0): Call DATA step functions in macro code
+- **Macro variables and scopes**: `%LET`, `%GLOBAL`, `%LOCAL`, `%SYMDEL`,
+  indirect `&&` references, and recursive rescanning
+- **Macros and control flow**: positional/keyword/default parameters, nested and
+  recursive `%MACRO` calls, `%IF/%THEN/%ELSE`, iterative `%DO`, `%DO %WHILE`,
+  `%DO %UNTIL`, `%GOTO`, and `%RETURN`
+- **Macro functions**: `%EVAL`, `%SYSEVALF`, character functions, symbol-table
+  queries, and compile-time/runtime quoting (`%STR`, `%NRSTR`, `%BQUOTE`,
+  `%NRBQUOTE`, `%SUPERQ`, `%UNQUOTE`, and Q variants)
+- **%SYSFUNC / %QSYSFUNC**: Call supported DATA step and dataset functions in
+  macro code, with optional output formatting
 - **%INCLUDE**: Compose programs from multiple files
-- **Conditional logic**: `%IF`, `%DO WHILE`, `%DO UNTIL`
+- **Automatic variables and diagnostics**: common `SYS*` variables plus
+  `MPRINT`, `MLOGIC`, and `SYMBOLGEN` output
 
 ### Built-in Functions (82 functions)
 - **Character**: `STRIP`, `UPCASE`, `LOWCASE`, `SUBSTR`, `INDEX`, `SCAN`, 
@@ -477,7 +485,7 @@ SASLite intentionally implements a practical subset of SAS. Some advanced or
 environment-specific SAS features are not currently supported:
 
 **Not Implemented:**
-- Advanced macro features (MACRO PROC, compiled macros)
+- Stored/compiled macro catalogs and SAS autocall (`SASAUTOS`) libraries
 - Remote libraries and server integration
 - Complete format/informat catalog system
 - Complete ODS styling and destination catalog (RTF/LISTING for PROC REPORT
@@ -489,6 +497,12 @@ environment-specific SAS features are not currently supported:
 - Hash objects and data structures
 
 **Partial Support:**
+- Macro quoting implements the commonly used masking and rescanning behavior,
+  but not every edge case of the SAS word scanner; backward `%GOTO`,
+  `PARMBUFF`/`SYSPBUFF`, and macro header options such as `MINOPERATOR` remain
+  unsupported
+- `%INCLUDE` supports nested local files, but not filerefs or macro-variable
+  expansion inside the include path
 - PROC PRINT does not support TITLE statements
 - ARRAY syntax: use full variable lists instead of `score1-score4` shorthand
 - Some advanced SQL features (recursive CTEs, complex subqueries)

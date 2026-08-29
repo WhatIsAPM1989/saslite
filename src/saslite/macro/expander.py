@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import math
 import re
 import sys
 from dataclasses import dataclass, field
@@ -134,6 +136,12 @@ class MacroExpander:
         # their bodies will be processed later when the macro is invoked.
         self._reject_open_code_macro_statements(source)
 
+        # Execute source-order assignments before expanding later macro
+        # functions such as %SUPERQ. Functions on a %LET right-hand side are
+        # expanded by _resolve_let_value itself.
+        source = self._process_let_statements(source)
+        source = self._process_symdel_statements(source)
+
         # Step 2.5: Process macro character functions and %SYSFUNC
         source = self._process_macro_functions(source)
 
@@ -145,6 +153,7 @@ class MacroExpander:
 
         # Step 5: Process %LET statements (after eval so values resolve)
         source = self._process_let_statements(source)
+        source = self._process_symdel_statements(source)
 
         # Step 5.5: Macro functions may now resolve with %LET values
         source = self._process_macro_functions(source)
@@ -558,6 +567,9 @@ class MacroExpander:
         if_match = re.search(r"%\s*IF\b", masked, flags=re.IGNORECASE)
         if if_match is None:
             return source
+        invocation = self._next_user_macro_invocation(source)
+        if invocation is not None and invocation < if_match.start():
+            return source
         then_match = re.search(
             r"%\s*THEN\b",
             masked[if_match.end():],
@@ -720,6 +732,7 @@ class MacroExpander:
 
     def _eval_macro_condition(self, condition: str) -> bool | None:
         """Evaluate a macro-level condition like 'X = 1' or 'X NE Y'."""
+        condition = self._process_macro_functions(condition)
         # Substitute any remaining &vars
         condition = self._substitute_vars(condition)
 
@@ -835,7 +848,7 @@ class MacroExpander:
 
     def _expand_macro_invocations(self, source: str) -> str:
         """Expand %macro_name and %macro_name(args) invocations."""
-        max_iterations = 20  # Prevent infinite loops
+        max_iterations = 1000  # Prevent recursive expansion from running forever
         for _ in range(max_iterations):
             expanded = self._expand_once(source)
             # Invoking an outer macro can emit a helper definition from its
@@ -843,6 +856,13 @@ class MacroExpander:
             # leaving its body (including macro conditionals) unevaluated
             # until the helper itself is invoked.
             expanded = self._process_macro_definitions(expanded)
+            expanded = self._process_global_declarations(expanded)
+            expanded = self._process_let_statements(expanded)
+            expanded = self._process_symdel_statements(expanded)
+            expanded = self._process_macro_functions(expanded)
+            expanded = self._process_conditionals(expanded)
+            expanded = self._process_do_loops(expanded)
+            expanded = self._process_put_statements(expanded)
             if expanded == source:
                 break
             source = expanded
@@ -880,23 +900,24 @@ class MacroExpander:
         return body
 
     def _expand_once(self, source: str) -> str:
-        """Single pass of macro expansion."""
-        # A no-argument macro call does not require a semicolon in SAS. Keep
-        # newlines outside the match so expanding a bare call on its own line
-        # cannot accidentally concatenate neighboring SAS statements.
-        pattern_no_args = r"%(\w+)\b(?!\s*\()[ \t]*;?"
-
+        """Expand the first user macro invocation in source order."""
         skip_keywords = {"LET", "MACRO", "MEND", "IF", "THEN", "ELSE", "DO", "END",
                          "PUT", "INCLUDE", "GOTO", "RETURN", "EVAL", "SYSEVALF",
-                         "UPCASE", "LOWCASE", "SCAN", "SUBSTR", "LENGTH", "INDEX",
-                         "STR", "NRSTR", "SUPERQ", "SYSFUNC", "TO", "BY"}
+                         "UPCASE", "QUPCASE", "LOWCASE", "SCAN", "QSCAN", "SUBSTR",
+                         "QSUBSTR", "LENGTH", "INDEX", "VERIFY", "LEFT", "TRIM",
+                         "CMPRES", "QCMPRES", "STR", "NRSTR", "QUOTE", "NRQUOTE",
+                         "BQUOTE", "NRBQUOTE", "UNQUOTE", "SUPERQ", "SYMEXIST",
+                         "SYMLOCAL", "SYMGLOBL", "SYMDEL", "SYSFUNC", "QSYSFUNC",
+                         "TO", "BY"}
 
         def expand_with_args(macro_name: str, args_str: str) -> str:
             macro = self._macros[macro_name]
+            args_str = self._process_macro_functions(args_str)
             args = [a.strip() for a in self._split_args_depth0(args_str)]
             # Build local variable scope: defaults first, then positional
             # and keyword (name=value) arguments
-            local_vars: dict[str, str] = dict(macro.defaults)
+            local_vars: dict[str, str] = {name: "" for name in macro.params}
+            local_vars.update(macro.defaults)
             pos_idx = 0
             for arg in args:
                 if not arg:
@@ -916,73 +937,71 @@ class MacroExpander:
             # Expand body with local vars
             return self._expand_invoked_macro(macro, local_vars)
 
-        # Expand calls with a balanced scanner.  Macro arguments routinely
-        # contain nested calls such as %SCAN(...); a ``[^)]*`` regex truncates
-        # the outer invocation at the first inner closing parenthesis.
-        head_re = re.compile(r"%(\w+)\s*\(", flags=re.IGNORECASE)
-        expanded_parts: list[str] = []
-        copy_from = 0
+        masked = self._mask_quoted_text(source)
         search_at = 0
         while True:
-            match = head_re.search(source, search_at)
+            match = re.search(r"%(\w+)\b", masked[search_at:], flags=re.IGNORECASE)
             if match is None:
-                expanded_parts.append(source[copy_from:])
-                break
+                return source
+            start = search_at + match.start()
+            name_end = search_at + match.end()
             macro_name = match.group(1).upper()
             if macro_name in skip_keywords or macro_name not in self._macros:
-                search_at = match.end()
+                search_at = name_end
                 continue
 
-            depth = 1
-            quote: str | None = None
-            position = match.end()
-            while position < len(source) and depth:
-                char = source[position]
-                if quote is not None:
-                    if char == quote:
-                        if position + 1 < len(source) and source[position + 1] == quote:
-                            position += 2
-                            continue
-                        quote = None
-                    position += 1
-                    continue
-                if char in ("'", '"'):
-                    quote = char
-                elif char == "(":
-                    depth += 1
-                elif char == ")":
-                    depth -= 1
+            position = name_end
+            while position < len(source) and source[position] in " \t\r":
                 position += 1
+            if position < len(source) and source[position] == "(":
+                args_start = position + 1
+                depth = 1
+                quote: str | None = None
+                position += 1
+                while position < len(source) and depth:
+                    char = source[position]
+                    if quote is not None:
+                        if char == quote:
+                            if position + 1 < len(source) and source[position + 1] == quote:
+                                position += 2
+                                continue
+                            quote = None
+                        position += 1
+                        continue
+                    if char in ("'", '"'):
+                        quote = char
+                    elif char == "(":
+                        depth += 1
+                    elif char == ")":
+                        depth -= 1
+                    position += 1
+                if depth:
+                    return source
+                replacement = expand_with_args(
+                    macro_name,
+                    source[args_start:position - 1],
+                )
+            else:
+                replacement = self._expand_invoked_macro(
+                    self._macros[macro_name],
+                    {
+                        **{name: "" for name in self._macros[macro_name].params},
+                        **self._macros[macro_name].defaults,
+                    },
+                )
 
-            if depth:
-                expanded_parts.append(source[copy_from:])
-                break
-
-            args_str = source[match.end():position - 1]
             call_end = position
             while call_end < len(source) and source[call_end] in " \t\r":
                 call_end += 1
-            if call_end < len(source) and source[call_end] == ";":
+            statement_start = max(
+                source.rfind(";", 0, start),
+                source.rfind("\n", 0, start),
+            ) + 1
+            standalone = not source[statement_start:start].strip()
+            if standalone and call_end < len(source) and source[call_end] == ";":
                 call_end += 1
+            return source[:start] + replacement + source[call_end:]
 
-            expanded_parts.append(source[copy_from:match.start()])
-            expanded_parts.append(expand_with_args(macro_name, args_str))
-            copy_from = call_end
-            search_at = call_end
-
-        source = "".join(expanded_parts)
-
-        # Then expand %name; (no args)
-        def replacer_no_args(match: re.Match) -> str:
-            macro_name = match.group(1).upper()
-            if macro_name in skip_keywords:
-                return match.group(0)
-            if macro_name not in self._macros:
-                return match.group(0)
-            macro = self._macros[macro_name]
-            return self._expand_invoked_macro(macro, dict(macro.defaults))
-
-        source = re.sub(pattern_no_args, replacer_no_args, source, flags=re.IGNORECASE)
         return source
 
     def _expand_invoked_macro(
@@ -1009,10 +1028,11 @@ class MacroExpander:
             # the outer body; their control statements execute only when the
             # helper itself is invoked.
             body = self._process_macro_definitions(body)
-            body = self._process_macro_functions(body)
-            body = self._process_eval(body)
             body = self._process_global_declarations(body)
             body = self._process_let_statements(body)
+            body = self._process_symdel_statements(body)
+            body = self._process_macro_functions(body)
+            body = self._process_eval(body)
             body = self._process_conditionals(body)
             # Expand iterative %DO only after false conditional branches have
             # been discarded; otherwise their %END tokens can be consumed as
@@ -1021,6 +1041,7 @@ class MacroExpander:
             body = self._process_macro_functions(body)
             body = self._process_eval(body)
             body = self._process_let_statements(body)
+            body = self._process_symdel_statements(body)
             body = self._process_conditionals(body)
             body = self._substitute_vars(body)
             body = self._process_put_statements(body)
@@ -1052,55 +1073,111 @@ class MacroExpander:
         )
 
     def _process_let_statements(self, source: str) -> str:
-        """Find and process %LET statements, return source without them."""
-        def replacer(match: re.Match) -> str:
-            var_name = match.group(1).upper()
-            value = self._resolve_let_value(match.group(2).strip())
-            sync_to_session = not self._macro_scopes
-            sync_to_global_session_scope = False
-            # Remove surrounding quotes if present
-            if (value.startswith("'") and value.endswith("'")) or (
-                value.startswith('"') and value.endswith('"')
-            ):
-                value = value[1:-1]
-            if self._macro_scopes:
-                target_scope = next(
-                    (
-                        scope
-                        for scope in reversed(self._macro_scopes)
-                        if var_name in scope
-                    ),
-                    None,
-                )
-                if target_scope is not None:
-                    target_scope[var_name] = value
-                elif var_name in self._global_vars:
-                    self._global_vars[var_name] = value
-                    sync_to_session = True
-                    sync_to_global_session_scope = True
-                else:
-                    self._macro_scopes[-1][var_name] = value
-            else:
-                self._local_vars[var_name] = value
-            if sync_to_session and self._session is not None:
-                if sync_to_global_session_scope:
-                    self._session.global_scope.define_var(var_name, value)
-                else:
-                    self._session.set_macro_var(var_name, value)
-            self._log_symbolgen(var_name, value)
-            return ""  # Remove the %LET statement
+        """Execute balanced %LET statements before the next control boundary."""
+        boundary = self._macro_execution_boundary(source)
+        prefix = source[:boundary]
+        masked = self._mask_quoted_text(prefix)
+        output: list[str] = []
+        cursor = 0
+        search_at = 0
+        while True:
+            head = re.search(
+                r"%\s*LET\s+([A-Za-z_]\w*)\s*=",
+                masked[search_at:],
+                flags=re.IGNORECASE,
+            )
+            if head is None:
+                output.append(prefix[cursor:])
+                break
+            start = search_at + head.start()
+            value_start = search_at + head.end()
+            depth = 0
+            position = value_start
+            while position < len(prefix):
+                character = prefix[position]
+                if character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth = max(0, depth - 1)
+                elif character == ";" and depth == 0:
+                    break
+                position += 1
+            if position >= len(prefix):
+                # A user-macro invocation can occur on the right-hand side.
+                # Leave the complete %LET pending until that invocation has
+                # expanded; ``prefix`` intentionally ends at that boundary.
+                if boundary < len(source):
+                    output.append(prefix[cursor:])
+                    break
+                raise SyntaxError(f"Expected ';' after %LET {head.group(1)}")
+            output.append(prefix[cursor:start])
+            value = self._resolve_let_value(prefix[value_start:position].strip())
+            self._assign_macro_variable(head.group(1), value)
+            cursor = position + 1
+            search_at = cursor
+        return "".join(output) + source[boundary:]
 
-        # Macro execution is ordered.  In particular, a %LET in the false
-        # branch of a later %IF must not run while scanning the surrounding
-        # body.  Process only the portion before the next conditional; the
-        # conditional engine removes the unselected branch and then calls us
-        # again on the remaining source.
-        masked = self._mask_quoted_text(source)
-        conditional = re.search(r"%\s*IF\b", masked, flags=re.IGNORECASE)
-        boundary = conditional.start() if conditional is not None else len(source)
+    def _assign_macro_variable(self, name: str, value: str) -> None:
+        """Assign one value using SAS local/global symbol-table rules."""
+        var_name = name.upper()
+        sync_to_session = not self._macro_scopes
+        sync_to_global_session_scope = False
+        # Quotes are ordinary macro text. SAS stores them as part of the
+        # value; they are not string delimiters owned by %LET.
+        if self._macro_scopes:
+            target_scope = next(
+                (
+                    scope
+                    for scope in reversed(self._macro_scopes)
+                    if var_name in scope
+                ),
+                None,
+            )
+            if target_scope is not None:
+                target_scope[var_name] = value
+            elif var_name in self._global_vars:
+                self._global_vars[var_name] = value
+                sync_to_session = True
+                sync_to_global_session_scope = True
+            else:
+                self._macro_scopes[-1][var_name] = value
+        elif var_name in self._global_vars:
+            self._global_vars[var_name] = value
+            sync_to_global_session_scope = True
+        else:
+            self._local_vars[var_name] = value
+        if sync_to_session and self._session is not None:
+            if sync_to_global_session_scope:
+                self._session.global_scope.define_var(var_name, value)
+            else:
+                self._session.set_macro_var(var_name, value)
+        self._log_symbolgen(var_name, value)
+
+    def _process_symdel_statements(self, source: str) -> str:
+        """Execute %SYMDEL for the nearest visible symbol table."""
+        def remove(match: re.Match) -> str:
+            payload = re.split(r"\s*/\s*", match.group(1), maxsplit=1)[0]
+            for raw_name in re.findall(r"[A-Za-z_]\w*", payload):
+                name = raw_name.upper()
+                removed = False
+                for scope in reversed(self._macro_scopes):
+                    if name in scope:
+                        del scope[name]
+                        removed = True
+                        break
+                if name in self._local_vars:
+                    del self._local_vars[name]
+                    removed = True
+                if name in self._global_vars:
+                    del self._global_vars[name]
+                if self._session is not None:
+                    self._session.global_scope.variables.pop(name, None)
+            return ""
+
+        boundary = self._macro_execution_boundary(source)
         prefix = re.sub(
-            r"%\s*LET\s+(\w+)\s*=\s*(.*?);",
-            replacer,
+            r"%\s*SYMDEL\s+([^;]*);",
+            remove,
             source[:boundary],
             flags=re.IGNORECASE,
         )
@@ -1133,9 +1210,7 @@ class MacroExpander:
         # must not run while the surrounding macro body is being prepared.
         # Process only declarations before the next conditional; the
         # conditional engine will revisit the selected branch and remainder.
-        masked = self._mask_quoted_text(source)
-        conditional = re.search(r"%\s*IF\b", masked, flags=re.IGNORECASE)
-        boundary = conditional.start() if conditional is not None else len(source)
+        boundary = self._macro_execution_boundary(source)
         prefix = re.sub(
             r"%\s*GLOBAL\s+([^;]*);",
             declare,
@@ -1143,6 +1218,25 @@ class MacroExpander:
             flags=re.IGNORECASE,
         )
         return prefix + source[boundary:]
+
+    def _macro_execution_boundary(self, source: str) -> int:
+        """Return the next conditional or user-macro call in open text."""
+        masked = self._mask_quoted_text(source)
+        positions: list[int] = []
+        conditional = re.search(r"%\s*(?:IF|DO)\b", masked, flags=re.IGNORECASE)
+        if conditional is not None:
+            positions.append(conditional.start())
+        invocation = self._next_user_macro_invocation(source)
+        if invocation is not None:
+            positions.append(invocation)
+        return min(positions) if positions else len(source)
+
+    def _next_user_macro_invocation(self, source: str) -> int | None:
+        masked = self._mask_quoted_text(source)
+        for match in re.finditer(r"%(\w+)\b", masked, flags=re.IGNORECASE):
+            if match.group(1).upper() in self._macros:
+                return match.start()
+        return None
 
     def _substitute_vars(self, source: str) -> str:
         """Substitute &var references with their values.
@@ -1222,13 +1316,16 @@ class MacroExpander:
                 self._session.add_debug_output(f"PUT: {output}")
             return ""
 
-        source = re.sub(
+        boundary = self._next_user_macro_invocation(source)
+        if boundary is None:
+            boundary = len(source)
+        prefix = re.sub(
             r"%\s*PUT\s+(.*?);",
             replacer,
-            source,
-            flags=re.IGNORECASE,
+            source[:boundary],
+            flags=re.IGNORECASE | re.DOTALL,
         )
-        return source
+        return prefix + source[boundary:]
 
     def _process_do_loops(self, source: str) -> str:
         """Process %DO %var = %eval(start) %TO %eval(end) %BY step; ... %END; loops."""
@@ -1243,6 +1340,33 @@ class MacroExpander:
     def _process_do_loops_once(self, source: str) -> str:
         """Expand the first iterative %DO using a balanced %DO/%END pair."""
         masked = self._mask_quoted_text(source)
+        conditional_head = re.search(
+            r"%\s*DO\s+%\s*(WHILE|UNTIL)\s*\(",
+            masked,
+            flags=re.IGNORECASE,
+        )
+        iterative_head = re.search(
+            r"%\s*DO\s+(\w+)\s*=",
+            masked,
+            flags=re.IGNORECASE,
+        )
+        loop_positions = [
+            match.start()
+            for match in (conditional_head, iterative_head)
+            if match is not None
+        ]
+        invocation = self._next_user_macro_invocation(source)
+        if invocation is not None and loop_positions and invocation < min(loop_positions):
+            return source
+        if conditional_head is not None and (
+            iterative_head is None or conditional_head.start() < iterative_head.start()
+        ):
+            return self._expand_conditional_do_loop(
+                source,
+                masked,
+                conditional_head,
+            )
+
         head = re.search(
             r"%\s*DO\s+(\w+)\s*=",
             masked,
@@ -1307,6 +1431,62 @@ class MacroExpander:
 
         return source[:head.start()] + "".join(result_parts) + source[loop_end:]
 
+    def _expand_conditional_do_loop(
+        self,
+        source: str,
+        masked: str,
+        head: re.Match,
+    ) -> str:
+        """Execute a macro %DO %WHILE or %DO %UNTIL loop."""
+        kind = head.group(1).upper()
+        depth = 1
+        position = head.end()
+        while position < len(masked) and depth:
+            if masked[position] == "(":
+                depth += 1
+            elif masked[position] == ")":
+                depth -= 1
+            position += 1
+        if depth:
+            raise SyntaxError(f"Unclosed %DO %{kind} condition")
+        condition = source[head.end():position - 1]
+        header_end = self._skip_whitespace(masked, position)
+        if header_end >= len(masked) or masked[header_end] != ";":
+            raise SyntaxError(f"Expected ';' after %DO %{kind}")
+        body_start = header_end + 1
+        body_end, loop_end = self._find_matching_macro_end(masked, body_start)
+        body = source[body_start:body_end]
+
+        output: list[str] = []
+        for iteration in range(10000):
+            if kind == "WHILE" and not self._macro_loop_condition(condition):
+                break
+            output.append(self._expand_macro_loop_iteration(body))
+            if kind == "UNTIL" and self._macro_loop_condition(condition):
+                break
+        else:
+            raise RuntimeError(f"Macro %DO %{kind} exceeded 10000 iterations")
+        return source[:head.start()] + "".join(output) + source[loop_end:]
+
+    def _macro_loop_condition(self, condition: str) -> bool:
+        resolved = self._process_macro_functions(condition)
+        resolved = self._substitute_vars(resolved)
+        value = self._eval_macro_condition(resolved)
+        return bool(value)
+
+    def _expand_macro_loop_iteration(self, body: str) -> str:
+        """Expand one loop body while preserving generated SAS source."""
+        expanded = self._process_macro_definitions(body)
+        expanded = self._process_global_declarations(expanded)
+        expanded = self._process_let_statements(expanded)
+        expanded = self._process_symdel_statements(expanded)
+        expanded = self._process_macro_functions(expanded)
+        expanded = self._process_conditionals(expanded)
+        expanded = self._process_do_loops(expanded)
+        expanded = self._expand_macro_invocations(expanded)
+        expanded = self._process_put_statements(expanded)
+        return self._substitute_vars(expanded)
+
     def expand_macro_fragment(self, source: str) -> str:
         """Expand a continuation known to originate inside an invoked macro.
 
@@ -1330,11 +1510,12 @@ class MacroExpander:
             source = self._remove_comments(source)
             source = self._quote_format_literals(source)
             source = self._process_macro_definitions(source)
+            source = self._process_global_declarations(source)
+            source = self._process_let_statements(source)
+            source = self._process_symdel_statements(source)
             source = self._process_macro_functions(source)
             source = self._process_do_loops(source)
             source = self._process_eval(source)
-            source = self._process_global_declarations(source)
-            source = self._process_let_statements(source)
             source = self._process_macro_functions(source)
             source = self._process_conditionals(source)
             source = self._process_put_statements(source)
@@ -1343,6 +1524,7 @@ class MacroExpander:
             source = self._process_do_loops(source)
             source = self._process_eval(source)
             source = self._process_let_statements(source)
+            source = self._process_symdel_statements(source)
             source = self._process_conditionals(source)
             source = self._process_put_statements(source)
             source = self._substitute_vars(source)
@@ -1392,8 +1574,12 @@ class MacroExpander:
     # ── Macro character functions & %SYSFUNC ──────────
 
     _MACRO_FUNC_NAMES = (
-        "UPCASE", "LOWCASE", "SCAN", "SUBSTR", "LENGTH", "INDEX",
-        "STR", "NRSTR", "SUPERQ", "SYMEXIST", "SYSFUNC",
+        "UPCASE", "QUPCASE", "LOWCASE", "SCAN", "QSCAN", "SUBSTR",
+        "QSUBSTR", "LENGTH", "INDEX", "VERIFY", "LEFT", "TRIM",
+        "CMPRES", "QCMPRES", "STR", "NRSTR", "QUOTE", "NRQUOTE",
+        "BQUOTE", "NRBQUOTE", "UNQUOTE", "SUPERQ", "SYMEXIST",
+        "SYMLOCAL", "SYMGLOBL", "SYSFUNC", "QSYSFUNC", "EVAL",
+        "SYSEVALF",
     )
 
     def _process_macro_functions(self, source: str) -> str:
@@ -1404,15 +1590,23 @@ class MacroExpander:
         the current pass (the inner call is expanded first); the pass repeats
         until the source is stable.
         """
+        boundary = self._macro_execution_boundary(source)
+        if boundary < len(source):
+            prefix = source[:boundary]
+            suffix = source[boundary:]
+        else:
+            prefix = source
+            suffix = ""
+
         names = "|".join(self._MACRO_FUNC_NAMES)
         head_re = re.compile(rf"%\s*({names})\s*\(", flags=re.IGNORECASE)
 
         for _ in range(30):
-            new_source = self._expand_macro_functions_once(source, head_re)
-            if new_source == source:
+            new_prefix = self._expand_macro_functions_once(prefix, head_re)
+            if new_prefix == prefix:
                 break
-            source = new_source
-        return source
+            prefix = new_prefix
+        return prefix + suffix
 
     def _expand_macro_functions_once(self, source: str, head_re: re.Pattern) -> str:
         result: list[str] = []
@@ -1426,11 +1620,23 @@ class MacroExpander:
             func = m.group(1).upper()
             # Find the balanced closing paren
             depth = 1
+            quote: str | None = None
             i = m.end()
             while i < n and depth > 0:
-                if source[i] == "(":
+                character = source[i]
+                if quote is not None:
+                    if character == quote:
+                        if i + 1 < n and source[i + 1] == quote:
+                            i += 2
+                            continue
+                        quote = None
+                    i += 1
+                    continue
+                if character in ("'", '"'):
+                    quote = character
+                elif character == "(":
                     depth += 1
-                elif source[i] == ")":
+                elif character == ")":
                     depth -= 1
                 i += 1
             if depth != 0:
@@ -1468,35 +1674,78 @@ class MacroExpander:
             value = self.get_var(name)
             if value is None:
                 return ""
-            return self._quote_macro_value(value)
+            return self._quote_all_macro_triggers(value)
 
         if func in ("STR", "NRSTR"):
             value = self._quote_macro_punctuation(raw_args)
             return self._quote_macro_value(value) if func == "NRSTR" else value
 
+        if func == "UNQUOTE":
+            return self._unquote_macro_value(raw_args)
+
         if func == "SYMEXIST":
             return "1" if self.get_var(raw_args.strip()) is not None else "0"
+        if func == "SYMLOCAL":
+            name = raw_args.strip().upper()
+            return "1" if any(name in scope for scope in self._macro_scopes) else "0"
+        if func == "SYMGLOBL":
+            name = raw_args.strip().upper()
+            return "1" if name in self._global_vars or name in self._local_vars else "0"
 
         raw_args = self._substitute_vars(raw_args)
         if "&" in raw_args:
             return None
 
-        if func == "SYSFUNC":
-            return self._eval_sysfunc(raw_args)
+        if func in ("QUOTE", "BQUOTE", "NRQUOTE", "NRBQUOTE"):
+            value = self._quote_macro_punctuation(raw_args)
+            if func.startswith("NR"):
+                value = self._quote_macro_value(value)
+            return value
 
-        args = [a.strip() for a in raw_args.split(",")]
+        if func in ("SYSFUNC", "QSYSFUNC"):
+            value = self._eval_sysfunc(raw_args)
+            return self._quote_all_macro_triggers(value) if func == "QSYSFUNC" else value
+
+        if func in ("EVAL", "SYSEVALF"):
+            args = self._split_args_depth0(raw_args)
+            expression = self._unquote_macro_value(args[0].strip() if args else "")
+            floating = func == "SYSEVALF"
+            value = self._eval_macro_expr(expression, floating=floating)
+            conversion = args[1].strip().upper() if floating and len(args) > 1 else ""
+            if conversion == "BOOLEAN":
+                return "0" if value == 0 or (isinstance(value, float) and math.isnan(value)) else "1"
+            if conversion == "CEIL":
+                return str(math.ceil(float(value)))
+            if conversion == "FLOOR":
+                return str(math.floor(float(value)))
+            if conversion == "INTEGER":
+                return str(round(float(value)))
+            return self._format_macro_number(value)
+
+        args = [
+            self._unquote_macro_value(arg.strip())
+            for arg in self._split_args_depth0(raw_args)
+        ]
         text = args[0] if args else ""
 
-        if func == "UPCASE":
-            return text.upper()
+        if func in ("UPCASE", "QUPCASE"):
+            value = text.upper()
+            return self._quote_all_macro_triggers(value) if func == "QUPCASE" else value
         if func == "LOWCASE":
             return text.lower()
+        if func == "LEFT":
+            return text.lstrip()
+        if func == "TRIM":
+            return text.rstrip()
+        if func in ("CMPRES", "QCMPRES"):
+            value = " ".join(text.split())
+            return self._quote_all_macro_triggers(value) if func == "QCMPRES" else value
         if func == "LENGTH":
             return str(len(text))
         if func == "INDEX":
             target = args[1] if len(args) > 1 else ""
             return str(text.find(target) + 1)
-        if func == "SCAN":
+        if func in ("SCAN", "QSCAN"):
             n = 1
             if len(args) > 1:
                 try:
@@ -1508,9 +1757,10 @@ class MacroExpander:
             if n < 0:
                 n = len(words) + n + 1
             if 1 <= n <= len(words):
-                return words[n - 1]
+                value = words[n - 1]
+                return self._quote_all_macro_triggers(value) if func == "QSCAN" else value
             return ""
-        if func == "SUBSTR":
+        if func in ("SUBSTR", "QSUBSTR"):
             try:
                 start = int(float(args[1])) if len(args) > 1 else 1
             except ValueError:
@@ -1523,8 +1773,13 @@ class MacroExpander:
                     length = None
             start_idx = max(start - 1, 0)
             if length is None:
-                return text[start_idx:]
-            return text[start_idx:start_idx + length]
+                value = text[start_idx:]
+            else:
+                value = text[start_idx:start_idx + length]
+            return self._quote_all_macro_triggers(value) if func == "QSUBSTR" else value
+        if func == "VERIFY":
+            allowed = args[1] if len(args) > 1 else ""
+            return str(next((index for index, char in enumerate(text, 1) if char not in allowed), 0))
         return ""
 
     @classmethod
@@ -1533,6 +1788,10 @@ class MacroExpander:
             "%",
             cls._QUOTED_PERCENT,
         )
+
+    @classmethod
+    def _quote_all_macro_triggers(cls, value: str) -> str:
+        return cls._quote_macro_value(cls._quote_macro_punctuation(value))
 
     @classmethod
     def _quote_macro_punctuation(cls, value: str) -> str:
@@ -1556,8 +1815,9 @@ class MacroExpander:
 
     def _eval_sysfunc(self, raw_args: str) -> str:
         """Evaluate %SYSFUNC(func(args) [, format])."""
-        m = re.match(r"\s*(\w+)\s*\((.*)\)\s*(?:,\s*[\w.$]+\s*)?$", raw_args, flags=re.DOTALL)
-        if m is None:
+        output_format = ""
+        head = re.match(r"\s*(\w+)\s*\(", raw_args, flags=re.DOTALL)
+        if head is None:
             # Function with no parens: %SYSFUNC(today())  handled above;
             # %SYSFUNC(today) style:
             m2 = re.match(r"\s*(\w+)\s*$", raw_args)
@@ -1565,7 +1825,33 @@ class MacroExpander:
                 return ""
             fn_name, inner = m2.group(1), ""
         else:
-            fn_name, inner = m.group(1), m.group(2)
+            fn_name = head.group(1)
+            depth = 1
+            quote: str | None = None
+            position = head.end()
+            while position < len(raw_args) and depth:
+                character = raw_args[position]
+                if quote is not None:
+                    if character == quote:
+                        if position + 1 < len(raw_args) and raw_args[position + 1] == quote:
+                            position += 2
+                            continue
+                        quote = None
+                    position += 1
+                    continue
+                if character in ("'", '"'):
+                    quote = character
+                elif character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth -= 1
+                position += 1
+            if depth:
+                return ""
+            inner = raw_args[head.end():position - 1]
+            trailing = raw_args[position:].strip()
+            if trailing.startswith(","):
+                output_format = trailing[1:].strip()
 
         if MacroExpander._sysfunc_registry is None:
             from saslite.functions import build_default_registry
@@ -1601,6 +1887,9 @@ class MacroExpander:
             return ""
         if result is None:
             return ""
+        if output_format:
+            from saslite.functions.convert_funcs import put_sas
+            return put_sas(result, output_format)
         if isinstance(result, float) and result.is_integer():
             return str(int(result))
         return str(result)
@@ -1787,120 +2076,154 @@ class MacroExpander:
         return parts
 
     def _process_eval(self, source: str) -> str:
-        """Process %EVAL() and %SYSEVALF() expressions."""
-        def eval_replacer(match: re.Match) -> str:
-            expr = match.group(1).strip()
-            expr = self._substitute_vars(expr)
-            return str(self._eval_macro_expr(expr))
+        """Process balanced %EVAL() and %SYSEVALF() expressions."""
+        return self._process_macro_functions(source)
 
-        # %SYSEVALF(expr) — floating-point arithmetic
-        def sysevalf_replacer(match: re.Match) -> str:
-            expr = match.group(1).strip()
-            expr = self._substitute_vars(expr)
-            return str(self._eval_macro_expr(expr, floating=True))
-
-        source = re.sub(
-            r"%\s*EVAL\s*\(([^)]+)\)",
-            eval_replacer,
-            source,
-            flags=re.IGNORECASE,
-        )
-        source = re.sub(
-            r"%\s*SYSEVALF\s*\(([^)]+)\)",
-            sysevalf_replacer,
-            source,
-            flags=re.IGNORECASE,
-        )
-        return source
+    @classmethod
+    def _eval_macro_expr(cls, expr: str, floating: bool = False) -> int | float:
+        """Evaluate macro arithmetic with SAS precedence and associativity."""
+        expression = cls._translate_macro_expression(expr.strip())
+        try:
+            tree = ast.parse(expression, mode="eval")
+            value = cls._eval_macro_ast(tree.body, floating=floating)
+        except (SyntaxError, TypeError, ValueError, ZeroDivisionError):
+            # Text comparisons that cannot be represented as a Python
+            # expression are still valid macro conditions.
+            condition = cls._eval_text_comparison(expr)
+            return int(condition) if condition is not None else 0
+        if isinstance(value, bool):
+            return int(value)
+        if floating:
+            return float(value)
+        return int(float(value))
 
     @staticmethod
-    def _eval_macro_expr(expr: str, floating: bool = False) -> int | float:
-        """Evaluate a macro-level arithmetic/comparison expression."""
-        expr = expr.strip()
-        # Try direct number
-        try:
-            return float(expr) if floating else int(float(expr))
-        except (ValueError, TypeError):
-            pass
+    def _format_macro_number(value: int | float) -> str:
+        if isinstance(value, float) and math.isnan(value):
+            return "."
+        if float(value).is_integer():
+            return str(int(value))
+        return format(float(value), ".15g")
 
-        # Comparison operators (lowest precedence) — return 1/0
-        comp_ops: list[tuple[str, Any]] = [
-            (">=", lambda a, b: a >= b), ("<=", lambda a, b: a <= b),
-            ("=", lambda a, b: a == b), (">", lambda a, b: a > b),
-            ("<", lambda a, b: a < b),
-        ]
-        mnemonic_ops: list[tuple[str, Any]] = [
-            ("NE", lambda a, b: a != b), ("GE", lambda a, b: a >= b),
-            ("LE", lambda a, b: a <= b), ("GT", lambda a, b: a > b),
-            ("LT", lambda a, b: a < b), ("EQ", lambda a, b: a == b),
-        ]
+    @staticmethod
+    def _translate_macro_expression(expr: str) -> str:
+        """Translate SAS mnemonic operators outside quotes to Python."""
+        word_ops = {
+            "AND": "and", "OR": "or", "NOT": "not",
+            "EQ": "==", "NE": "!=", "GT": ">", "GE": ">=",
+            "LT": "<", "LE": "<=",
+        }
+        output: list[str] = []
+        index = 0
+        quote: str | None = None
+        while index < len(expr):
+            char = expr[index]
+            if quote is not None:
+                output.append(char)
+                if char == quote:
+                    if index + 1 < len(expr) and expr[index + 1] == quote:
+                        output.append(expr[index + 1])
+                        index += 2
+                        continue
+                    quote = None
+                index += 1
+                continue
+            if char in ("'", '"'):
+                quote = char
+                output.append(char)
+                index += 1
+                continue
+            if char.isalpha() or char == "_":
+                end = index + 1
+                while end < len(expr) and (expr[end].isalnum() or expr[end] == "_"):
+                    end += 1
+                token = expr[index:end]
+                output.append(word_ops.get(token.upper(), token))
+                index = end
+                continue
+            if expr[index:index + 2] in ("<>", "^=", "~="):
+                output.append("!=")
+                index += 2
+                continue
+            if char == "=" and not (
+                index > 0 and expr[index - 1] in "<>=!~^"
+            ) and not (index + 1 < len(expr) and expr[index + 1] == "="):
+                output.append("==")
+            else:
+                output.append(char)
+            index += 1
+        return "".join(output)
 
-        def _operand(s: str) -> Any:
-            s = s.strip()
-            try:
-                val = MacroExpander._eval_macro_expr(s, floating=True)
-                # _eval_macro_expr returns 0 for unknown text — but for
-                # comparisons we want string semantics there. Distinguish:
-                # if s parses as expr containing digits/operators, trust it.
-                if re.search(r"\d", s) or any(op in s for op in "+-*/()"):
-                    return val
-            except Exception:
-                pass
-            return s.strip("'\"")
-
-        # Mnemonic operators need word boundaries
-        for op_word, op_fn in mnemonic_ops:
-            m = re.search(rf"\b{op_word}\b", expr, flags=re.IGNORECASE)
-            if m:
-                left = _operand(expr[:m.start()])
-                right = _operand(expr[m.end():])
+    @classmethod
+    def _eval_macro_ast(cls, node: ast.AST, *, floating: bool) -> Any:
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.UnaryOp):
+            value = cls._eval_macro_ast(node.operand, floating=floating)
+            if isinstance(node.op, ast.USub):
+                return -float(value)
+            if isinstance(node.op, ast.UAdd):
+                return float(value)
+            if isinstance(node.op, ast.Not):
+                return not bool(value)
+        if isinstance(node, ast.BinOp):
+            left = cls._eval_macro_ast(node.left, floating=floating)
+            right = cls._eval_macro_ast(node.right, floating=floating)
+            if isinstance(node.op, ast.Add):
+                return float(left) + float(right)
+            if isinstance(node.op, ast.Sub):
+                return float(left) - float(right)
+            if isinstance(node.op, ast.Mult):
+                return float(left) * float(right)
+            if isinstance(node.op, ast.Div):
+                quotient = float(left) / float(right)
+                return quotient if floating else math.trunc(quotient)
+            if isinstance(node.op, ast.Mod):
+                return float(left) % float(right)
+            if isinstance(node.op, ast.Pow):
+                return float(left) ** float(right)
+        if isinstance(node, ast.BoolOp):
+            values = [bool(cls._eval_macro_ast(value, floating=floating)) for value in node.values]
+            return all(values) if isinstance(node.op, ast.And) else any(values)
+        if isinstance(node, ast.Compare):
+            left = cls._eval_macro_ast(node.left, floating=floating)
+            for operator, comparator in zip(node.ops, node.comparators):
+                right = cls._eval_macro_ast(comparator, floating=floating)
                 try:
-                    return 1 if op_fn(float(left), float(right)) else 0
+                    pair = float(left), float(right)
                 except (TypeError, ValueError):
-                    return 1 if op_fn(str(left), str(right)) else 0
+                    pair = str(left), str(right)
+                if isinstance(operator, ast.Eq):
+                    matched = pair[0] == pair[1]
+                elif isinstance(operator, ast.NotEq):
+                    matched = pair[0] != pair[1]
+                elif isinstance(operator, ast.Gt):
+                    matched = pair[0] > pair[1]
+                elif isinstance(operator, ast.GtE):
+                    matched = pair[0] >= pair[1]
+                elif isinstance(operator, ast.Lt):
+                    matched = pair[0] < pair[1]
+                elif isinstance(operator, ast.LtE):
+                    matched = pair[0] <= pair[1]
+                else:
+                    raise ValueError("unsupported macro comparison")
+                if not matched:
+                    return False
+                left = right
+            return True
+        raise ValueError("unsupported macro expression")
 
-        # Symbolic comparison operators at depth 0
-        depth = 0
-        for i, ch in enumerate(expr):
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-            elif depth == 0:
-                for op_sym, op_fn in comp_ops:
-                    if expr[i:i + len(op_sym)] == op_sym:
-                        # Skip ** which is not comparison; = is unambiguous
-                        left = _operand(expr[:i])
-                        right = _operand(expr[i + len(op_sym):])
-                        try:
-                            return 1 if op_fn(float(left), float(right)) else 0
-                        except (TypeError, ValueError):
-                            return 1 if op_fn(str(left), str(right)) else 0
-
-        # Handle common arithmetic operators
-        ops = [("+", lambda a, b: a + b), ("-", lambda a, b: a - b),
-               ("*", lambda a, b: a * b), ("/", lambda a, b: a / b if b != 0 else 0)]
-
-        for op_sym, op_fn in ops:
-            # Find the operator (respecting parentheses depth)
-            depth = 0
-            split_pos = -1
-            for i, ch in enumerate(expr):
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                elif depth == 0 and ch == op_sym and i > 0:
-                    split_pos = i
-                    break  # Take the first occurrence at depth 0
-            if split_pos > 0:
-                left = MacroExpander._eval_macro_expr(expr[:split_pos], floating)
-                right = MacroExpander._eval_macro_expr(expr[split_pos + 1:], floating)
-                return op_fn(left, right)
-
-        # Handle parentheses
-        if expr.startswith("(") and expr.endswith(")"):
-            return MacroExpander._eval_macro_expr(expr[1:-1], floating)
-
-        # Unknown expression — return 0
-        return 0
+    @staticmethod
+    def _eval_text_comparison(expr: str) -> bool | None:
+        match = re.match(
+            r"^\s*(.*?)\s*(=|<>|\^=|~=|\bEQ\b|\bNE\b)\s*(.*?)\s*$",
+            expr,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match is None:
+            return None
+        left = match.group(1).strip().strip("'\"")
+        right = match.group(3).strip().strip("'\"")
+        return left != right if match.group(2).upper() in {"<>", "^=", "~=", "NE"} else left == right

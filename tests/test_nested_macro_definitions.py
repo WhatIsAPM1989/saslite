@@ -54,9 +54,9 @@ class NestedMacroDefinitionTests(unittest.TestCase):
         result = sas.execute(source)
 
         self.assertTrue(result.success, result.error)
-        # Existing macro expansion processes open-code %PUT statements before
-        # those emitted by an invoked macro.
-        self.assertEqual(log.getvalue(), "after-outer\nsample-accepted\n")
+        # Macro statements execute in source order: the invoked macro emits
+        # its line before the following open-code %PUT executes.
+        self.assertEqual(log.getvalue(), "sample-accepted\nafter-outer\n")
         self.assertIn("OUTER", sas._macro._macros)
         self.assertIn("HELPER", sas._macro._macros)
 

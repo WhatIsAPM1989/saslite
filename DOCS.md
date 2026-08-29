@@ -1315,6 +1315,25 @@ RUN;
 %LET result = %EVAL((100 - 20) / 4);
 ```
 
+`%EVAL` 使用整数运算（除法结果截断），`%SYSEVALF` 支持浮点运算以及
+`BOOLEAN`、`CEIL`、`FLOOR`、`INTEGER` 转换类型。表达式支持嵌套括号和
+标准算术优先级。
+
+### 宏引用、符号表与函数
+
+- 引用函数：`%STR`、`%NRSTR`、`%QUOTE`、`%NRQUOTE`、`%BQUOTE`、
+  `%NRBQUOTE`、`%SUPERQ`、`%UNQUOTE`，以及 `%QSCAN`、`%QSUBSTR`、
+  `%QUPCASE`、`%QCMPRES`。
+- 字符函数：`%UPCASE`、`%LOWCASE`、`%SCAN`、`%SUBSTR`、`%LENGTH`、
+  `%INDEX`、`%VERIFY`、`%LEFT`、`%TRIM`、`%CMPRES`。
+- 符号表：`%GLOBAL`、`%LOCAL`、`%SYMDEL`、`%SYMEXIST`、`%SYMLOCAL`、
+  `%SYMGLOBL`。
+- `%SYSFUNC` / `%QSYSFUNC` 可以调用受支持的 DATA step 函数和数据集
+  函数，并可指定输出格式。
+
+宏调用按源代码顺序执行，支持嵌套定义、递归调用以及相互隔离的局部作用域。
+`%DO %WHILE(...)` 和 `%DO %UNTIL(...)` 会在每次迭代后重新计算条件。
+
 ### 注释
 
 ```sas
@@ -1325,18 +1344,18 @@ RUN;
 /*  嵌套注释支持有限 — 最外层 /* 内层 */ 会提前关闭 */
 ```
 
-### 未实现的宏功能
+### 宏兼容性边界
 
 | 功能 | 状态 |
 |------|------|
-| %GOTO / %LABEL | 未实现 |
-| %RETURN | 未实现 |
-| %SCAN 宏函数 | 未实现（有 DATA step SCAN） |
-| %SUBSTR 宏函数 | 未实现（有 DATA step SUBSTR） |
-| %SYSFUNC | 未实现 |
-| 宏嵌套调用 | 有限支持（不支持递归） |
-| 全局/本地宏变量作用域 | 有限实现 |
-| 自动宏变量（SYSDATE, SYSTIME, SYSERR 等） | 未实现 |
+| `%GOTO` / `%LABEL`、`%RETURN` | 支持向前跳转和提前返回；不支持向后 `%GOTO` |
+| `%SCAN` / `%SUBSTR` / `%SYSFUNC` | 已实现，并支持常用 Q 变体和输出格式 |
+| 宏嵌套与递归 | 已实现，递归调用使用隔离的局部作用域 |
+| 全局/本地符号表 | 已实现常用声明、查询、赋值和删除操作 |
+| 自动宏变量 | 已实现常用 `SYSDATE`、`SYSTIME`、`SYSERR`、`SYSNOBS` 等 |
+| 宏引用 | 已实现常用掩码和重新扫描行为；少数字扫描器边界情况仍有限 |
+| 编译宏目录 / `SASAUTOS` | 未实现 |
+| `PARMBUFF` / `SYSPBUFF`、`MINOPERATOR` | 未实现 |
 
 ---
 
@@ -1556,13 +1575,12 @@ SUM(a, b, c, d)           /* 可变参数 */
 - PROC COPY
 
 ### 宏
-- %INCLUDE
-- %GOTO / %LABEL
-- %RETURN
-- %SYSFUNC
-- %SCAN / %SUBSTR 宏函数
-- 宏递归
-- 自动宏变量（SYSDATE, SYSTIME, SYSERR 等）
+- 编译/存储宏目录和 SASAUTOS 自动调用库
+- 向后 %GOTO
+- PARMBUFF / SYSPBUFF
+- MINOPERATOR / MINDELIMITER 宏头选项
+- `%INCLUDE` fileref 和路径中的宏变量展开
+- 宏引用的少数字扫描器边界情况
 
 ### 全局
 - OPTIONS 设置（仅解析，不改变行为）
