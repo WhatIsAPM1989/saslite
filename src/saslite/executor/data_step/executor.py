@@ -66,6 +66,10 @@ class LagState:
 _SENTINEL = object()
 
 
+class _VectorizedDataStepUnsupported(Exception):
+    """Internal signal to retry a DATA step with the PDV row engine."""
+
+
 class DataStepExecutor:
     """Executes a DATA step."""
 
@@ -278,6 +282,19 @@ class DataStepExecutor:
                     combined_df = self._combine_parallel_sets(set_groups, by_vars)
                 else:
                     combined_df = self._combine_inputs(input_datasets, by_vars)
+                vectorized_result = self._try_execute_vectorized_data_step(
+                    step,
+                    combined_df,
+                    pdv,
+                    eval_ctx,
+                    input_datasets,
+                    in_flag_names,
+                    set_nodes,
+                    by_vars,
+                    set_length_warnings,
+                )
+                if vectorized_result is not None:
+                    return vectorized_result
                 total_rows = len(combined_df)
                 for i in range(total_rows):
                     pdv.increment_n()
@@ -738,6 +755,479 @@ class DataStepExecutor:
                     return True
         return False
 
+    def _try_execute_vectorized_data_step(
+        self,
+        step: DataStepNode,
+        input_frame: pd.DataFrame,
+        pdv: PDV,
+        ctx: DataStepContext,
+        input_datasets: list[Dataset],
+        in_flag_names: set[str],
+        set_nodes: list[SetNode],
+        by_vars: list[str],
+        set_length_warnings: list[str],
+    ) -> StepResult | None:
+        """Execute a conservative numeric DATA step on whole pandas columns.
+
+        The fast path deliberately supports only stateless steps whose result
+        is independent for every observation. Any unsupported expression or
+        warning-worthy runtime condition makes the caller transparently retry
+        with the normal PDV row engine.
+        """
+        if not self._vectorized_step_is_eligible(step, pdv, set_nodes, by_vars):
+            return None
+        if self._vectorized_input_requires_pdv_diagnostics(input_frame, pdv):
+            return None
+
+        try:
+            frame = input_frame.copy()
+            column_map = {str(column).upper(): str(column) for column in frame.columns}
+
+            # Compile-time variables exist in the output descriptor even when
+            # no branch assigns them for a particular observation.
+            for variable in pdv.variables.values():
+                logical_name = variable.metadata.logical_name
+                if logical_name in column_map:
+                    continue
+                column_name = variable.metadata.name
+                initial = "" if variable.metadata.dtype == "character" else float("nan")
+                frame[column_name] = initial
+                column_map[logical_name] = column_name
+
+            observation_numbers = pd.Series(
+                range(1, len(frame) + 1),
+                index=frame.index,
+                dtype="int64",
+            )
+
+            # DATA-step WHERE is evaluated before executable statements,
+            # regardless of its textual position in the source.
+            where_statements = [
+                statement
+                for statement in step.statements
+                if isinstance(statement, WhereNode)
+            ]
+            if where_statements:
+                selected = self._vectorized_bool(
+                    self._vectorized_expression(
+                        where_statements[0].condition,
+                        frame,
+                        column_map,
+                        pdv,
+                        observation_numbers,
+                    ),
+                    frame.index,
+                )
+                frame = frame.loc[selected].copy()
+
+            for statement in step.statements:
+                if isinstance(statement, AssignNode):
+                    self._vectorized_assign(
+                        statement,
+                        frame,
+                        frame.index,
+                        column_map,
+                        pdv,
+                        observation_numbers,
+                    )
+                elif isinstance(statement, IfNode):
+                    frame = self._vectorized_if(
+                        statement,
+                        frame,
+                        frame.index,
+                        column_map,
+                        pdv,
+                        observation_numbers,
+                        allow_subset=True,
+                    )
+
+            return self._store_declared_outputs(
+                step,
+                ctx,
+                pdv,
+                input_datasets,
+                in_flag_names,
+                [*set_length_warnings, *pdv.character_length_warnings()],
+                output_frame=frame.reset_index(drop=True),
+            )
+        except (_VectorizedDataStepUnsupported, TypeError, ValueError):
+            return None
+
+    def _vectorized_input_requires_pdv_diagnostics(
+        self,
+        frame: pd.DataFrame,
+        pdv: PDV,
+    ) -> bool:
+        """Detect input values whose PDV load would emit a warning."""
+        columns = {str(column).upper(): str(column) for column in frame.columns}
+        encoding = str(self.session.get_option("ENCODING", "utf-8"))
+        for logical_name, variable in pdv.variables.items():
+            column_name = columns.get(logical_name)
+            if column_name is None:
+                continue
+            series = frame[column_name]
+            present = series.loc[~series.isna()]
+            if present.empty:
+                continue
+            if variable.metadata.dtype == "numeric":
+                if not pd.api.types.is_numeric_dtype(present.dtype):
+                    if present.map(lambda value: isinstance(value, str)).any():
+                        return True
+                continue
+            if pd.api.types.is_numeric_dtype(present.dtype):
+                return True
+            if present.map(lambda value: isinstance(value, (int, float))).any():
+                return True
+            limit = variable.metadata.length
+            if limit is not None:
+                try:
+                    byte_lengths = present.astype(str).str.encode(encoding).str.len()
+                except (LookupError, UnicodeEncodeError):
+                    return True
+                if byte_lengths.gt(limit).any():
+                    return True
+        return False
+
+    def _vectorized_step_is_eligible(
+        self,
+        step: DataStepNode,
+        pdv: PDV,
+        set_nodes: list[SetNode],
+        by_vars: list[str],
+    ) -> bool:
+        """Return whether a DATA step can safely bypass observation iteration."""
+        if (
+            len(set_nodes) != 1
+            or by_vars
+            or set_nodes[0].end_var
+            or step.extra_targets
+            or step.target.upper() == "_NULL_"
+            or self._has_explicit_output(step.statements)
+            or "WHERE" in step.target_options
+        ):
+            return False
+
+        harmless = (
+            SetNode, WhereNode, KeepNode, DropNode, RenameNode,
+            FormatNode, FormatResetNode, InformatResetNode, LabelNode,
+            LengthNode, AttribNode,
+        )
+        for statement in step.statements:
+            if isinstance(statement, harmless):
+                continue
+            if isinstance(statement, AssignNode):
+                variable = pdv.variables.get(statement.target.upper())
+                if variable is None or variable.metadata.dtype != "numeric":
+                    return False
+                if not self._vectorized_expression_is_supported(statement.expr):
+                    return False
+                continue
+            if isinstance(statement, IfNode):
+                if not self._vectorized_if_is_supported(statement, pdv):
+                    return False
+                continue
+            return False
+        return True
+
+    def _vectorized_if_is_supported(self, statement: IfNode, pdv: PDV) -> bool:
+        if not self._vectorized_expression_is_supported(statement.condition):
+            return False
+        for branch in (statement.then_stmt, statement.else_stmt):
+            if branch is None:
+                continue
+            if isinstance(branch, AssignNode):
+                variable = pdv.variables.get(branch.target.upper())
+                if (
+                    variable is None
+                    or variable.metadata.dtype != "numeric"
+                    or not self._vectorized_expression_is_supported(branch.expr)
+                ):
+                    return False
+            elif isinstance(branch, IfNode):
+                if not self._vectorized_if_is_supported(branch, pdv):
+                    return False
+            else:
+                return False
+        return True
+
+    def _vectorized_expression_is_supported(self, expression: Any) -> bool:
+        if isinstance(expression, (LiteralNode, VariableNode)):
+            return True
+        if isinstance(expression, BinaryOpNode):
+            return (
+                expression.op.upper() in {
+                    "+", "-", "*", "/", "=", "EQ", "NE", "<>", "^=", "~=",
+                    ">", "GT", ">=", "GE", "<", "LT", "<=", "LE", "AND", "OR",
+                }
+                and self._vectorized_expression_is_supported(expression.left)
+                and self._vectorized_expression_is_supported(expression.right)
+            )
+        if isinstance(expression, UnaryOpNode):
+            return (
+                expression.op.upper() in {"NOT", "^", "~", "+", "-"}
+                and self._vectorized_expression_is_supported(expression.operand)
+            )
+        if isinstance(expression, FunctionCallNode):
+            return (
+                expression.name.upper() in {"IN", "MISSING", "N", "NMISS", "SUM"}
+                and all(self._vectorized_expression_is_supported(arg) for arg in expression.args)
+            )
+        return False
+
+    def _vectorized_if(
+        self,
+        statement: IfNode,
+        frame: pd.DataFrame,
+        active_index: pd.Index,
+        column_map: dict[str, str],
+        pdv: PDV,
+        observation_numbers: pd.Series,
+        *,
+        allow_subset: bool,
+    ) -> pd.DataFrame:
+        active_frame = frame.loc[active_index]
+        condition = self._vectorized_bool(
+            self._vectorized_expression(
+                statement.condition,
+                active_frame,
+                column_map,
+                pdv,
+                observation_numbers,
+            ),
+            active_index,
+        )
+        true_index = active_index[condition.to_numpy()]
+        false_index = active_index[~condition.to_numpy()]
+
+        if statement.then_stmt is None and statement.else_stmt is None:
+            if not allow_subset:
+                raise _VectorizedDataStepUnsupported
+            return frame.loc[true_index].copy()
+
+        if statement.then_stmt is not None:
+            self._vectorized_branch(
+                statement.then_stmt, frame, true_index, column_map, pdv,
+                observation_numbers,
+            )
+        if statement.else_stmt is not None:
+            self._vectorized_branch(
+                statement.else_stmt, frame, false_index, column_map, pdv,
+                observation_numbers,
+            )
+        return frame
+
+    def _vectorized_branch(
+        self,
+        statement: Any,
+        frame: pd.DataFrame,
+        active_index: pd.Index,
+        column_map: dict[str, str],
+        pdv: PDV,
+        observation_numbers: pd.Series,
+    ) -> None:
+        if active_index.empty:
+            return
+        if isinstance(statement, AssignNode):
+            self._vectorized_assign(
+                statement, frame, active_index, column_map, pdv,
+                observation_numbers,
+            )
+            return
+        if isinstance(statement, IfNode):
+            self._vectorized_if(
+                statement, frame, active_index, column_map, pdv,
+                observation_numbers, allow_subset=False,
+            )
+            return
+        raise _VectorizedDataStepUnsupported
+
+    def _vectorized_assign(
+        self,
+        statement: AssignNode,
+        frame: pd.DataFrame,
+        active_index: pd.Index,
+        column_map: dict[str, str],
+        pdv: PDV,
+        observation_numbers: pd.Series,
+    ) -> None:
+        if active_index.empty:
+            return
+        column_name = column_map[statement.target.upper()]
+        values = self._vectorized_expression(
+            statement.expr,
+            frame.loc[active_index],
+            column_map,
+            pdv,
+            observation_numbers,
+        )
+        values = self._vectorized_series(values, active_index)
+        if not pd.api.types.is_numeric_dtype(values.dtype):
+            raise _VectorizedDataStepUnsupported
+        if pd.api.types.is_bool_dtype(values.dtype):
+            values = values.astype("int64")
+        frame.loc[active_index, column_name] = values
+
+    def _vectorized_expression(
+        self,
+        expression: Any,
+        frame: pd.DataFrame,
+        column_map: dict[str, str],
+        pdv: PDV,
+        observation_numbers: pd.Series,
+    ) -> Any:
+        index = frame.index
+        if isinstance(expression, LiteralNode):
+            return expression.value
+        if isinstance(expression, VariableNode):
+            logical_name = expression.name.upper()
+            if logical_name == "_N_":
+                return observation_numbers.loc[index]
+            if logical_name == "_ERROR_":
+                return 0
+            column_name = column_map.get(logical_name)
+            if column_name is not None:
+                return frame[column_name]
+            if pdv.has_compile_time_source(logical_name):
+                return float("nan")
+            raise _VectorizedDataStepUnsupported
+        if isinstance(expression, UnaryOpNode):
+            operand = self._vectorized_expression(
+                expression.operand, frame, column_map, pdv, observation_numbers
+            )
+            if expression.op.upper() in {"NOT", "^", "~"}:
+                return ~self._vectorized_bool(operand, index)
+            numeric = self._vectorized_numeric(operand, index, allow_missing=False)
+            return -numeric if expression.op == "-" else numeric
+        if isinstance(expression, BinaryOpNode):
+            op = expression.op.upper()
+            left = self._vectorized_expression(
+                expression.left, frame, column_map, pdv, observation_numbers
+            )
+            right = self._vectorized_expression(
+                expression.right, frame, column_map, pdv, observation_numbers
+            )
+            if op in {"AND", "OR"}:
+                left_bool = self._vectorized_bool(left, index)
+                right_bool = self._vectorized_bool(right, index)
+                return left_bool & right_bool if op == "AND" else left_bool | right_bool
+            if op in {"=", "EQ", "NE", "<>", "^=", "~=", ">", "GT", ">=", "GE", "<", "LT", "<=", "LE"}:
+                return self._vectorized_compare(left, right, op, index)
+            left_numeric = self._vectorized_numeric(left, index, allow_missing=False)
+            right_numeric = self._vectorized_numeric(right, index, allow_missing=False)
+            if op == "+":
+                return left_numeric + right_numeric
+            if op == "-":
+                return left_numeric - right_numeric
+            if op == "*":
+                return left_numeric * right_numeric
+            if op == "/":
+                if (right_numeric == 0).any():
+                    raise _VectorizedDataStepUnsupported
+                return left_numeric / right_numeric
+            raise _VectorizedDataStepUnsupported
+        if isinstance(expression, FunctionCallNode):
+            name = expression.name.upper()
+            args = [
+                self._vectorized_expression(arg, frame, column_map, pdv, observation_numbers)
+                for arg in expression.args
+            ]
+            if name == "MISSING" and len(args) == 1:
+                return self._vectorized_series(args[0], index).isna()
+            if name == "IN" and len(args) >= 2:
+                result = pd.Series(False, index=index)
+                for candidate in args[1:]:
+                    result |= self._vectorized_compare(args[0], candidate, "=", index)
+                return result
+            if name in {"N", "NMISS", "SUM"} and args:
+                values = pd.concat(
+                    [self._vectorized_numeric(arg, index, allow_missing=True) for arg in args],
+                    axis=1,
+                )
+                if name == "N":
+                    return values.notna().sum(axis=1)
+                if name == "NMISS":
+                    return values.isna().sum(axis=1)
+                return values.sum(axis=1, skipna=True)
+            raise _VectorizedDataStepUnsupported
+        raise _VectorizedDataStepUnsupported
+
+    @staticmethod
+    def _vectorized_series(value: Any, index: pd.Index) -> pd.Series:
+        if isinstance(value, pd.Series):
+            return value.reindex(index)
+        return pd.Series(value, index=index)
+
+    def _vectorized_numeric(
+        self,
+        value: Any,
+        index: pd.Index,
+        *,
+        allow_missing: bool,
+    ) -> pd.Series:
+        series = self._vectorized_series(value, index)
+        if not pd.api.types.is_numeric_dtype(series.dtype):
+            raise _VectorizedDataStepUnsupported
+        if not allow_missing and series.isna().any():
+            # The row engine must aggregate SAS missing-generation warnings.
+            raise _VectorizedDataStepUnsupported
+        return series
+
+    def _vectorized_bool(self, value: Any, index: pd.Index) -> pd.Series:
+        series = self._vectorized_series(value, index)
+        missing = series.isna()
+        if pd.api.types.is_numeric_dtype(series.dtype):
+            return ((series != 0) & ~missing).astype(bool)
+        if pd.api.types.is_string_dtype(series.dtype) or series.dtype == object:
+            return ((series.astype(str).str.len() > 0) & ~missing).astype(bool)
+        raise _VectorizedDataStepUnsupported
+
+    def _vectorized_compare(
+        self,
+        left: Any,
+        right: Any,
+        op: str,
+        index: pd.Index,
+    ) -> pd.Series:
+        left_series = self._vectorized_series(left, index)
+        right_series = self._vectorized_series(right, index)
+        left_numeric = pd.api.types.is_numeric_dtype(left_series.dtype)
+        right_numeric = pd.api.types.is_numeric_dtype(right_series.dtype)
+        if left_numeric != right_numeric:
+            raise _VectorizedDataStepUnsupported
+
+        left_missing = left_series.isna()
+        right_missing = right_series.isna()
+        both_present = ~left_missing & ~right_missing
+        normalized = {
+            "EQ": "=", "NE": "NE", "~=": "NE", "<>": "NE", "^=": "NE",
+            "GT": ">", "GE": ">=", "LT": "<", "LE": "<=",
+        }.get(op, op)
+        if normalized == "=":
+            return (left_missing & right_missing) | (
+                both_present & (left_series == right_series)
+            )
+        if normalized == "NE":
+            return (left_missing ^ right_missing) | (
+                both_present & (left_series != right_series)
+            )
+        if normalized == ">":
+            return (~left_missing & right_missing) | (
+                both_present & (left_series > right_series)
+            )
+        if normalized == ">=":
+            return (~left_missing & right_missing) | (
+                both_present & (left_series >= right_series)
+            )
+        if normalized == "<":
+            return (left_missing & ~right_missing) | (
+                both_present & (left_series < right_series)
+            )
+        if normalized == "<=":
+            return (left_missing & ~right_missing) | (
+                both_present & (left_series <= right_series)
+            )
+        raise _VectorizedDataStepUnsupported
+
     def _execute_statements(self, statements: list[Any], ctx: DataStepContext) -> None:
         """Execute all statements in the DATA step body."""
         for stmt in statements:
@@ -1081,6 +1571,7 @@ class DataStepExecutor:
         input_datasets: list[Dataset],
         in_flag_names: set[str],
         warnings: list[str] | None = None,
+        output_frame: pd.DataFrame | None = None,
     ) -> StepResult:
         """Materialize every DATA target using named and broadcast OUTPUT rows."""
         self._finalize_data_step_schema_warnings(pdv)
@@ -1109,9 +1600,12 @@ class DataStepExecutor:
                 continue
             libref, member = self._split_output_target(target)
             full_name = f"{libref}.{member}"
-            rows = list(ctx.output_rows)
-            for key in {target.upper(), member, full_name}:
-                rows.extend(ctx.target_rows.get(key, []))
+            if output_frame is not None:
+                rows: list[dict[str, Any]] | pd.DataFrame = output_frame
+            else:
+                rows = list(ctx.output_rows)
+                for key in {target.upper(), member, full_name}:
+                    rows.extend(ctx.target_rows.get(key, []))
             out_ds = self._build_output_dataset(
                 rows,
                 member,
@@ -1140,7 +1634,7 @@ class DataStepExecutor:
 
     def _build_output_dataset(
         self,
-        rows: list[dict[str, Any]],
+        rows: list[dict[str, Any]] | pd.DataFrame,
         member: str,
         libref: str,
         step: DataStepNode,
@@ -1149,7 +1643,9 @@ class DataStepExecutor:
         in_flag_names: set[str],
         output_options: dict[str, Any],
     ) -> Dataset:
-        if rows:
+        if isinstance(rows, pd.DataFrame):
+            df = rows.copy()
+        elif rows:
             df = pd.DataFrame(rows)
         else:
             df = pd.DataFrame(columns=[

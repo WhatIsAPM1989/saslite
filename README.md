@@ -529,8 +529,12 @@ environment-specific SAS features are not currently supported:
 When SASLite cannot parse or execute a program exactly, simplify the program to
 the supported subset or use the Python API to prepare input datasets directly.
 
-**Performance Note:** SASLite is optimized for datasets up to ~1M rows. For larger
-datasets, consider using SAS itself or chunking strategies with the Python API.
+**Performance Note:** Stateless numeric DATA steps with one `SET`, column
+assignments, `IF`/`WHERE` filters, and common numeric missing-value functions
+use a vectorized pandas fast path. Stateful or diagnostic-sensitive constructs
+automatically fall back to the observation-by-observation PDV engine. SASLite
+is optimized for datasets up to ~1M rows; for larger datasets, consider using
+SAS itself or chunking strategies with the Python API.
 
 ## Development
 
