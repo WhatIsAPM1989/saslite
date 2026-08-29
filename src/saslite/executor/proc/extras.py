@@ -14,7 +14,7 @@ import pandas as pd
 from saslite.ast.proc import ProcNode, VarListNode, ByNode, ClassNode
 from saslite.ast.data_step import DatasetRefNode
 from saslite.executor.expression_eval import ExpressionEvaluator
-from saslite.executor.ods import write_report_destinations
+from saslite.executor.ods import write_output_tables, write_report_destinations
 from saslite.functions import build_default_registry
 from saslite.runtime.dataset import Dataset
 from saslite.runtime.execution_result import StepResult
@@ -719,12 +719,15 @@ def handle_proc_tabulate(proc: ProcNode, session: Session, reporter: Reporter) -
 
     class_names: list[str] = []
     var_names: list[str] = []
+    by_names: list[str] = []
     tables: list[list[list[str]]] = []
     for stmt in proc.statements:
         if isinstance(stmt, ClassNode):
             class_names = [v.upper() for v in stmt.variables]
         elif isinstance(stmt, VarListNode):
             var_names = [v.upper() for v in stmt.variables]
+        elif isinstance(stmt, ByNode):
+            by_names = [v.upper() for v in stmt.variables]
         elif isinstance(stmt, dict) and stmt.get("action") == "table":
             tables.append(stmt.get("terms", []))
 
@@ -736,42 +739,99 @@ def handle_proc_tabulate(proc: ProcNode, session: Session, reporter: Reporter) -
     buf.write(f"  PROC TABULATE: {ds.metadata.libref}.{ds.metadata.member_name}\n")
     buf.write(f"{'=' * 60}\n")
 
-    for terms in tables:
-        # Each term is a list like [CLASSVAR, ANALYSISVAR, STAT]
-        for term in terms:
-            class_part = [t for t in term if t in class_names and t in cmap]
-            analysis_part = [t for t in term if t in var_names and t in cmap]
-            stat_part = [t for t in term if t in _TAB_STATS]
+    ods_frames: list[pd.DataFrame] = []
+    for table_number, terms in enumerate(tables, 1):
+        # Commas select table dimensions.  Statistics and analysis variables
+        # can occur in either dimension, so evaluate their combined crossing.
+        tokens = [token for term in terms for token in term]
+        class_part = list(dict.fromkeys(
+            token for token in tokens if token in class_names and token in cmap
+        ))
+        missing_by = [name for name in by_names if name not in cmap]
+        if missing_by:
+            return StepResult(
+                success=False,
+                error=f"PROC TABULATE: BY variable {missing_by[0]} not found",
+            )
+        class_part = list(dict.fromkeys([*by_names, *class_part]))
+        analysis_part = list(dict.fromkeys(
+            token for token in tokens if token in var_names and token in cmap
+        ))
+        stat_part = list(dict.fromkeys(token for token in tokens if token in _TAB_STATS))
+        include_all = "ALL" in tokens
+        actual_classes = [cmap[name] for name in class_part]
 
-            stat = _TAB_STATS.get(stat_part[0], "mean") if stat_part else "mean"
-            stat_label = stat_part[0] if stat_part else "MEAN"
-
-            if not analysis_part:
-                # Pure class frequency table
-                if class_part:
-                    actual = [cmap[c] for c in class_part]
-                    counts = df.groupby(actual, dropna=False).size()
-                    buf.write(f"\n  Table: {' * '.join(class_part)} (N)\n\n")
-                    buf.write(counts.to_string())
-                    buf.write("\n")
+        if not analysis_part:
+            if not actual_classes:
                 continue
-
-            a_cols = [cmap[a] for a in analysis_part]
-            if class_part:
-                actual = [cmap[c] for c in class_part]
-                grouped = df.groupby(actual, dropna=False)[a_cols].agg(stat)
-                buf.write(f"\n  Table: {' * '.join(class_part)} * "
-                          f"{' * '.join(analysis_part)} ({stat_label})\n\n")
-                buf.write(grouped.to_string())
-                buf.write("\n")
-            else:
-                vals = df[a_cols].agg(stat)
-                buf.write(f"\n  Table: {' * '.join(analysis_part)} ({stat_label})\n\n")
-                buf.write(vals.to_string())
-                buf.write("\n")
+            table_frame = (
+                df.groupby(actual_classes, dropna=False, sort=False)
+                .size().rename("N").reset_index()
+            )
+            if include_all:
+                total = {column: "All" for column in actual_classes}
+                total["N"] = len(df)
+                table_frame = pd.concat(
+                    [table_frame, pd.DataFrame([total])], ignore_index=True
+                )
+            title = f"{' * '.join(class_part)} (N)"
+        else:
+            statistics = stat_part or ["MEAN"]
+            actual_analysis = [cmap[name] for name in analysis_part]
+            pieces: list[pd.DataFrame] = []
+            for stat_label in statistics:
+                statistic = _TAB_STATS[stat_label]
+                if actual_classes:
+                    values = (
+                        df.groupby(actual_classes, dropna=False, sort=False)[actual_analysis]
+                        .agg(statistic).reset_index()
+                    )
+                else:
+                    values = pd.DataFrame([
+                        df[actual_analysis].agg(statistic).to_dict()
+                    ])
+                values = values.rename(columns={
+                    column: f"{column}_{stat_label.title()}"
+                    for column in actual_analysis
+                })
+                pieces.append(values)
+            table_frame = pieces[0]
+            for piece in pieces[1:]:
+                if actual_classes:
+                    table_frame = table_frame.merge(piece, on=actual_classes, how="outer")
+                else:
+                    table_frame = pd.concat(
+                        [table_frame.reset_index(drop=True), piece.reset_index(drop=True)],
+                        axis=1,
+                    )
+            if include_all and actual_classes:
+                total = {column: "All" for column in actual_classes}
+                for stat_label in statistics:
+                    statistic = _TAB_STATS[stat_label]
+                    for column in actual_analysis:
+                        total[f"{column}_{stat_label.title()}"] = getattr(
+                            df[column], statistic
+                        )() if statistic != "count" else df[column].count()
+                table_frame = pd.concat(
+                    [table_frame, pd.DataFrame([total])], ignore_index=True
+                )
+            title = (
+                f"{' * '.join(class_part + analysis_part)} "
+                f"({', '.join(statistics)})"
+            )
+        buf.write(f"\n  Table: {title}\n\n")
+        buf.write(table_frame.to_string(index=False))
+        buf.write("\n")
+        table_frame.insert(0, "_TABLE_", table_number)
+        ods_frames.append(table_frame)
 
     output = buf.getvalue()
     reporter.log(output)
+    table_output = (
+        pd.concat(ods_frames, ignore_index=True, sort=False)
+        if ods_frames else pd.DataFrame()
+    )
+    write_output_tables(session, {"TABLE": table_output}, proc=proc)
     return StepResult(success=True, rows_affected=ds.nrow, output_messages=[output])
 
 
@@ -810,6 +870,7 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
         return StepResult(success=False, error="PROC REPORT: no valid columns")
 
     group_cols = []
+    across_cols = []
     analysis: dict[str, str] = {}  # actual col -> stat
     for cu in columns:
         if cu not in cmap:
@@ -818,18 +879,74 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
         attrs = [a.upper() for a in d.get("attrs", [])] if d else []
         if "GROUP" in attrs or "ORDER" in attrs:
             group_cols.append(cmap[cu])
+        elif "ACROSS" in attrs:
+            across_cols.append(cmap[cu])
         else:
-            stat = next((s for s in ("SUM", "MEAN", "MIN", "MAX", "N") if s in attrs), None)
+            stat = next((s for s in ("SUM", "MEAN", "MIN", "MAX", "N", "STD", "MEDIAN") if s in attrs), None)
             if "ANALYSIS" in attrs or stat:
                 analysis[cmap[cu]] = (stat or "SUM").lower()
 
-    if group_cols and analysis:
+    by_columns: list[str] = []
+    for statement in proc.statements:
+        if isinstance(statement, ByNode):
+            for name in statement.variables:
+                actual = cmap.get(name.upper())
+                if actual is None:
+                    return StepResult(
+                        success=False,
+                        error=f"PROC REPORT: BY variable {name} not found",
+                    )
+                by_columns.append(actual)
+    grouping_columns = list(dict.fromkeys([*by_columns, *group_cols]))
+
+    if across_cols and analysis:
+        pivot_index = grouping_columns or by_columns
+        pivot = pd.pivot_table(
+            df,
+            index=pivot_index or None,
+            columns=across_cols,
+            values=list(analysis),
+            aggfunc={column: ("count" if statistic == "n" else statistic)
+                     for column, statistic in analysis.items()},
+            dropna=not bool(proc.options.get("MISSING")),
+            sort=False,
+        )
+        if isinstance(pivot, pd.Series):
+            pivot = pivot.to_frame().T
+        report_df = pivot.reset_index()
+        report_df.columns = [
+            "_".join(str(part) for part in column if str(part) not in {"", "None"})
+            if isinstance(column, tuple) else str(column)
+            for column in report_df.columns
+        ]
+    elif grouping_columns and analysis:
         agg_spec = {col: ("count" if st == "n" else st) for col, st in analysis.items()}
-        report_df = df.groupby(group_cols, dropna=False).agg(agg_spec).reset_index()
-    elif group_cols:
-        report_df = df[actual_cols].drop_duplicates(subset=group_cols).reset_index(drop=True)
+        report_df = df.groupby(grouping_columns, dropna=False, sort=False).agg(agg_spec).reset_index()
+    elif grouping_columns:
+        selected = list(dict.fromkeys([*by_columns, *actual_cols]))
+        report_df = df[selected].drop_duplicates(subset=grouping_columns).reset_index(drop=True)
     else:
         report_df = df[actual_cols]
+
+    rbreak = next((
+        statement for statement in proc.statements
+        if isinstance(statement, dict) and statement.get("action") == "rbreak"
+        and "SUMMARIZE" in statement.get("options", [])
+    ), None)
+    if rbreak is not None and analysis and not across_cols:
+        summary = {column: "" for column in report_df.columns}
+        if grouping_columns:
+            summary[grouping_columns[0]] = "Total"
+        for column, statistic in analysis.items():
+            if column not in df.columns or column not in report_df.columns:
+                continue
+            operation = "count" if statistic == "n" else statistic
+            summary[column] = getattr(df[column], operation)()
+        summary_frame = pd.DataFrame([summary])
+        if rbreak.get("location") == "BEFORE":
+            report_df = pd.concat([summary_frame, report_df], ignore_index=True)
+        else:
+            report_df = pd.concat([report_df, summary_frame], ignore_index=True)
 
     # Apply presentation attributes from DEFINE. NOPRINT columns still take
     # part in grouping/ordering but are excluded from LST and RTF output.
@@ -877,6 +994,8 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
         out_libref, out_member = _split_name(out_name)
         out_ds = Dataset.from_dataframe(report_df, name=out_member, libref=out_libref)
         session.put_dataset(out_libref, out_member, out_ds)
+
+    write_output_tables(session, {"REPORT": report_df}, proc=proc)
 
     return StepResult(
         success=True,

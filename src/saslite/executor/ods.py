@@ -8,7 +8,9 @@ from typing import Any
 import pandas as pd
 
 from saslite.ast.proc import ProcNode
+from saslite.ast.data_step import DatasetRefNode
 from saslite.diagnostics.reporter import Reporter
+from saslite.runtime.dataset import Dataset
 from saslite.runtime.execution_result import StepResult
 from saslite.session.session import Session
 
@@ -101,6 +103,54 @@ def write_report_destinations(
                 if not listing_text.endswith("\n"):
                     stream.write("\n")
         written.append(f"ODS {destination} wrote {path}")
+    return written
+
+
+def output_items(session: Session, proc: ProcNode | None = None) -> list[tuple[Any, Any]]:
+    """Return active ODS OUTPUT assignments, preserving duplicate table targets.
+
+    SAS permits the same output object to be routed to more than one data set,
+    commonly with different target data-set options.  The historical mapping
+    on ``Session`` cannot represent duplicates, so consumers should use this
+    ordered form.
+    """
+    items = list(getattr(session, "_ods_output_items", []))
+    if not items:
+        items = list(getattr(session, "_ods_output_targets", {}).items())
+    if proc is not None:
+        for statement in proc.statements:
+            if not isinstance(statement, dict) or statement.get("action") != "ods":
+                continue
+            local_items = list(statement.get("table_items", []))
+            items.extend(local_items or statement.get("tables", {}).items())
+    return items
+
+
+def write_output_tables(
+    session: Session,
+    tables: dict[str, pd.DataFrame],
+    *,
+    proc: ProcNode | None = None,
+) -> list[str]:
+    """Materialize requested ODS output objects as SASLite data sets."""
+    normalized = {str(name).upper(): frame for name, frame in tables.items()}
+    written: list[str] = []
+    for table_name, target in output_items(session, proc):
+        frame = normalized.get(str(table_name).upper())
+        if frame is None or not isinstance(target, DatasetRefNode):
+            continue
+        dataset = Dataset.from_dataframe(
+            frame.copy(),
+            name=target.name,
+            libref=target.libref,
+        )
+        # Import lazily: registry imports the ODS handler through the facade,
+        # while several PROC modules also depend on this helper.
+        from saslite.executor.proc.registry import _apply_export_dataset_options
+
+        dataset = _apply_export_dataset_options(dataset, target.options, session)
+        session.put_dataset(target.libref, target.name, dataset)
+        written.append(f"{str(table_name)}={target.libref}.{target.name}")
     return written
 
 

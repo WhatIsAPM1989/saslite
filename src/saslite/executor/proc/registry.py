@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import io
+import math
 from typing import Any
 
+import numpy as np
 import pandas as pd
+from scipy import stats
 
 from saslite.ast.proc import ProcNode, VarListNode, ByNode, ClassNode, FreqTableSpec
 from saslite.ast.data_step import DatasetRefNode, WhereNode
@@ -17,6 +20,7 @@ from saslite.runtime.formatting import csv_dataframe
 from saslite.runtime.types import sas_bool
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
+from saslite.executor.ods import write_output_tables
 
 
 def handle_proc_sgrender(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
@@ -676,6 +680,8 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
     # Collect FreqTableSpec from statements
     table_specs: list[FreqTableSpec] = []
     by_names: list[str] = []
+    weight_name = ""
+    exact_statistics: set[str] = set()
     for stmt in proc.statements:
         if isinstance(stmt, list):
             table_specs.extend([s for s in stmt if isinstance(s, FreqTableSpec)])
@@ -683,6 +689,12 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
             table_specs.append(stmt)
         elif isinstance(stmt, ByNode):
             by_names = stmt.variables
+        elif isinstance(stmt, dict) and stmt.get("action") == "weight":
+            weight_name = str(stmt.get("variable", ""))
+        elif isinstance(stmt, dict) and stmt.get("action") == "exact":
+            exact_statistics.update(
+                str(item).upper() for item in stmt.get("statistics", [])
+            )
 
     if not table_specs:
         return StepResult(success=False, error="PROC FREQ requires TABLES statement")
@@ -704,12 +716,26 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
             )
         by_resolved.append(actual)
 
+    weight_column = col_map.get(weight_name.upper()) if weight_name else None
+    if weight_name and weight_column is None:
+        return StepResult(
+            success=False,
+            error=f"WEIGHT variable {weight_name} not found in dataset",
+        )
+
     if by_resolved:
         grouped_data = list(
             ds.data.groupby(by_resolved, sort=False, dropna=False)
         )
     else:
         grouped_data = [((), ds.data)]
+
+    ods_one_way: list[pd.DataFrame] = []
+    ods_cross_tabs: list[pd.DataFrame] = []
+    ods_chi_square: list[pd.DataFrame] = []
+    ods_fisher: list[pd.DataFrame] = []
+    ods_measures: list[pd.DataFrame] = []
+    ods_nlevels: list[pd.DataFrame] = []
 
     for spec in table_specs:
         # Resolve variable names (case-insensitive)
@@ -729,6 +755,13 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
         show_row = not opts.get("NOROW", False)
         show_col = not opts.get("NOCOL", False)
         show_pct = not opts.get("NOPERCENT", False)
+        wants_chisq = bool(opts.get("CHISQ") or opts.get("ALL"))
+        wants_fisher = bool(
+            opts.get("FISHER")
+            or opts.get("EXACT")
+            or "FISHER" in exact_statistics
+        )
+        wants_measures = bool(opts.get("MEASURES") or opts.get("ALL"))
 
         for group_key, block in grouped_data:
             if by_resolved:
@@ -739,6 +772,11 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
                 )
                 buf.write(f"\n  BY {description}\n")
 
+            by_values = (
+                group_key if isinstance(group_key, tuple) else (group_key,)
+            ) if by_resolved else ()
+            by_payload = dict(zip(by_resolved, by_values))
+
             if len(vars_resolved) == 1:
                 _freq_one_way(
                     buf,
@@ -747,6 +785,22 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
                     include_missing,
                     order=order,
                 )
+                one_way = _freq_one_way_ods(
+                    block,
+                    vars_resolved[0],
+                    include_missing=include_missing,
+                    order=order,
+                    weight_column=weight_column,
+                )
+                one_way = _prepend_freq_by(one_way, by_payload)
+                ods_one_way.append(one_way)
+                ods_nlevels.append(_freq_nlevels_ods(
+                    block, vars_resolved, by_payload
+                ))
+                if wants_chisq:
+                    ods_chi_square.append(_freq_one_way_chisq_ods(
+                        one_way, vars_resolved[0], by_payload
+                    ))
             else:
                 _freq_crosstab(
                     buf,
@@ -757,6 +811,33 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
                     show_col,
                     show_pct,
                 )
+                cross_tab, contingency = _freq_cross_tab_ods(
+                    block,
+                    vars_resolved,
+                    include_missing=include_missing,
+                    weight_column=weight_column,
+                )
+                cross_tab = _prepend_freq_by(cross_tab, by_payload)
+                ods_cross_tabs.append(cross_tab)
+                ods_nlevels.append(_freq_nlevels_ods(
+                    block, vars_resolved, by_payload
+                ))
+                if wants_chisq:
+                    ods_chi_square.append(_freq_chisq_ods(
+                        contingency, by_payload
+                    ))
+                    if contingency.shape == (2, 2):
+                        ods_fisher.append(_freq_fisher_ods(
+                            contingency, by_payload
+                        ))
+                elif wants_fisher and contingency.shape == (2, 2):
+                    ods_fisher.append(_freq_fisher_ods(
+                        contingency, by_payload
+                    ))
+                if wants_measures and contingency.shape == (2, 2):
+                    ods_measures.append(_freq_measures_ods(
+                        contingency, by_payload
+                    ))
 
         out_ref = opts.get("OUT", "")
         if out_ref:
@@ -817,7 +898,254 @@ def handle_proc_freq(proc: ProcNode, session: Session, reporter: Reporter) -> St
     output = buf.getvalue()
     reporter.log(output)
 
+    outputs = {
+        "ONEWAYFREQS": _concat_freq_frames(ods_one_way),
+        "CROSSTABFREQS": _concat_freq_frames(ods_cross_tabs),
+        "CHISQ": _concat_freq_frames(ods_chi_square),
+        "FISHERSEXACT": _concat_freq_frames(ods_fisher),
+        "MEASURES": _concat_freq_frames(ods_measures),
+        "NLEVELS": _concat_freq_frames(ods_nlevels),
+    }
+    write_output_tables(session, outputs, proc=proc)
+
     return StepResult(success=True, rows_affected=ds.nrow, output_messages=[output])
+
+
+def _concat_freq_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+
+
+def _prepend_freq_by(frame: pd.DataFrame, values: dict[str, Any]) -> pd.DataFrame:
+    result = frame.copy()
+    for position, (name, value) in enumerate(values.items()):
+        if name not in result.columns:
+            result.insert(position, name, value)
+    return result
+
+
+def _freq_weighted_counts(
+    frame: pd.DataFrame,
+    variables: list[str],
+    *,
+    include_missing: bool,
+    weight_column: str | None,
+) -> pd.DataFrame:
+    working = frame.copy()
+    if not include_missing:
+        working = working.dropna(subset=variables)
+    if weight_column is None:
+        return (
+            working.groupby(variables, dropna=not include_missing, sort=False)
+            .size().rename("Frequency").reset_index()
+        )
+    weights = pd.to_numeric(working[weight_column], errors="coerce").fillna(0.0)
+    working = working.assign(__FREQ_WEIGHT__=weights.where(weights > 0, 0.0))
+    return (
+        working.groupby(variables, dropna=not include_missing, sort=False)["__FREQ_WEIGHT__"]
+        .sum().rename("Frequency").reset_index()
+    )
+
+
+def _freq_one_way_ods(
+    frame: pd.DataFrame,
+    variable: str,
+    *,
+    include_missing: bool,
+    order: str,
+    weight_column: str | None,
+) -> pd.DataFrame:
+    result = _freq_weighted_counts(
+        frame, [variable], include_missing=include_missing,
+        weight_column=weight_column,
+    )
+    if order == "FREQ":
+        result = result.sort_values("Frequency", ascending=False, kind="stable")
+    elif order in {"INTERNAL", "FORMATTED"}:
+        result = result.sort_values(variable, kind="stable", na_position="first")
+    result = result.reset_index(drop=True)
+    total = float(result["Frequency"].sum())
+    result["Percent"] = result["Frequency"] / total * 100.0 if total else 0.0
+    result["CumFrequency"] = result["Frequency"].cumsum()
+    result["CumPercent"] = result["Percent"].cumsum()
+    result.insert(0, f"F_{variable}", result[variable].map(_fmt_freq_val))
+    result.insert(0, "Table", f"Table {variable}")
+    return result
+
+
+def _freq_cross_tab_ods(
+    frame: pd.DataFrame,
+    variables: list[str],
+    *,
+    include_missing: bool,
+    weight_column: str | None,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    counts = _freq_weighted_counts(
+        frame, variables, include_missing=include_missing,
+        weight_column=weight_column,
+    )
+    page_variables = variables[:-2]
+    row_variable, column_variable = variables[-2:]
+    table_label = f"Table {' * '.join(variables)}"
+    output: list[pd.DataFrame] = []
+    grouped = counts.groupby(page_variables, dropna=False, sort=False) if page_variables else [((), counts)]
+    for _key, block in grouped:
+        block = block.copy()
+        total = float(block["Frequency"].sum())
+        row_total = block.groupby(row_variable, dropna=False)["Frequency"].transform("sum")
+        column_total = block.groupby(column_variable, dropna=False)["Frequency"].transform("sum")
+        block["Percent"] = block["Frequency"] / total * 100.0 if total else 0.0
+        block["RowPercent"] = np.where(row_total > 0, block["Frequency"] / row_total * 100.0, np.nan)
+        block["ColPercent"] = np.where(column_total > 0, block["Frequency"] / column_total * 100.0, np.nan)
+        block.insert(0, f"F_{column_variable}", block[column_variable].map(_fmt_freq_val))
+        block.insert(0, f"F_{row_variable}", block[row_variable].map(_fmt_freq_val))
+        block.insert(0, "Table", table_label)
+        output.append(block)
+    result = _concat_freq_frames(output)
+    counts["Frequency"] = counts["Frequency"].astype(float)
+    contingency_frame = counts.pivot_table(
+        index=row_variable,
+        columns=column_variable,
+        values="Frequency",
+        aggfunc="sum",
+        fill_value=0.0,
+        dropna=not include_missing,
+    )
+    return result, contingency_frame.to_numpy(dtype=float)
+
+
+def _freq_nlevels_ods(
+    frame: pd.DataFrame,
+    variables: list[str],
+    by_values: dict[str, Any],
+) -> pd.DataFrame:
+    rows = []
+    for variable in variables:
+        missing = int(frame[variable].isna().any())
+        nonmissing = int(frame[variable].dropna().nunique())
+        rows.append({
+            **by_values,
+            "TableVar": variable,
+            "NLevels": nonmissing + missing,
+            "NMissLevels": missing,
+            "NNonMissLevels": nonmissing,
+        })
+    return pd.DataFrame(rows)
+
+
+def _freq_one_way_chisq_ods(
+    one_way: pd.DataFrame,
+    variable: str,
+    by_values: dict[str, Any],
+) -> pd.DataFrame:
+    observed = one_way["Frequency"].to_numpy(dtype=float)
+    if len(observed) < 2 or observed.sum() <= 0:
+        return pd.DataFrame()
+    statistic, probability = stats.chisquare(observed)
+    return pd.DataFrame([{
+        **by_values,
+        "Table": f"Table {variable}",
+        "Statistic": "Chi-Square",
+        "DF": len(observed) - 1,
+        "Value": float(statistic),
+        "Prob": float(probability),
+    }])
+
+
+def _freq_chisq_ods(
+    contingency: np.ndarray,
+    by_values: dict[str, Any],
+) -> pd.DataFrame:
+    if contingency.size == 0 or min(contingency.shape) < 2:
+        return pd.DataFrame()
+    pearson, pearson_p, degrees, _expected = stats.chi2_contingency(
+        contingency, correction=False
+    )
+    likelihood, likelihood_p, _df, _ = stats.chi2_contingency(
+        contingency, correction=False, lambda_="log-likelihood"
+    )
+    rows = [
+        {**by_values, "Statistic": "Chi-Square", "DF": degrees,
+         "Value": float(pearson), "Prob": float(pearson_p)},
+        {**by_values, "Statistic": "Likelihood Ratio Chi-Square", "DF": degrees,
+         "Value": float(likelihood), "Prob": float(likelihood_p)},
+    ]
+    if contingency.shape == (2, 2):
+        continuity, continuity_p, _df, _ = stats.chi2_contingency(
+            contingency, correction=True
+        )
+        rows.insert(1, {
+            **by_values, "Statistic": "Continuity Adj. Chi-Square", "DF": 1,
+            "Value": float(continuity), "Prob": float(continuity_p),
+        })
+    total = float(contingency.sum())
+    row_scores = np.arange(contingency.shape[0], dtype=float)
+    column_scores = np.arange(contingency.shape[1], dtype=float)
+    if total > 1:
+        row_mean = float(row_scores @ contingency.sum(axis=1) / total)
+        column_mean = float(column_scores @ contingency.sum(axis=0) / total)
+        row_variance = float(
+            ((row_scores - row_mean) ** 2) @ contingency.sum(axis=1) / total
+        )
+        column_variance = float(
+            ((column_scores - column_mean) ** 2) @ contingency.sum(axis=0) / total
+        )
+        covariance = float(sum(
+            contingency[row, column]
+            * (row_scores[row] - row_mean)
+            * (column_scores[column] - column_mean)
+            for row in range(contingency.shape[0])
+            for column in range(contingency.shape[1])
+        ) / total)
+        correlation = (
+            covariance / math.sqrt(row_variance * column_variance)
+            if row_variance > 0 and column_variance > 0 else 0.0
+        )
+        mh = (total - 1.0) * correlation * correlation
+        rows.append({
+            **by_values, "Statistic": "Mantel-Haenszel Chi-Square", "DF": 1,
+            "Value": mh, "Prob": float(stats.chi2.sf(mh, 1)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _freq_fisher_ods(
+    contingency: np.ndarray,
+    by_values: dict[str, Any],
+) -> pd.DataFrame:
+    odds_ratio, two_sided = stats.fisher_exact(contingency, alternative="two-sided")
+    _odds, left = stats.fisher_exact(contingency, alternative="less")
+    _odds, right = stats.fisher_exact(contingency, alternative="greater")
+    return pd.DataFrame([
+        {**by_values, "Name1": "XP2_FISH", "Label1": "Two-sided Pr <= P",
+         "nValue1": float(two_sided), "cValue1": f"{two_sided:.4f}"},
+        {**by_values, "Name1": "P_TABLE", "Label1": "Table Probability (P)",
+         "nValue1": float(min(left, right)), "cValue1": f"{min(left, right):.4f}"},
+        {**by_values, "Name1": "R", "Label1": "Odds Ratio",
+         "nValue1": float(odds_ratio), "cValue1": f"{odds_ratio:.4f}"},
+    ])
+
+
+def _freq_measures_ods(
+    contingency: np.ndarray,
+    by_values: dict[str, Any],
+) -> pd.DataFrame:
+    a, b, c, d = (float(value) for value in contingency.ravel())
+    corrected = [value if value > 0 else 0.5 for value in (a, b, c, d)]
+    ca, cb, cc, cd = corrected
+    odds_ratio = ca * cd / (cb * cc)
+    standard_error = math.sqrt(sum(1.0 / value for value in corrected))
+    lower = math.exp(math.log(odds_ratio) - 1.959963984540054 * standard_error)
+    upper = math.exp(math.log(odds_ratio) + 1.959963984540054 * standard_error)
+    row1_risk = a / (a + b) if a + b else float("nan")
+    row2_risk = c / (c + d) if c + d else float("nan")
+    relative_risk = row1_risk / row2_risk if row2_risk else float("nan")
+    return pd.DataFrame([
+        {**by_values, "Statistic": "Odds Ratio", "Value": odds_ratio,
+         "ASE": standard_error, "LowerCL": lower, "UpperCL": upper},
+        {**by_values, "Statistic": "Relative Risk (Column 1)",
+         "Value": relative_risk, "ASE": float("nan"),
+         "LowerCL": float("nan"), "UpperCL": float("nan")},
+    ])
 
 
 def _freq_one_way(buf: io.StringIO, df: pd.DataFrame, var_name: str,

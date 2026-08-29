@@ -330,7 +330,9 @@ SASLite includes support for:
 
 ### Statistical Analysis
 - **PROC MEANS/SUMMARY**: Descriptive statistics with `CLASS`, `BY`, `VAR`, `OUTPUT`
-- **PROC FREQ**: Frequency tables, cross-tabulations, chi-square tests
+- **PROC FREQ**: One-way and n-way frequency tables, weights, BY groups,
+  chi-square and Fisher tests, association measures, cumulative statistics,
+  and SAS-named ODS tables
 - **PROC CORR** (new in 0.3.0): Correlation analysis (Pearson, Spearman, Kendall)
 - **PROC TTEST** (new in 0.3.0): T-tests for comparing means
 - **PROC REG** (new in 0.4.0): Linear regression analysis
@@ -344,12 +346,21 @@ SASLite includes support for:
   - ODDSRATIO statement with confidence intervals
   - Model fit statistics (AIC, BIC, -2 Log L)
   - Predicted probabilities
+- **PROC PHREG**: Cox proportional-hazards models with CLASS, STRATA, BY,
+  Efron/Breslow ties, hazard ratios, profile limits for one-parameter models,
+  and model diagnostics through ODS
+- **PROC MIXED**: Fixed-effect and repeated-measures models with VC, CS, UN,
+  AR(1), ARH(1), TOEP, and TOEPH covariance structures; solutions, Type 3
+  tests, LS-means, differences, covariance matrices, and fit tables
 
 ### Other Procedures
 - **PROC SORT**: Multi-key sorting with `BY`, `DESCENDING`, `NODUPKEY`
 - **PROC PRINT**: Data display with `VAR`, `WHERE`, `BY`
 - **PROC REPORT**: `COLUMN`/`DEFINE`, grouping and analysis columns, `OUT=`,
-  plus file output through `ODS RTF FILE=` and `ODS LISTING FILE=`
+  `ACROSS`, BY groups, summary `RBREAK`, and `Report` ODS output, plus file
+  output through `ODS RTF FILE=` and `ODS LISTING FILE=`
+- **PROC TABULATE**: row/column dimensions, crossed class/analysis variables,
+  multiple statistics, `ALL`, BY groups, and `Table` ODS output
 - **PROC CONTENTS**: Dataset metadata
 - **PROC DATASETS**: Library management, dataset operations
 - **PROC APPEND**: Append datasets
@@ -391,6 +402,8 @@ SASLite includes support for:
 - **Excel support**: PROC IMPORT/EXPORT for XLSX files
 
 See `DOCS.md` and the `examples/` directory for detailed usage.
+The exact ODS object contract for statistical and presentation procedures is
+listed in `ODS_COMPATIBILITY.md`.
 
 ## Examples
 
@@ -497,6 +510,11 @@ environment-specific SAS features are not currently supported:
 - Hash objects and data structures
 
 **Partial Support:**
+- Statistical ODS contracts cover the supported binary LOGISTIC, Cox PHREG,
+  repeated-measures MIXED, FREQ, REPORT, and TABULATE syntax. Conditional exact
+  LOGISTIC, PHREG frailty/Bayesian models, MIXED RANDOM effects, full
+  Kenward-Roger adjustment, and advanced FREQ CMH/agreement/binomial analyses
+  are not yet implemented
 - Macro quoting implements the commonly used masking and rescanning behavior,
   but not every edge case of the SAS word scanner; backward `%GOTO`,
   `PARMBUFF`/`SYSPBUFF`, and macro header options such as `MINOPERATOR` remain

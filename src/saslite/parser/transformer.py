@@ -2185,6 +2185,13 @@ class SasTransformer(Transformer):
         names = next((item for item in items if isinstance(item, list)), [])
         return ByNode(variables=[str(name) for name in names])
 
+    def freq_weight(self, items: list[Any]) -> dict[str, Any]:
+        names = self._stmt_names(items)
+        return {"action": "weight", "variable": names[0]} if names else {}
+
+    def freq_exact(self, items: list[Any]) -> dict[str, Any]:
+        return {"action": "exact", "statistics": self._stmt_names(items)}
+
     def freq_table_spec(self, items: list[Any]) -> FreqTableSpec:
         """Handle freq_table_spec — single table like 'a * b / norow'."""
         var_names = []
@@ -3793,6 +3800,9 @@ class SasTransformer(Transformer):
     def tabulate_var(self, items: list[Any]) -> VarListNode:
         return VarListNode(variables=self._stmt_names(items))
 
+    def tabulate_by(self, items: list[Any]) -> ByNode:
+        return ByNode(variables=self._stmt_names(items))
+
     def tabulate_table(self, items: list[Any]) -> dict[str, Any]:
         terms = []
         for item in items:
@@ -3803,8 +3813,21 @@ class SasTransformer(Transformer):
     def tabulate_expr(self, items: list[Any]) -> list[Any]:
         return [item for item in items if isinstance(item, list)]
 
+    def tabulate_dimension(self, items: list[Any]) -> list[str]:
+        return [value for item in items if isinstance(item, list) for value in item]
+
     def tabulate_term(self, items: list[Any]) -> list[str]:
-        return [str(t).upper() for t in items if isinstance(t, Token) and str(t) != "*"]
+        result: list[str] = []
+        for item in items:
+            if isinstance(item, list):
+                result.extend(str(value).upper() for value in item)
+            elif isinstance(item, Token) and str(item) != "*":
+                result.append(str(item).upper())
+        return result
+
+    def tabulate_factor(self, items: list[Any]) -> list[str]:
+        return [str(item).upper() for item in items
+                if isinstance(item, Token) and str(item) not in {"(", ")"}]
 
     # ── PROC REPORT ───────────────────────────────────
 
@@ -3851,6 +3874,25 @@ class SasTransformer(Transformer):
 
     def report_by(self, items: list[Any]) -> ByNode:
         return ByNode(variables=self._stmt_names(items))
+
+    def report_break_opt(self, items: list[Any]) -> str:
+        return next((str(item).upper() for item in items if isinstance(item, Token)), "")
+
+    def report_break(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item).upper() for item in items if isinstance(item, Token)]
+        location = "BEFORE" if "BEFORE" in tokens else "AFTER"
+        variable = next(
+            (token for token in tokens if token not in {"BREAK", "BEFORE", "AFTER", "/", ";"}),
+            "",
+        )
+        options = [item for item in items if isinstance(item, str)]
+        return {"action": "break", "location": location, "variable": variable, "options": options}
+
+    def report_rbreak(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item).upper() for item in items if isinstance(item, Token)]
+        location = "BEFORE" if "BEFORE" in tokens else "AFTER"
+        options = [item for item in items if isinstance(item, str)]
+        return {"action": "rbreak", "location": location, "options": options}
 
     # ── PROC REG / LOGISTIC ───────────────────────────
 

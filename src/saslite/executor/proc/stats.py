@@ -19,6 +19,7 @@ from saslite.runtime.execution_result import StepResult
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
 from saslite.executor.proc.extras import _resolve_dataset, _split_name, _col_map
+from saslite.executor.ods import write_output_tables
 from saslite.functions.numeric_funcs import probt, probf
 
 
@@ -126,6 +127,7 @@ def handle_proc_reg(proc: ProcNode, session: Session, reporter: Reporter) -> Ste
         xtx_inv = np.linalg.inv(X.T @ X)
         se = np.sqrt(np.clip(np.diag(xtx_inv) * mse, 0, None))
     except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(X.T @ (X * W[:, None]))
         se = np.full(p, float("nan"))
 
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -221,9 +223,11 @@ def handle_proc_logistic(proc: ProcNode, session: Session, reporter: Reporter) -
 
     # Get CLASS variables
     class_vars = []
+    class_options: dict[str, Any] = {}
     for stmt in proc.statements:
         if isinstance(stmt, dict) and stmt.get("action") == "class":
             class_vars = [v.upper() for v in stmt.get("variables", [])]
+            class_options = dict(stmt.get("options", {}))
             break
 
     # Get ODDSRATIO variables
@@ -282,21 +286,41 @@ def handle_proc_logistic(proc: ProcNode, session: Session, reporter: Reporter) -
     # Build design matrix - handle categorical variables
     X_list = [np.ones(len(sub))]  # Intercept
     coef_names = ["Intercept"]
+    coef_variables = ["Intercept"]
+    coef_class_values = [""]
 
     for xc in x_cols:
         xn_upper = xc.upper()
         if xn_upper in class_vars:
-            # Categorical variable - use dummy coding (reference = first level)
+            # Reference coding. PARAM=REF is the most common interchange form
+            # and is also used internally for stable, directly interpretable
+            # odds ratios.
             unique_vals = sorted(sub[xc].unique())
+            reference_text = str(class_options.get("REF", "LAST")).strip("'\"")
+            if reference_text.upper() == "FIRST":
+                reference = unique_vals[0]
+            elif reference_text.upper() == "LAST":
+                reference = unique_vals[-1]
+            else:
+                reference = next(
+                    (value for value in unique_vals if str(value) == reference_text),
+                    unique_vals[-1],
+                )
             if len(unique_vals) > 1:
-                for i, val in enumerate(unique_vals[1:], 1):  # Skip first (reference)
+                for val in unique_vals:
+                    if val == reference:
+                        continue
                     dummy = (sub[xc] == val).astype(float).to_numpy()
                     X_list.append(dummy)
                     coef_names.append(f"{xc}_{val}")
+                    coef_variables.append(xc)
+                    coef_class_values.append(str(val))
         else:
             # Continuous variable
             X_list.append(sub[xc].to_numpy(dtype=float))
             coef_names.append(xc)
+            coef_variables.append(xc)
+            coef_class_values.append("")
 
     X = np.column_stack(X_list)
     n, p = X.shape
@@ -304,7 +328,8 @@ def handle_proc_logistic(proc: ProcNode, session: Session, reporter: Reporter) -
     # Newton-Raphson with simple step-halving
     beta = np.zeros(p)
     converged = False
-    for _ in range(50):
+    iteration_history: list[dict[str, float | int]] = []
+    for iteration in range(50):
         eta = np.clip(X @ beta, -30, 30)
         mu = 1.0 / (1.0 + np.exp(-eta))
         W = mu * (1.0 - mu)
@@ -315,6 +340,16 @@ def handle_proc_logistic(proc: ProcNode, session: Session, reporter: Reporter) -
         except np.linalg.LinAlgError:
             return StepResult(success=False, error="PROC LOGISTIC: singular Hessian (separation?)")
         beta_new = beta + delta
+        trial_mu = 1.0 / (1.0 + np.exp(-np.clip(X @ beta_new, -30, 30)))
+        trial_loglik = float(np.sum(
+            y * np.log(trial_mu + 1e-12)
+            + (1 - y) * np.log(1 - trial_mu + 1e-12)
+        ))
+        iteration_history.append({
+            "ITERATION": iteration + 1,
+            "-2LOGL": -2.0 * trial_loglik,
+            "RIDGE": 0.0,
+        })
         if np.max(np.abs(delta)) < 1e-8:
             beta = beta_new
             converged = True
@@ -405,6 +440,161 @@ def handle_proc_logistic(proc: ProcNode, session: Session, reporter: Reporter) -
         out_df = pd.DataFrame([row])
         out_ds = Dataset.from_dataframe(out_df, name=out_member, libref=out_libref)
         session.put_dataset(out_libref, out_member, out_ds)
+
+    parameter_estimates = pd.DataFrame({
+        "VARIABLE": coef_variables,
+        "CLASSVAL0": coef_class_values,
+        "DF": np.ones(p, dtype=int),
+        "ESTIMATE": beta,
+        "STDERR": se,
+        "WALDCHISQ": wald,
+        "PROBCHISQ": p_vals,
+        "EXPEST": np.exp(np.clip(beta, -700, 700)),
+    })
+    odds_rows = []
+    for index in range(1, p):
+        odds_rows.append({
+            "EFFECT": (
+                coef_variables[index]
+                if not coef_class_values[index]
+                else f"{coef_variables[index]} {coef_class_values[index]} vs Reference"
+            ),
+            "POINTESTIMATE": math.exp(beta[index]),
+            "LOWERCL": math.exp(ci_lower[index]),
+            "UPPERCL": math.exp(ci_upper[index]),
+        })
+    odds_ratios = pd.DataFrame(odds_rows)
+    lr_chi2 = max(0.0, 2.0 * (loglik - loglik_null))
+    model_df = max(p - 1, 0)
+    if model_df:
+        null_weight = p_null * (1.0 - p_null)
+        predictors = X[:, 1:]
+        score_vector = predictors.T @ (y - p_null)
+        weighted_information = null_weight * (predictors.T @ predictors)
+        intercept_cross = null_weight * predictors.sum(axis=0)
+        efficient_information = (
+            weighted_information
+            - np.outer(intercept_cross, intercept_cross) / (null_weight * n)
+        )
+        score_chi_square = float(
+            score_vector @ np.linalg.pinv(efficient_information) @ score_vector
+        )
+        beta_effects = beta[1:]
+        effect_covariance = cov[1:, 1:]
+        wald_chi_square = float(
+            beta_effects @ np.linalg.pinv(effect_covariance) @ beta_effects
+        )
+    else:
+        score_chi_square = wald_chi_square = float("nan")
+    global_tests = pd.DataFrame([
+        {"TEST": "Likelihood Ratio", "CHISQ": lr_chi2, "DF": model_df,
+         "PROBCHISQ": float(stats.chi2.sf(lr_chi2, model_df)) if model_df else float("nan")},
+        {"TEST": "Score", "CHISQ": score_chi_square, "DF": model_df,
+         "PROBCHISQ": float(stats.chi2.sf(score_chi_square, model_df)) if model_df else float("nan")},
+        {"TEST": "Wald", "CHISQ": wald_chi_square, "DF": model_df,
+         "PROBCHISQ": float(stats.chi2.sf(wald_chi_square, model_df)) if model_df else float("nan")},
+    ])
+    fit_statistics = pd.DataFrame([
+        {"CRITERION": "AIC", "INTERCEPTONLY": -2 * loglik_null + 2,
+         "INTERCEPTANDCOVARIATES": -2 * loglik + 2 * p},
+        {"CRITERION": "SC", "INTERCEPTONLY": -2 * loglik_null + math.log(n),
+         "INTERCEPTANDCOVARIATES": -2 * loglik + p * math.log(n)},
+        {"CRITERION": "-2 Log L", "INTERCEPTONLY": -2 * loglik_null,
+         "INTERCEPTANDCOVARIATES": -2 * loglik},
+    ])
+    counts = sub[y_col].astype(str).value_counts().sort_index()
+    response_profile = pd.DataFrame({
+        "ORDEREDVALUE": range(1, len(counts) + 1),
+        "OUTCOME": counts.index.tolist(),
+        "TOTALFREQUENCY": counts.astype(int).tolist(),
+    })
+    event_probabilities = mu[y == 1]
+    nonevent_probabilities = mu[y == 0]
+    concordant = discordant = tied = 0
+    for event_probability in event_probabilities:
+        differences = event_probability - nonevent_probabilities
+        concordant += int(np.sum(differences > 1e-12))
+        discordant += int(np.sum(differences < -1e-12))
+        tied += int(np.sum(np.abs(differences) <= 1e-12))
+    pairs = concordant + discordant + tied
+    association = pd.DataFrame([
+        {"LABEL": "Percent Concordant", "VALUE": 100.0 * concordant / pairs if pairs else float("nan")},
+        {"LABEL": "Percent Discordant", "VALUE": 100.0 * discordant / pairs if pairs else float("nan")},
+        {"LABEL": "Percent Tied", "VALUE": 100.0 * tied / pairs if pairs else float("nan")},
+        {"LABEL": "Pairs", "VALUE": pairs},
+        {"LABEL": "c", "VALUE": (concordant + 0.5 * tied) / pairs if pairs else float("nan")},
+    ])
+    type3_rows: list[dict[str, Any]] = []
+    for variable in dict.fromkeys(coef_variables[1:]):
+        indices = [
+            index for index, candidate in enumerate(coef_variables)
+            if index > 0 and candidate == variable
+        ]
+        estimates = beta[indices]
+        covariance_block = cov[np.ix_(indices, indices)]
+        statistic = float(estimates @ np.linalg.pinv(covariance_block) @ estimates)
+        degrees = max(int(np.linalg.matrix_rank(covariance_block)), 1)
+        type3_rows.append({
+            "EFFECT": variable,
+            "DF": degrees,
+            "WALDCHISQ": statistic,
+            "PROBCHISQ": float(stats.chi2.sf(statistic, degrees)),
+        })
+    class_level_rows = []
+    for variable in class_vars:
+        column = cmap.get(variable)
+        if column is None:
+            continue
+        levels_for_variable = sorted(sub[column].dropna().unique().tolist())
+        for level in levels_for_variable:
+            class_level_rows.append({
+                "CLASS": variable,
+                "VALUE": level,
+                "DESIGNVARIABLE": f"{variable}_{level}",
+            })
+    classification = pd.DataFrame([
+        {
+            "PROBLEVEL": 0.5,
+            "CORRECTEVENT": int(np.sum((mu >= 0.5) & (y == 1))),
+            "INCORRECTEVENT": int(np.sum((mu >= 0.5) & (y == 0))),
+            "CORRECTNONEVENT": int(np.sum((mu < 0.5) & (y == 0))),
+            "INCORRECTNONEVENT": int(np.sum((mu < 0.5) & (y == 1))),
+        }
+    ])
+    max_rescaled_rsquare = 1.0 - math.exp(2.0 * loglik_null / n)
+    raw_rsquare = 1.0 - math.exp(-lr_chi2 / n)
+    outputs = {
+        "MODELINFO": pd.DataFrame([
+            {"DESCRIPTION": "Data Set", "VALUE": f"{ds.metadata.libref}.{ds.metadata.member_name}"},
+            {"DESCRIPTION": "Response Variable", "VALUE": y_col},
+            {"DESCRIPTION": "Model", "VALUE": "binary logit"},
+            {"DESCRIPTION": "Optimization Technique", "VALUE": "Newton-Raphson"},
+        ]),
+        "NOBS": pd.DataFrame([
+            {"LABEL": "Number of Observations Read", "N": len(ds.data)},
+            {"LABEL": "Number of Observations Used", "N": n},
+        ]),
+        "RESPONSEPROFILE": response_profile,
+        "CONVERGENCESTATUS": pd.DataFrame([{
+            "STATUS": 0 if converged else 1,
+            "REASON": "Convergence criterion satisfied" if converged else "Maximum iterations reached",
+        }]),
+        "FITSTATISTICS": fit_statistics,
+        "GLOBALTESTS": global_tests,
+        "PARAMETERESTIMATES": parameter_estimates,
+        "ODDSRATIOS": odds_ratios,
+        "ASSOCIATION": association,
+        "ITERHISTORY": pd.DataFrame(iteration_history),
+        "TYPE3": pd.DataFrame(type3_rows),
+        "MODELANOVA": pd.DataFrame(type3_rows),
+        "CLASSLEVELINFO": pd.DataFrame(class_level_rows),
+        "CLASSIFICATION": classification,
+        "RSQUARE": pd.DataFrame([{
+            "RSQUARE": raw_rsquare,
+            "MAXRESCALEDRSQUARE": raw_rsquare / max_rescaled_rsquare if max_rescaled_rsquare > 0 else float("nan"),
+        }]),
+    }
+    write_output_tables(session, outputs, proc=proc)
 
     out_stmt = _get_output(proc)
     if out_stmt and out_stmt.get("OUT"):

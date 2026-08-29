@@ -17,6 +17,7 @@ from saslite.runtime.dataset import Dataset
 from saslite.runtime.execution_result import StepResult
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
+from saslite.executor.ods import write_output_tables
 
 
 def _write_dataset(
@@ -31,6 +32,10 @@ def _write_dataset(
     )
     dataset = _apply_export_dataset_options(dataset, target.options, session)
     session.put_dataset(target.libref, target.name, dataset)
+
+
+def _concat_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
 
 def _column(frame: pd.DataFrame, name: str) -> str | None:
@@ -414,8 +419,9 @@ def _cox_negative_log_likelihood(
     events: np.ndarray,
     design: np.ndarray,
     strata: np.ndarray,
+    ties: str = "EFRON",
 ) -> float:
-    """Efron partial negative log likelihood for a Cox PH model."""
+    """Partial negative log likelihood for a Cox PH model."""
     total = 0.0
     for stratum in np.unique(strata):
         selected = strata == stratum
@@ -434,7 +440,11 @@ def _cox_negative_log_likelihood(
             event_sum = float(np.exp(eta[event_mask] - maximum).sum())
             total -= float(eta[event_mask].sum())
             for tied_index in range(event_count):
-                denominator = risk_sum - tied_index / event_count * event_sum
+                denominator = (
+                    risk_sum
+                    if ties.upper() == "BRESLOW"
+                    else risk_sum - tied_index / event_count * event_sum
+                )
                 if denominator <= 0 or not math.isfinite(denominator):
                     return float("inf")
                 total += maximum + math.log(denominator)
@@ -469,6 +479,47 @@ def _profile_interval_one_parameter(
     return boundary(-1.0), boundary(1.0)
 
 
+def _numerical_gradient_hessian(
+    objective: Any,
+    point: np.ndarray,
+    step: float = 1e-4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Central-difference gradient and Hessian for score-test diagnostics."""
+    point = np.asarray(point, dtype=float)
+    size = len(point)
+    gradient = np.zeros(size, dtype=float)
+    hessian = np.zeros((size, size), dtype=float)
+    center = float(objective(point))
+    for left in range(size):
+        plus = point.copy()
+        minus = point.copy()
+        plus[left] += step
+        minus[left] -= step
+        plus_value = float(objective(plus))
+        minus_value = float(objective(minus))
+        gradient[left] = (plus_value - minus_value) / (2.0 * step)
+        hessian[left, left] = (plus_value - 2.0 * center + minus_value) / (step * step)
+        for right in range(left):
+            pp = point.copy()
+            pp[left] += step
+            pp[right] += step
+            pm = point.copy()
+            pm[left] += step
+            pm[right] -= step
+            mp = point.copy()
+            mp[left] -= step
+            mp[right] += step
+            mm = point.copy()
+            mm[left] -= step
+            mm[right] -= step
+            value = (
+                float(objective(pp)) - float(objective(pm))
+                - float(objective(mp)) + float(objective(mm))
+            ) / (4.0 * step * step)
+            hessian[left, right] = hessian[right, left] = value
+    return gradient, hessian
+
+
 def _resolve_reference(levels: list[Any], requested: Any) -> Any:
     text = str(requested).strip().strip("'\"") if requested is not None else "LAST"
     if text.upper() == "FIRST":
@@ -487,7 +538,7 @@ def _fit_cox_block(
     classes: dict[str, dict[str, Any]],
     strata_names: list[str],
     hazard_requests: list[dict[str, Any]],
-) -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], list[str]]:
     warnings: list[str] = []
     duration_column = _column(frame, model.get("duration", ""))
     censor_column = _column(frame, model.get("censor", ""))
@@ -559,8 +610,11 @@ def _fit_cox_block(
         strata = pd.MultiIndex.from_frame(working[strata_columns]).factorize()[0]
     else:
         strata = np.zeros(len(working), dtype=int)
+    ties = str(model.get("options", {}).get("TIES", "EFRON")).upper()
+    if ties not in {"EFRON", "BRESLOW"}:
+        raise ValueError(f"PROC PHREG TIES={ties} is not supported")
     objective = lambda beta: _cox_negative_log_likelihood(
-        np.asarray(beta, dtype=float), durations, event_array, design, strata
+        np.asarray(beta, dtype=float), durations, event_array, design, strata, ties
     )
     result = minimize(objective, np.zeros(design.shape[1]), method="BFGS")
     if not np.all(np.isfinite(result.x)):
@@ -635,7 +689,97 @@ def _fit_cox_block(
                     "HRUPPERCL": _safe_exp(upper_beta) if math.isfinite(upper_beta) else float("nan"),
                 }
             )
-    return pd.DataFrame(hazard_rows), pd.DataFrame(parameter_rows), warnings
+    log_likelihood = -float(objective(beta))
+    null_log_likelihood = -float(objective(np.zeros_like(beta)))
+    lr_statistic = max(0.0, 2.0 * (log_likelihood - null_log_likelihood))
+    null_gradient, null_hessian = _numerical_gradient_hessian(
+        objective, np.zeros_like(beta)
+    )
+    score_statistic = float(
+        null_gradient @ np.linalg.pinv(null_hessian) @ null_gradient
+    )
+    wald_statistic = float(beta @ np.linalg.pinv(covariance) @ beta)
+    diagnostics = {
+        "n_read": len(frame),
+        "n_used": len(working),
+        "events": int(event_array.sum()),
+        "censored": int((~event_array).sum()),
+        "parameters": len(beta),
+        "log_likelihood": log_likelihood,
+        "null_log_likelihood": null_log_likelihood,
+        "lr_statistic": lr_statistic,
+        "lr_probability": float(chi2.sf(lr_statistic, len(beta))),
+        "score_statistic": score_statistic,
+        "score_probability": float(chi2.sf(score_statistic, len(beta))),
+        "wald_statistic": wald_statistic,
+        "wald_probability": float(chi2.sf(wald_statistic, len(beta))),
+        "converged": bool(result.success),
+        "reason": str(result.message),
+        "ties": ties,
+        "class_levels": [
+            {
+                "CLASS": info["variable"],
+                "VALUE": info["level"],
+                "REFERENCE": info["reference"],
+            }
+            for info in coefficient_info if info["level"] is not None
+        ],
+        "iteration_history": pd.DataFrame([{
+            "ITERATION": int(getattr(result, "nit", 0)),
+            "LOGLIKE": log_likelihood,
+            "-2LOGL": -2.0 * log_likelihood,
+        }]),
+        "last_gradient": pd.DataFrame([{
+            "PARAMETER": (
+                info["variable"] if info["level"] is None
+                else f"{info['variable']} {info['level']}"
+            ),
+            "GRADIENT": float(value),
+        } for info, value in zip(
+            coefficient_info,
+            _numerical_gradient_hessian(objective, beta)[0],
+        )]),
+        "covariance": _cox_parameter_matrix(covariance, coefficient_info),
+        "correlation": _cox_parameter_matrix(
+            covariance / np.outer(standard_errors, standard_errors),
+            coefficient_info,
+        ),
+        "simple_statistics": pd.DataFrame([
+            {
+                "VARIABLE": predictor,
+                "N": int(pd.to_numeric(working[column], errors="coerce").count()),
+                "MEAN": float(pd.to_numeric(working[column], errors="coerce").mean()),
+                "STDDEV": float(pd.to_numeric(working[column], errors="coerce").std()),
+                "MINIMUM": float(pd.to_numeric(working[column], errors="coerce").min()),
+                "MAXIMUM": float(pd.to_numeric(working[column], errors="coerce").max()),
+            }
+            for predictor, column in predictor_columns.items()
+            if predictor not in classes and column is not None
+        ]),
+    }
+    return (
+        pd.DataFrame(hazard_rows),
+        pd.DataFrame(parameter_rows),
+        diagnostics,
+        warnings,
+    )
+
+
+def _cox_parameter_matrix(
+    matrix: np.ndarray,
+    coefficient_info: list[dict[str, Any]],
+) -> pd.DataFrame:
+    names = [
+        info["variable"] if info["level"] is None
+        else f"{info['variable']}_{info['level']}"
+        for info in coefficient_info
+    ]
+    rows: list[dict[str, Any]] = []
+    for row_name, values in zip(names, np.asarray(matrix, dtype=float)):
+        row = {"ROWNAME": row_name}
+        row.update(dict(zip(names, values)))
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def handle_proc_phreg(
@@ -708,10 +852,23 @@ def handle_proc_phreg(
         blocks = [((), frame)]
     hazard_frames: list[pd.DataFrame] = []
     parameter_frames: list[pd.DataFrame] = []
+    model_info_frames: list[pd.DataFrame] = []
+    nobs_frames: list[pd.DataFrame] = []
+    convergence_frames: list[pd.DataFrame] = []
+    fit_frames: list[pd.DataFrame] = []
+    global_frames: list[pd.DataFrame] = []
+    class_level_frames: list[pd.DataFrame] = []
+    diagnostic_frames: dict[str, list[pd.DataFrame]] = {
+        "ITERHISTORY": [],
+        "LASTGRADIENT": [],
+        "COVB": [],
+        "CORRB": [],
+        "SIMPLESTATISTICS": [],
+    }
     warnings: list[str] = []
     try:
         for by_value, block in blocks:
-            hazard, parameters, block_warnings = _fit_cox_block(
+            hazard, parameters, diagnostics, block_warnings = _fit_cox_block(
                 block,
                 model,
                 classes,
@@ -722,19 +879,81 @@ def handle_proc_phreg(
             for column, value in zip(by_columns, values):
                 hazard[column] = value
                 parameters[column] = value
+            by_payload = dict(zip(by_columns, values))
             hazard_frames.append(hazard)
             parameter_frames.append(parameters)
+            model_info_frames.append(pd.DataFrame([
+                {**by_payload, "DESCRIPTION": "Data Set", "VALUE": f"{dataset.metadata.libref}.{dataset.metadata.member_name}"},
+                {**by_payload, "DESCRIPTION": "Dependent Variable", "VALUE": model.get("duration", "")},
+                {**by_payload, "DESCRIPTION": "Censoring Variable", "VALUE": model.get("censor", "")},
+                {**by_payload, "DESCRIPTION": "Ties Handling", "VALUE": diagnostics["ties"]},
+            ]))
+            nobs_frames.append(pd.DataFrame([
+                {**by_payload, "LABEL": "Number of Observations Read", "N": diagnostics["n_read"]},
+                {**by_payload, "LABEL": "Number of Observations Used", "N": diagnostics["n_used"]},
+                {**by_payload, "LABEL": "Number of Events", "N": diagnostics["events"]},
+                {**by_payload, "LABEL": "Number of Censored Observations", "N": diagnostics["censored"]},
+            ]))
+            convergence_frames.append(pd.DataFrame([{
+                **by_payload,
+                "STATUS": 0 if diagnostics["converged"] else 1,
+                "REASON": diagnostics["reason"],
+            }]))
+            parameter_count = diagnostics["parameters"]
+            minus_two_log_likelihood = -2.0 * diagnostics["log_likelihood"]
+            fit_frames.append(pd.DataFrame([
+                {**by_payload, "CRITERION": "-2 LOG L", "WITHOUTCOVARIATES": -2.0 * diagnostics["null_log_likelihood"], "WITHCOVARIATES": minus_two_log_likelihood},
+                {**by_payload, "CRITERION": "AIC", "WITHOUTCOVARIATES": -2.0 * diagnostics["null_log_likelihood"], "WITHCOVARIATES": minus_two_log_likelihood + 2 * parameter_count},
+                {**by_payload, "CRITERION": "SBC", "WITHOUTCOVARIATES": -2.0 * diagnostics["null_log_likelihood"], "WITHCOVARIATES": minus_two_log_likelihood + math.log(max(diagnostics["events"], 1)) * parameter_count},
+            ]))
+            global_frames.append(pd.DataFrame([
+                {**by_payload, "TEST": "Likelihood Ratio",
+                 "CHISQ": diagnostics["lr_statistic"], "DF": parameter_count,
+                 "PROBCHISQ": diagnostics["lr_probability"]},
+                {**by_payload, "TEST": "Score",
+                 "CHISQ": diagnostics["score_statistic"], "DF": parameter_count,
+                 "PROBCHISQ": diagnostics["score_probability"]},
+                {**by_payload, "TEST": "Wald",
+                 "CHISQ": diagnostics["wald_statistic"], "DF": parameter_count,
+                 "PROBCHISQ": diagnostics["wald_probability"]},
+            ]))
+            class_levels = pd.DataFrame(diagnostics["class_levels"])
+            if not class_levels.empty:
+                for column, value in by_payload.items():
+                    class_levels[column] = value
+                class_level_frames.append(class_levels)
+            for table_name, diagnostic_key in (
+                ("ITERHISTORY", "iteration_history"),
+                ("LASTGRADIENT", "last_gradient"),
+                ("COVB", "covariance"),
+                ("CORRB", "correlation"),
+                ("SIMPLESTATISTICS", "simple_statistics"),
+            ):
+                diagnostic = diagnostics[diagnostic_key].copy()
+                for column, value in by_payload.items():
+                    diagnostic[column] = value
+                diagnostic_frames[table_name].append(diagnostic)
             warnings.extend(block_warnings)
     except ValueError as exc:
         return StepResult(success=False, error=str(exc))
 
     hazard_output = pd.concat(hazard_frames, ignore_index=True) if hazard_frames else pd.DataFrame()
     parameter_output = pd.concat(parameter_frames, ignore_index=True) if parameter_frames else pd.DataFrame()
-    ods_targets = getattr(session, "_ods_output_targets", {})
-    if isinstance(ods_targets.get("HAZARDRATIOS"), DatasetRefNode):
-        _write_dataset(session, ods_targets["HAZARDRATIOS"], hazard_output)
-    if isinstance(ods_targets.get("PARAMETERESTIMATES"), DatasetRefNode):
-        _write_dataset(session, ods_targets["PARAMETERESTIMATES"], parameter_output)
+    outputs = {
+        "HAZARDRATIOS": hazard_output,
+        "PARAMETERESTIMATES": parameter_output,
+        "MODELINFO": _concat_frames(model_info_frames),
+        "NOBS": _concat_frames(nobs_frames),
+        "CONVERGENCESTATUS": _concat_frames(convergence_frames),
+        "FITSTATISTICS": _concat_frames(fit_frames),
+        "GLOBALTESTS": _concat_frames(global_frames),
+        "CLASSLEVELINFO": _concat_frames(class_level_frames),
+    }
+    outputs.update({
+        name: _concat_frames(frames)
+        for name, frames in diagnostic_frames.items()
+    })
+    write_output_tables(session, outputs, proc=proc)
 
     return StepResult(
         success=True,

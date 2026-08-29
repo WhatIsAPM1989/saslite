@@ -1055,9 +1055,13 @@ RUN;
 
 /* 交叉表 */
 PROC FREQ DATA=employees;
-  TABLES dept_id * gender;
+  TABLES dept_id * gender / CHISQ FISHER MEASURES;
 RUN;
 ```
+
+支持 `BY`、`WEIGHT`、`ORDER=`、`MISSING`，以及表选项 `CHISQ`、
+`FISHER`、`MEASURES`。ODS 对象包括 `OneWayFreqs`、`CrossTabFreqs`、
+`ChiSq`、`FishersExact`、`Measures` 和 `NLevels`。
 
 交叉表输出示例：
 ```
@@ -1181,11 +1185,13 @@ QUIT;
 | PROC | 状态 |
 |------|------|
 | PROC MEANS 的 NOPRINT | 已实现：抑制输出，OUT= 数据集仍正常写入 |
-| PROC TABULATE | 未实现 |
-| PROC TRANSPOSE | 未实现 |
-| PROC REPORT | 未实现 |
+| PROC TABULATE | 已实现常用 CLASS/VAR、行列维度、统计量、ALL、BY 和 ODS Table |
+| PROC TRANSPOSE | 已实现常用 VAR/ID/BY/OUT 形式 |
+| PROC REPORT | 已实现 COLUMN/DEFINE、GROUP/ORDER/ACROSS/ANALYSIS、RBREAK、BY、OUT 和 ODS Report |
 | PROC GPLOT / GCHART | 未实现（图形） |
-| PROC REG / LOGISTIC | 未实现（统计建模） |
+| PROC REG / LOGISTIC | 已实现；LOGISTIC 提供常用模型、诊断和 ODS 表 |
+| PROC PHREG | 已实现 Cox 模型、Efron/Breslow ties、CLASS/STRATA/BY 和常用 ODS 表 |
+| PROC MIXED | 已实现重复测量 GLS、常用协方差结构、LSMEANS/DIFF 和常用 ODS 表 |
 | PROC SQL 的 QUIT 后代码 | 不支持（QUIT 必须是最后一条） |
 
 ---
@@ -1564,11 +1570,13 @@ SUM(a, b, c, d)           /* 可变参数 */
 - CALL 子程序（除 SYMPUT 外）
 
 ### 过程步
-- PROC TABULATE
-- PROC TRANSPOSE
-- PROC REPORT
-- PROC REG / LOGISTIC / GLM（统计建模）
-- PROC UNIVARIATE
+- PROC REPORT 的 COMPUTE 块、复杂 BREAK 小计和完整样式系统
+- PROC TABULATE 的百分位统计和完整 KEYLABEL/FORMAT/PAGE 维度
+- PROC FREQ 的精确 Monte Carlo、CMH、agreement 和 binomial 分析
+- PROC LOGISTIC 的多项/有序响应、条件 exact 分析和模型选择
+- PROC PHREG 的 time-dependent 编程语句、frailty 和 Bayesian 分析
+- PROC MIXED 的 RANDOM/G-side 模型和完整 Kenward-Roger 调整
+- PROC GLM
 - PROC GPLOT / GCHART（图形）
 - PROC FORMAT（自定义格式）
 - PROC COMPARE

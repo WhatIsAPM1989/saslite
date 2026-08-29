@@ -344,12 +344,15 @@ freq_opt: "DATA"i "=" dataset_ref -> freq_opt_data
         | "NOCOL"i -> freq_opt_flag
         | "NOPERCENT"i -> freq_opt_flag
         | "MISSING"i -> freq_opt_flag
+        | NAME -> freq_opt_flag
 
 freq_body: freq_stmt+
 
 freq_stmt: freq_tables | freq_by
+         | "WEIGHT"i NAME ";"? -> freq_weight
+         | "EXACT"i name_list ";"? -> freq_exact
 
-freq_tables: "TABLES"i freq_table_spec ("," freq_table_spec)* ";"?
+freq_tables: "TABLES"i freq_table_spec (","? freq_table_spec)* ";"?
 
 freq_table_spec: qualified_name ("." qualified_name)? ("/" freq_opt+)? (( "*" qualified_name ("." qualified_name)?)+ ("/" freq_opt+)?)*
 
@@ -600,10 +603,13 @@ tabulate_opt: "DATA"i "=" qualified_name
 
 tabulate_stmt: "CLASS"i name_list ";" -> tabulate_class
              | "VAR"i name_list ";" -> tabulate_var
+             | "BY"i name_list ";" -> tabulate_by
              | "TABLE"i tabulate_expr ";" -> tabulate_table
 
-tabulate_expr: tabulate_term ("," tabulate_term)*
-tabulate_term: NAME ("*" NAME)*
+tabulate_expr: tabulate_dimension ("," tabulate_dimension)*
+tabulate_dimension: tabulate_term+
+tabulate_term: tabulate_factor ("*" tabulate_factor)*
+tabulate_factor: NAME | "(" NAME+ ")"
 
 // ─── PROC REPORT ──────────────────────────────────
 
@@ -624,8 +630,11 @@ report_stmt: "COLUMN"i name_list ";" -> report_column
            | "COLUMNS"i name_list ";" -> report_column
            | "DEFINE"i NAME "/" (report_def_attr)* ";" -> report_define
            | "BY"i name_list ";" -> report_by
+           | "BREAK"i ("AFTER"i | "BEFORE"i) NAME "/" report_break_opt* ";" -> report_break
+           | "RBREAK"i ("AFTER"i | "BEFORE"i)? "/" report_break_opt* ";" -> report_rbreak
 
-report_def_attr: "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "NOPRINT"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | STRING | "FORMAT"i "=" format_spec | "WIDTH"i "=" NUMBER | REPORT_STYLE_OPTION
+report_def_attr: "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "ACROSS"i | "NOPRINT"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | "STD"i | "MEDIAN"i | STRING | "FORMAT"i "=" format_spec | "WIDTH"i "=" NUMBER | REPORT_STYLE_OPTION
+report_break_opt: "SUMMARIZE"i | "SUPPRESS"i | "SKIP"i | "DOL"i | "DUL"i | "OL"i | "UL"i | "PAGE"i
 
 // ─── PROC REG ─────────────────────────────────────
 
