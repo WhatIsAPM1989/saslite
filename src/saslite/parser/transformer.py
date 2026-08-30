@@ -1908,6 +1908,253 @@ class SasTransformer(Transformer):
                 return ByNode(variables=names)
         return first
 
+    # ── Statistical graphics ───────────────────────────────
+
+    @staticmethod
+    def _sg_value(items: list[Any]) -> Any:
+        """Return a plain Python value from a graphics grammar value."""
+        for item in items:
+            if isinstance(item, LiteralNode):
+                return item.value
+            if not isinstance(item, Token):
+                return item
+        return _clean_token_value(items[-1]) if items else ""
+
+    def sg_string(self, items: list[Any]) -> str:
+        return str(_clean_token_value(items[-1])) if items else ""
+
+    def sg_number(self, items: list[Any]) -> int | float:
+        value = _clean_token_value(items[-1]) if items else 0
+        return value if isinstance(value, (int, float)) else float(value)
+
+    def sg_negative(self, items: list[Any]) -> int | float:
+        value = self.sg_number(items)
+        return -value
+
+    def sg_name(self, items: list[Any]) -> str:
+        return str(items[-1]) if items else ""
+
+    def sg_proc_opt(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item) for item in items if isinstance(item, Token)]
+        key = tokens[0].upper() if tokens else ""
+        values = _non_tokens(items)
+        if key in {"DATA", "DATTRMAP"} and values:
+            return {"_sg_proc_option": True, key: values[0]}
+        return {"_sg_proc_option": True, key: True}
+
+    def sg_plot_kind(self, items: list[Any]) -> str:
+        return str(items[0]).upper() if items else ""
+
+    def gtl_plot_kind(self, items: list[Any]) -> str:
+        return str(items[0]).upper() if items else ""
+
+    def sg_plot_arg(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item) for item in items if isinstance(item, Token)]
+        values = _non_tokens(items)
+        if tokens and "=" in tokens and values:
+            return {"_sg_arg": True, "name": tokens[0].upper(), "value": values[-1]}
+        value = values[-1] if values else _clean_token_value(items[-1])
+        return {"_sg_arg": True, "name": "", "value": value}
+
+    def sg_attr_item(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item) for item in items if isinstance(item, Token)]
+        values = _non_tokens(items)
+        if tokens and "=" in tokens and values:
+            return {"_sg_attr": True, "name": tokens[0].upper(), "value": values[-1]}
+        value = values[-1] if values else _clean_token_value(items[-1])
+        return {"_sg_attr": True, "name": "", "value": value}
+
+    def sg_option(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item) for item in items if isinstance(item, Token)]
+        key = tokens[0].upper() if tokens else ""
+        values = _non_tokens(items)
+        attrs = [value for value in values if isinstance(value, dict) and value.get("_sg_attr")]
+        if attrs:
+            named = {
+                attr["name"]: attr["value"]
+                for attr in attrs
+                if attr.get("name")
+            }
+            positional = [attr["value"] for attr in attrs if not attr.get("name")]
+            value: Any = named
+            if positional:
+                value = {**named, "_VALUES": positional}
+        else:
+            plain = [value for value in values if not isinstance(value, dict)]
+            value = plain[-1] if plain else True
+        return {"_sg_option": True, "name": key, "value": value}
+
+    @staticmethod
+    def _graphics_statement(items: list[Any], *, gtl: bool = False) -> dict[str, Any]:
+        kind = next((item for item in items if isinstance(item, str)), "")
+        args: dict[str, Any] = {}
+        positional: list[Any] = []
+        options: dict[str, Any] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if item.get("_sg_arg"):
+                if item["name"]:
+                    args[item["name"]] = item["value"]
+                else:
+                    positional.append(item["value"])
+            elif item.get("_sg_option"):
+                options[item["name"]] = item["value"]
+        return {
+            "action": "plot",
+            "kind": kind,
+            "args": args,
+            "positional": positional,
+            "options": options,
+            "gtl": gtl,
+        }
+
+    def sg_plot_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self._graphics_statement(items)
+
+    def gtl_plot_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self._graphics_statement(items, gtl=True)
+
+    def sgplot_stmt(self, items: list[Any]) -> Any:
+        return next((item for item in items if not isinstance(item, Token)), None)
+
+    def sgpanel_stmt(self, items: list[Any]) -> Any:
+        return next((item for item in items if not isinstance(item, Token)), None)
+
+    def sg_axis_kind(self, items: list[Any]) -> str:
+        return str(items[0]).upper() if items else ""
+
+    def sg_panel_axis_kind(self, items: list[Any]) -> str:
+        return str(items[0]).upper() if items else ""
+
+    @staticmethod
+    def _axis_statement(items: list[Any]) -> dict[str, Any]:
+        axis = next((item for item in items if isinstance(item, str)), "")
+        options = {
+            item["name"]: item["value"]
+            for item in items
+            if isinstance(item, dict) and item.get("_sg_option")
+        }
+        return {"action": "axis", "axis": axis, "options": options}
+
+    def sg_axis_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self._axis_statement(items)
+
+    def sg_panel_axis_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return self._axis_statement(items)
+
+    def sg_panelby_stmt(self, items: list[Any]) -> dict[str, Any]:
+        token_values = [str(item) for item in items if isinstance(item, Token)]
+        names: list[str] = []
+        for token in token_values[1:]:
+            if token == "/":
+                break
+            if token not in {";"}:
+                names.append(token)
+        options = {
+            item["name"]: item["value"]
+            for item in items
+            if isinstance(item, dict) and item.get("_sg_option")
+        }
+        return {"action": "panelby", "variables": names, "options": options}
+
+    def sg_title_stmt(self, items: list[Any]) -> dict[str, Any]:
+        values = _non_tokens(items)
+        return {"action": "title", "text": values[-1] if values else ""}
+
+    def sg_footnote_stmt(self, items: list[Any]) -> dict[str, Any]:
+        values = _non_tokens(items)
+        return {"action": "footnote", "text": values[-1] if values else ""}
+
+    def sg_legend_stmt(self, items: list[Any]) -> dict[str, Any]:
+        options = {
+            item["name"]: item["value"]
+            for item in items
+            if isinstance(item, dict) and item.get("_sg_option")
+        }
+        values = [item for item in _non_tokens(items) if not isinstance(item, dict)]
+        return {"action": "legend", "names": values, "options": options}
+
+    def proc_sgplot(self, items: list[Any]) -> ProcNode:
+        return self._proc_graphics("SGPLOT", items)
+
+    def proc_sgpanel(self, items: list[Any]) -> ProcNode:
+        return self._proc_graphics("SGPANEL", items)
+
+    @staticmethod
+    def _proc_graphics(name: str, items: list[Any]) -> ProcNode:
+        options: dict[str, Any] = {}
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, dict) and item.get("_sg_proc_option"):
+                options.update({key: value for key, value in item.items() if not key.startswith("_")})
+            elif item is not None:
+                statements.append(item)
+        return ProcNode(proc_name=name, options=options, statements=statements)
+
+    def gtl_layout_kind(self, items: list[Any]) -> str:
+        return str(items[0]).upper() if items else ""
+
+    def gtl_begingraph_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return {"action": "begingraph", "options": self._sg_options(items)}
+
+    def gtl_endgraph_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return {"action": "endgraph"}
+
+    def gtl_entrytitle_stmt(self, items: list[Any]) -> dict[str, Any]:
+        values = _non_tokens(items)
+        return {"action": "title", "text": values[-1] if values else ""}
+
+    def gtl_entryfootnote_stmt(self, items: list[Any]) -> dict[str, Any]:
+        values = _non_tokens(items)
+        return {"action": "footnote", "text": values[-1] if values else ""}
+
+    def gtl_entry_stmt(self, items: list[Any]) -> dict[str, Any]:
+        values = [item for item in _non_tokens(items) if not isinstance(item, dict)]
+        return {
+            "action": "entry",
+            "text": values[-1] if values else "",
+            "options": self._sg_options(items),
+        }
+
+    @staticmethod
+    def _sg_options(items: list[Any]) -> dict[str, Any]:
+        return {
+            item["name"]: item["value"]
+            for item in items
+            if isinstance(item, dict) and item.get("_sg_option")
+        }
+
+    def gtl_layout_stmt(self, items: list[Any]) -> dict[str, Any]:
+        kind = next(
+            (item for item in items if isinstance(item, str) and not isinstance(item, Token)),
+            "OVERLAY",
+        )
+        return {"action": "layout", "kind": kind, "options": self._sg_options(items)}
+
+    def gtl_endlayout_stmt(self, items: list[Any]) -> dict[str, Any]:
+        return {"action": "endlayout"}
+
+    def gtl_stmt(self, items: list[Any]) -> Any:
+        return next((item for item in items if not isinstance(item, Token)), None)
+
+    def gtl_define(self, items: list[Any]) -> dict[str, Any]:
+        name = ""
+        statements: list[Any] = []
+        for item in _non_tokens(items):
+            if isinstance(item, VariableNode) and not name:
+                name = item.name
+            elif item is not None:
+                statements.append(item)
+        return {"action": "define_statgraph", "name": name, "statements": statements}
+
+    def proc_template(self, items: list[Any]) -> ProcNode:
+        definitions = [
+            item for item in _non_tokens(items)
+            if isinstance(item, dict) and item.get("action") == "define_statgraph"
+        ]
+        return ProcNode(proc_name="TEMPLATE", statements=definitions)
+
     # ── PROC SGRENDER ────────────────────────────────
 
     def proc_sgrender(self, items: list[Any]) -> ProcNode:

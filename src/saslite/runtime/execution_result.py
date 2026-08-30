@@ -7,6 +7,21 @@ from typing import Any
 
 
 @dataclass
+class OutputArtifact:
+    """A displayable artifact produced by an executable step.
+
+    Binary payloads use base64 so the same object can cross the Python API,
+    JSON GUI boundary, notebooks, and remote callers without temporary files.
+    """
+    kind: str
+    mime_type: str
+    data: str
+    title: str = ""
+    width: int | None = None
+    height: int | None = None
+
+
+@dataclass
 class StepResult:
     """Result of executing a single SAS step (DATA/PROC)."""
     success: bool = True
@@ -16,6 +31,7 @@ class StepResult:
     output_messages: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    artifacts: list[OutputArtifact] = field(default_factory=list)
 
 
 @dataclass

@@ -356,6 +356,27 @@ body {
 .error-line { color: var(--error); }
 .note-line { color: var(--text-dim); }
 .success-line { color: var(--accent2); }
+.graph-output {
+  margin: 12px 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  white-space: normal;
+  word-break: normal;
+  text-align: center;
+}
+.graph-output img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+.graph-title {
+  margin-top: 6px;
+  color: #333;
+  font: 12px var(--font-ui);
+}
 
 /* ── Data Tab ── */
 #tab-data {
@@ -764,6 +785,14 @@ function renderOutput(result) {
       }
       for (const w of (step.warnings || [])) {
         html += `<span class="note-line">\nWARNING: ${escapeHtml(w)}</span>`;
+      }
+      for (const artifact of (step.artifacts || [])) {
+        if (artifact.kind === 'image' && artifact.mime_type === 'image/png') {
+          const title = escapeHtml(artifact.title || 'SASLite graph');
+          html += `<div class="graph-output"><img src="data:image/png;base64,${artifact.data}" alt="${title}">`;
+          if (artifact.title) html += `<div class="graph-title">${title}</div>`;
+          html += '</div>';
+        }
       }
     }
   }

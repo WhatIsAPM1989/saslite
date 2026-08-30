@@ -21,32 +21,7 @@ from saslite.runtime.types import sas_bool
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
 from saslite.executor.ods import write_output_tables
-
-
-def handle_proc_sgrender(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
-    """Validate PROC SGRENDER input while treating GTL output as presentation-only."""
-    data_name = str(proc.options.get("DATA", ""))
-    if not data_name:
-        return StepResult(success=False, error="PROC SGRENDER requires DATA=")
-
-    try:
-        if "." in data_name:
-            libref, member = data_name.split(".", 1)
-        else:
-            libref, member = "WORK", data_name
-        ds = session.get_dataset(libref, member)
-    except KeyError:
-        return StepResult(success=False, error=f"Dataset {data_name} not found")
-
-    template = str(proc.options.get("TEMPLATE", ""))
-    suffix = f" using template {template}" if template else ""
-    qualified = f"{libref.upper()}.{member.upper()}"
-    return StepResult(
-        success=True,
-        dataset_name=qualified,
-        rows_affected=ds.nrow,
-        notes=[f"PROC SGRENDER validated {qualified}{suffix}; GTL rendering skipped."],
-    )
+from saslite.executor.proc.graphics import handle_proc_sgrender
 
 
 def handle_proc_print(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:

@@ -21,6 +21,9 @@ statement: data_step
          | proc_format
          | proc_tabulate
          | proc_report
+         | proc_sgplot
+         | proc_sgpanel
+         | proc_template
          | proc_sgrender
          | proc_reg
          | proc_logistic
@@ -279,8 +282,87 @@ print_stmt: "VAR"i name_list ";"
           | format_stmt ";"
 
 // ─── PROC SGRENDER ───────────────────────────────
-// GTL rendering is presentation-only in SASLite, but accepting SGRENDER lets
-// validation programs materialize and verify their plotting datasets.
+// SGPLOT, SGPANEL, and the common GTL/SGRENDER subset share one renderer.
+
+proc_sgplot: "PROC"i "SGPLOT"i (sg_proc_opt)* ";" (sgplot_stmt)* ("RUN"i ";")?
+proc_sgpanel: "PROC"i "SGPANEL"i (sg_proc_opt)* ";" (sgpanel_stmt)* ("RUN"i ";")?
+
+sg_proc_opt: "DATA"i "=" dataset_ref
+           | "DATTRMAP"i "=" dataset_ref
+           | "NOAUTOLEGEND"i
+
+sgplot_stmt: sg_plot_stmt ";"
+           | sg_axis_stmt ";"
+           | sg_title_stmt ";"
+           | sg_footnote_stmt ";"
+           | sg_legend_stmt ";"
+           | where_stmt ";"
+
+sgpanel_stmt: sg_plot_stmt ";"
+            | sg_panelby_stmt ";"
+            | sg_panel_axis_stmt ";"
+            | sg_title_stmt ";"
+            | sg_footnote_stmt ";"
+            | sg_legend_stmt ";"
+            | where_stmt ";"
+
+sg_plot_stmt: sg_plot_kind sg_plot_arg* ("/" sg_option*)?
+sg_plot_kind: "SCATTER"i | "SERIES"i | "STEP"i | "NEEDLE"i
+            | "VLINE"i | "HLINE"i | "VBAR"i | "HBAR"i
+            | "HISTOGRAM"i | "DENSITY"i | "REG"i | "LOESS"i
+            | "BAND"i | "REFLINE"i | "DOT"i
+
+sg_plot_arg: NAME "=" sg_value
+           | sg_value
+
+sg_option: NAME "=" sg_value
+         | NAME "=" "(" sg_attr_item* ")"
+         | NAME
+
+sg_attr_item: NAME "=" sg_value
+            | sg_value
+
+?sg_value: STRING -> sg_string
+         | "-" NUMBER -> sg_negative
+         | NUMBER -> sg_number
+         | NAME -> sg_name
+
+sg_axis_stmt: sg_axis_kind sg_option*
+sg_axis_kind: "XAXIS"i | "YAXIS"i
+sg_panel_axis_stmt: sg_panel_axis_kind sg_option*
+sg_panel_axis_kind: "COLAXIS"i | "ROWAXIS"i
+sg_panelby_stmt: "PANELBY"i NAME+ ("/" sg_option*)?
+sg_title_stmt: "TITLE"i sg_value
+sg_footnote_stmt: "FOOTNOTE"i sg_value
+sg_legend_stmt: "KEYLEGEND"i sg_value* ("/" sg_option*)?
+
+// Practical GTL subset: session-catalog STATGRAPH templates rendered by
+// PROC SGRENDER through the same backend as SGPLOT and SGPANEL.
+proc_template: "PROC"i "TEMPLATE"i ";" gtl_define+ ("RUN"i ";")?
+gtl_define: "DEFINE"i "STATGRAPH"i qualified_name ";" gtl_stmt* "END"i ";"
+
+gtl_stmt: gtl_begingraph_stmt ";"
+        | gtl_endgraph_stmt ";"
+        | gtl_entrytitle_stmt ";"
+        | gtl_entryfootnote_stmt ";"
+        | gtl_entry_stmt ";"
+        | gtl_layout_stmt ";"
+        | gtl_endlayout_stmt ";"
+        | gtl_plot_stmt ";"
+
+gtl_begingraph_stmt: "BEGINGRAPH"i sg_option*
+gtl_endgraph_stmt: "ENDGRAPH"i
+gtl_entrytitle_stmt: "ENTRYTITLE"i sg_value
+gtl_entryfootnote_stmt: "ENTRYFOOTNOTE"i sg_value
+gtl_entry_stmt: "ENTRY"i sg_value sg_option*
+gtl_layout_stmt: "LAYOUT"i gtl_layout_kind ("/" sg_option*)?
+gtl_layout_kind: "OVERLAY"i | "LATTICE"i
+gtl_endlayout_stmt: "ENDLAYOUT"i
+gtl_plot_stmt: gtl_plot_kind sg_plot_arg* ("/" sg_option*)?
+gtl_plot_kind: "SCATTERPLOT"i | "SERIESPLOT"i | "STEPPLOT"i
+             | "NEEDLEPLOT"i | "BARCHART"i | "HISTOGRAM"i
+             | "DENSITYPLOT"i | "REGRESSIONPLOT"i | "LOESSPLOT"i
+             | "BANDPLOT"i | "REFERENCELINE"i
 
 proc_sgrender: "PROC"i "SGRENDER"i (sgrender_opt)* ";" (sgrender_stmt)* ("RUN"i ";")?
 

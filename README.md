@@ -492,6 +492,59 @@ cd examples
 python validate_examples.py
 ```
 
+## Statistical graphics
+
+`PROC SGPLOT` and `PROC SGPANEL` render through Matplotlib's headless backend,
+so they work on desktops, servers, and CI runners without a display. The local
+GUI shows generated graphs in the Output tab:
+
+```sas
+proc sgplot data=sales;
+  scatter x=height y=weight / group=sex;
+  reg x=height y=weight / lineattrs=(pattern=dash thickness=2);
+  xaxis label="Height" grid;
+  yaxis label="Weight" grid;
+  title "Height and weight";
+run;
+
+proc sgpanel data=sales;
+  panelby sex / columns=2;
+  vbar age / response=weight stat=mean;
+run;
+```
+
+The Python API exposes every image on its producing step as a base64 PNG
+artifact, avoiding temporary-file ownership issues:
+
+```python
+import base64
+from pathlib import Path
+
+result = sas.execute(source)
+png = next(step for step in result.steps if step.artifacts).artifacts[0]
+Path("graph.png").write_bytes(base64.b64decode(png.data))
+```
+
+Basic GTL templates can be compiled in the session and rendered later with
+`PROC SGRENDER`:
+
+```sas
+proc template;
+  define statgraph graphs.scatter;
+    begingraph;
+      entrytitle graph_title;
+      layout overlay / xaxisopts=(label="Height") yaxisopts=(label="Weight");
+        scatterplot x=height y=weight / group=sex;
+      endlayout;
+    endgraph;
+  end;
+run;
+
+proc sgrender data=sales template=graphs.scatter;
+  dynamic graph_title="GTL scatter";
+run;
+```
+
 ## Known Limits
 
 SASLite intentionally implements a practical subset of SAS. Some advanced or
@@ -503,13 +556,22 @@ environment-specific SAS features are not currently supported:
 - Complete format/informat catalog system
 - Complete ODS styling and destination catalog (RTF/LISTING for PROC REPORT
   and ODS OUTPUT datasets for supported statistical procedures are available)
-- Graphics procedures (SGPLOT, GPLOT, etc.)
+- Legacy graphics procedures such as GPLOT/GCHART
 - Some specialized PROCs (for example IML)
 - BY-group processing in all contexts
 - Full index support
 - Hash objects and data structures
 
 **Partial Support:**
+- Statistical graphics use a headless Matplotlib backend. `PROC SGPLOT`
+  supports scatter, series, step, needle, VLINE/HLINE, VBAR/HBAR, histogram,
+  density, regression, LOESS-style smoothing, band, dot, and reference-line
+  statements. `PROC SGPANEL` supports `PANELBY`; `PROC TEMPLATE` plus
+  `PROC SGRENDER` supports the common GTL `BEGINGRAPH`, `ENTRYTITLE`,
+  nested `LAYOUT LATTICE`, `LAYOUT OVERLAY`, and plot-statement subset.
+  Lattices support rows/columns, weights, gutters, row/column-major ordering,
+  and union data ranges. Graphs are returned as PNG artifacts by the Python
+  API and displayed by the built-in GUI.
 - Statistical ODS contracts cover the supported binary LOGISTIC, Cox PHREG,
   repeated-measures MIXED, FREQ, REPORT, and TABULATE syntax. Conditional exact
   LOGISTIC, PHREG frailty/Bayesian models, MIXED RANDOM effects, full

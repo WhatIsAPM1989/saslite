@@ -29,6 +29,9 @@ from saslite.executor.proc.survival import handle_proc_lifetest, handle_proc_phr
 from saslite.executor.proc.generalized import handle_proc_genmod
 from saslite.executor.proc.mixed import handle_proc_mixed
 from saslite.executor.proc.interval_survival import handle_proc_icphreg, handle_proc_iclifetest
+from saslite.executor.proc.graphics import (
+    handle_proc_sgplot, handle_proc_sgpanel, handle_proc_template,
+)
 from saslite.runtime.execution_result import RunSummary
 from saslite.diagnostics.reporter import Reporter
 from saslite.profiles import CompatibilityProfile, create_profile, load_profile_file
@@ -415,6 +418,9 @@ class SasInterpreter:
             session = self._session
             reporter = self._reporter
             dispatcher.register_proc("PRINT", lambda p: handle_proc_print(p, session, reporter))
+            dispatcher.register_proc("SGPLOT", lambda p: handle_proc_sgplot(p, session, reporter))
+            dispatcher.register_proc("SGPANEL", lambda p: handle_proc_sgpanel(p, session, reporter))
+            dispatcher.register_proc("TEMPLATE", lambda p: handle_proc_template(p, session, reporter))
             dispatcher.register_proc("SGRENDER", lambda p: handle_proc_sgrender(p, session, reporter))
             dispatcher.register_proc("SORT", lambda p: handle_proc_sort(p, session, reporter))
             dispatcher.register_proc("CONTENTS", lambda p: handle_proc_contents(p, session, reporter))

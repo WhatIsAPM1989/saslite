@@ -184,6 +184,17 @@ def api_execute():
                     "error": step.error,
                     "notes": step.notes,
                     "warnings": step.warnings,
+                    "artifacts": [
+                        {
+                            "kind": artifact.kind,
+                            "mime_type": artifact.mime_type,
+                            "data": artifact.data,
+                            "title": artifact.title,
+                            "width": artifact.width,
+                            "height": artifact.height,
+                        }
+                        for artifact in step.artifacts
+                    ],
                 })
 
             return jsonify({
