@@ -54,6 +54,7 @@ gui = [
 
 [project.scripts]
 saslite = "saslite.cli.main:main"
+saslite-fixture = "saslite.cli.fixture:main"
 saslite-gui = "saslite.gui.app:main"
 saslite-desktop = "saslite.gui.desktop:main"
 

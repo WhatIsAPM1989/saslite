@@ -12,6 +12,7 @@ from saslite.runtime.dataset import Dataset
 from saslite.project_config import ProjectConfig
 from saslite.storage.path_resolver import StorageRouter
 from saslite.storage.memory import MemoryBackend
+from saslite.fixtures import fixture_path, load_fixture
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +59,7 @@ class Session:
         self.schema_policy = "weak"
         self.library_metadata = {}
         self.metadata_dir: str | None = None
+        self.fixtures_dir: str | None = None
         self.project_config_path: str | None = None
         self._schema_expectations: dict[
             tuple[tuple[str, ...], str], set[str]
@@ -95,6 +97,7 @@ class Session:
         self.schema_policy = config.default_schema
         self.library_metadata = dict(config.library_metadata)
         self.metadata_dir = str(config.metadata_dir) if config.metadata_dir else None
+        self.fixtures_dir = str(config.fixtures_dir) if config.fixtures_dir else None
         self.project_config_path = str(config.path) if config.path else None
         for libref in self.library_metadata:
             if self.storage.get_backend(libref) is None:
@@ -205,7 +208,25 @@ class Session:
             raise KeyError(
                 f"Dataset {libref_upper}.{ds_name} does not exist in strict metadata"
             )
-        ds = backend.read(ds_name)
+        fixture = (
+            fixture_path(
+                self.fixtures_dir,
+                libref_upper,
+                ds_name,
+                existing_only=True,
+            )
+            if dataset_schema is not None and self.fixtures_dir is not None
+            else None
+        )
+        if fixture is not None and dataset_schema is not None:
+            ds = load_fixture(
+                fixture,
+                schema=dataset_schema,
+                libref=libref_upper,
+                member=ds_name,
+            )
+        else:
+            ds = backend.read(ds_name)
         if dataset_schema is not None:
             ds = self._dataset_with_metadata_schema(
                 libref_upper,

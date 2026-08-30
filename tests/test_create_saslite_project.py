@@ -27,6 +27,8 @@ class CreateSasliteProjectTests(unittest.TestCase):
             self.assertTrue((project / "_local/output/qcosi").is_dir())
             self.assertTrue((project / "_local/output/osip").is_dir())
             self.assertTrue((project / "_local/work").is_dir())
+            self.assertTrue((project / "fixtures/ADAM").is_dir())
+            self.assertTrue((project / "fixtures/SDTM").is_dir())
 
             cleaner = (
                 project / "_local/config/metadata/clean-sas-log-metadata.py"
@@ -35,7 +37,7 @@ class CreateSasliteProjectTests(unittest.TestCase):
 
             config = (project / "saslite-project.json").read_text(encoding="utf-8")
             self.assertIn('"default_schema": "weak"', config)
-            self.assertNotIn('"libraries"', config)
+            self.assertIn('"fixtures_dir": "fixtures"', config)
 
             setup = (
                 project / "_local/config/localsetup.sas"

@@ -161,13 +161,14 @@ Create a project structure with:
 ./scripts/create-saslite-project.py /path/to/new-project
 ```
 
-The generated `saslite-project.json` contains no library list:
+The generated `saslite-project.json` contains project-wide settings:
 
 ```json
 {
   "version": 1,
   "default_schema": "weak",
-  "metadata_dir": "_local/config/metadata"
+  "metadata_dir": "_local/config/metadata",
+  "fixtures_dir": "fixtures"
 }
 ```
 
@@ -196,7 +197,16 @@ from the manifest emits a schema warning. Both policies follow source lineage
 through intermediate `WORK` datasets.
 
 Variables read without an input dataset remain ordinary uninitialized-variable
-warnings. Dummy fixture loading is planned but is not implemented yet.
+warnings.
+
+Dummy rows can be stored as UTF-8 semicolon CSV files under
+`fixtures/<LIBREF>/<DATASET>.csv`. A fixture takes precedence over a local
+XPT/SAS7BDAT file and is overlaid on the complete manifest descriptor; omitted
+columns become missing. Scaffold a fixture header from strict metadata with:
+
+```bash
+saslite-fixture SDTM.AE --project-root /path/to/project
+```
 
 ### Starting a new local project
 

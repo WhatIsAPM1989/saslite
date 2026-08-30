@@ -85,10 +85,12 @@ def create_project(
     data_root = local_root / "data"
     output_root = local_root / "output"
     work_root = local_root / "work"
+    fixtures_root = root / "fixtures"
 
     directories = {metadata_dir, work_root}
     directories.update(data_root / folder for folder in input_libraries.values())
     directories.update(output_root / folder for folder in output_libraries.values())
+    directories.update(fixtures_root / libref for libref in input_libraries)
     for directory in sorted(directories):
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -96,6 +98,7 @@ def create_project(
         "version": 1,
         "default_schema": "weak",
         "metadata_dir": "_local/config/metadata",
+        "fixtures_dir": "fixtures",
     }
     _write_generated(
         root / "saslite-project.json",
@@ -129,6 +132,7 @@ def create_project(
     print(f"Project config: {root / 'saslite-project.json'}")
     print(f"Local setup: {local_root / 'config' / 'localsetup.sas'}")
     print(f"Metadata directory: {metadata_dir}")
+    print(f"Fixture directory: {fixtures_root}")
 
 
 def _parse_mappings(

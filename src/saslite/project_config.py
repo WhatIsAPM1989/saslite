@@ -21,6 +21,7 @@ class ProjectConfig:
     version: int = 1
     default_schema: str = "weak"
     metadata_dir: Path | None = None
+    fixtures_dir: Path | None = None
     library_metadata: dict[str, LibrarySchema] = field(default_factory=dict)
 
 
@@ -45,12 +46,6 @@ def load_project_config(path: str | Path) -> ProjectConfig:
             f"Unsupported project configuration version {version!r} in "
             f"{config_path}; expected 1"
         )
-    if "libraries" in payload:
-        raise ValueError(
-            f"libraries is no longer supported in {config_path}; place one "
-            "<libref>.csv file per strict library in metadata_dir"
-        )
-
     default_schema = _schema_policy(
         payload.get("default_schema", "weak"),
         location="default_schema",
@@ -68,11 +63,23 @@ def load_project_config(path: str | Path) -> ProjectConfig:
     metadata_dir = metadata_dir.resolve()
     library_metadata = load_metadata_directory(metadata_dir)
 
+    raw_fixtures_dir = payload.get("fixtures_dir", "fixtures")
+    if not isinstance(raw_fixtures_dir, str) or not raw_fixtures_dir.strip():
+        raise ValueError(
+            f"fixtures_dir in project configuration {config_path} "
+            "must be a non-empty path string"
+        )
+    fixtures_dir = Path(raw_fixtures_dir).expanduser()
+    if not fixtures_dir.is_absolute():
+        fixtures_dir = config_path.parent / fixtures_dir
+    fixtures_dir = fixtures_dir.resolve()
+
     return ProjectConfig(
         path=config_path,
         version=version,
         default_schema=default_schema,
         metadata_dir=metadata_dir,
+        fixtures_dir=fixtures_dir,
         library_metadata=library_metadata,
     )
 

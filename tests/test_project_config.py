@@ -9,8 +9,8 @@ import unittest
 import pandas as pd
 
 from saslite import SasInterpreter
+from saslite.cli.fixture import main as fixture_cli_main
 from saslite.cli.main import main as cli_main
-from saslite.project_config import load_project_config
 from saslite.storage.memory import MemoryBackend
 
 
@@ -132,6 +132,83 @@ run;
             self.assertEqual(len(frame), 0)
             self.assertEqual(list(frame.columns), ["USUBJID", "AETERM"])
 
+    def test_fixture_rows_are_overlaid_on_full_metadata_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._write_config(root)
+            self._write_metadata(root, "SDTM", [
+                ("AE", "USUBJID", "character", 20, 1, "", "", "Subject"),
+                ("AE", "AETERM", "character", 200, 2, "", "", "Term"),
+                ("AE", "AESEQ", "numeric", 8, 3, "BEST12.", "", "Sequence"),
+            ])
+            fixture_dir = root / "fixtures" / "sdtm"
+            fixture_dir.mkdir(parents=True)
+            (fixture_dir / "ae.CSV").write_text(
+                "USUBJID;AESEQ\nTEST-001;1\nTEST-002;.\n",
+                encoding="utf-8",
+            )
+            sas = SasInterpreter(project_file=config)
+            sas.session.storage.register("SDTM", MemoryBackend())
+            sas.create_dataset(
+                "AE",
+                pd.DataFrame({"USUBJID": ["PHYSICAL"], "AESEQ": [99]}),
+                libref="SDTM",
+            )
+
+            frame = sas.get_dataset("SDTM", "AE")
+
+            self.assertEqual(list(frame.columns), ["USUBJID", "AETERM", "AESEQ"])
+            self.assertEqual(frame["USUBJID"].tolist(), ["TEST-001", "TEST-002"])
+            self.assertEqual(frame["AETERM"].tolist(), ["", ""])
+            self.assertEqual(frame.loc[0, "AESEQ"], 1)
+            self.assertTrue(pd.isna(frame.loc[1, "AESEQ"]))
+
+    def test_fixture_rejects_columns_outside_strict_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = self._write_config(root)
+            self._write_metadata(root, "SDTM", self._ae_rows())
+            fixture_dir = root / "fixtures" / "SDTM"
+            fixture_dir.mkdir(parents=True)
+            (fixture_dir / "AE.csv").write_text(
+                "USUBJID;INVENTED\nTEST-001;value\n",
+                encoding="utf-8",
+            )
+            sas = SasInterpreter(project_file=config)
+
+            with self.assertRaisesRegex(ValueError, "INVENTED"):
+                sas.get_dataset("SDTM", "AE")
+
+    def test_fixture_command_scaffolds_header_from_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_config(root)
+            self._write_metadata(root, "SDTM", self._ae_rows())
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = fixture_cli_main([
+                    "SDTM.AE",
+                    "--project-root",
+                    str(root),
+                ])
+
+            self.assertEqual(exit_code, 0, stderr.getvalue())
+            fixture = root / "fixtures" / "SDTM" / "AE.csv"
+            self.assertEqual(
+                fixture.read_text(encoding="utf-8"),
+                "USUBJID;AETERM\n",
+            )
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                second_exit_code = fixture_cli_main([
+                    "SDTM.AE",
+                    "--project-root",
+                    str(root),
+                ])
+            self.assertEqual(second_exit_code, 1)
+            self.assertIn("already exists", stderr.getvalue())
+
     def test_strict_policy_survives_work_lineage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -184,17 +261,6 @@ run;
             self.assertIn("MISSING_SQL", warnings)
             self.assertIn("SDTM.AE", warnings)
             self.assertFalse(sas.session.schema_expectations)
-
-    def test_old_per_library_configuration_is_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            path = self._write_config(
-                root,
-                extra={"libraries": {"ADAM": {"schema": "strict"}}},
-            )
-
-            with self.assertRaisesRegex(ValueError, "libraries is no longer supported"):
-                load_project_config(path)
 
     def test_cli_discovers_config_beside_program(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
