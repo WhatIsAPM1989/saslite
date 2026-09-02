@@ -963,9 +963,26 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
         label = d.get("label", "")
         if label and cu in cmap and cmap[cu] in report_df.columns:
             rename_labels[cmap[cu]] = label
-    display_df = report_df[
-        [column for column in report_df.columns if column not in hidden_columns]
-    ].rename(columns=rename_labels)
+    visible_columns = [
+        column for column in report_df.columns if column not in hidden_columns
+    ]
+    display_df = report_df[visible_columns].rename(columns=rename_labels)
+
+    column_styles: list[dict[str, str]] = []
+    reverse_columns = {actual: upper for upper, actual in cmap.items()}
+    for column in visible_columns:
+        definition = defines.get(reverse_columns.get(column, ""), {})
+        styles = definition.get("styles", {}) if definition else {}
+        column_styles.append({
+            "COLUMN": str(styles.get("COLUMN", "")),
+            "HEADER": str(styles.get("HEADER", "")),
+        })
+    presentation = {
+        "REPORT": str(proc.options.get("STYLE_REPORT_ATTRS", "")),
+        "HEADER": str(proc.options.get("STYLE_HEADER_ATTRS", "")),
+        "COLUMN": str(proc.options.get("STYLE_COLUMN_ATTRS", "")),
+        "COLUMNS": column_styles,
+    }
 
     buf = io.StringIO()
     buf.write(f"\n{'=' * 60}\n")
@@ -986,6 +1003,7 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
             display_df,
             title=f"PROC REPORT: {ds.metadata.libref}.{ds.metadata.member_name}",
             listing_text=output,
+            presentation=presentation,
         )
     except OSError as exc:
         return StepResult(success=False, error=f"PROC REPORT output error: {exc}")

@@ -32,3 +32,18 @@ hazard-ratio, LS-mean, and contrast results. The remaining unsupported SAS
 algorithms are listed under Known Limits in the main documentation; notably,
 the current `DDFM=KR` path uses residual degrees of freedom and does not yet
 apply the complete Kenward-Roger covariance inflation.
+
+## RTF styles
+
+`ODS RTF FILE=... STYLE=...` applies a visual preset to `PROC REPORT` output.
+The native presets are `DEFAULT`, `RTF`, `JOURNAL`, `PRINTER`, `STATISTICAL`,
+`HTMLBLUE`, `SAPPHIRE`, and `MEADOW`; familiar variants such as `JOURNAL2`,
+`JOURNAL3`, `PLATEAU`, and `SEASIDE` resolve to the closest native preset.
+
+`PROC REPORT` can override the preset with `STYLE(REPORT)`, `STYLE(HEADER)`,
+and `STYLE(COLUMN)`. A `DEFINE` statement can also apply `STYLE(COLUMN)` or
+`STYLE(HEADER)` to one column. RTF rendering supports `FONT_FACE`, `FONT_SIZE`,
+`FONT_WEIGHT`, `FONT_STYLE`, `TEXT_DECORATION`, `FOREGROUND`/`COLOR`,
+`BACKGROUND`, `BORDERCOLOR`, `BORDERWIDTH`, `CELLPADDING`, `WIDTH`, `JUST`,
+and `VJUST`. Colors may be common names, `#RRGGBB`, or SAS `CXrrggbb` values;
+sizes accept points, inches, centimetres, or millimetres where applicable.

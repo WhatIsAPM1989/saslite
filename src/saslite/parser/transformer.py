@@ -68,6 +68,19 @@ def _get_text(node: Any) -> str:
     return str(node)
 
 
+def _report_style_parts(value: str) -> tuple[str, str]:
+    """Return the STYLE target and declaration body from PROC REPORT syntax."""
+    match = re.fullmatch(
+        r"\s*STYLE\s*\(\s*(REPORT|HEADER|COLUMN)\s*\)\s*=\s*"
+        r"(?:\{(.*)\}|\[(.*)\])\s*",
+        value,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return "", ""
+    return match.group(1).upper(), (match.group(2) or match.group(3) or "").strip()
+
+
 def _get_name(node: Any) -> str:
     """Get a NAME token value."""
     if isinstance(node, Token):
@@ -4086,7 +4099,12 @@ class SasTransformer(Transformer):
         if "NOWINDOWS" in option:
             return {"NOWD": option["NOWINDOWS"]}
         if any(key.startswith("STYLE") for key in option):
-            return {"STYLE_REPORT": True}
+            text = next((str(item) for item in items if isinstance(item, Token)), "")
+            target, attributes = _report_style_parts(text)
+            result: dict[str, Any] = {"STYLE_REPORT": True}
+            if target:
+                result[f"STYLE_{target}_ATTRS"] = attributes
+            return result
         return option
 
     def report_column(self, items: list[Any]) -> dict[str, Any]:
@@ -4096,10 +4114,17 @@ class SasTransformer(Transformer):
         name = ""
         attrs: list[str] = []
         label = ""
+        styles: dict[str, str] = {}
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
                 if t.upper() in ("DEFINE", "/", ";", "="):
+                    continue
+                if t.upper().startswith("STYLE"):
+                    target, attributes = _report_style_parts(t)
+                    if target:
+                        styles[target] = attributes
+                    attrs.append(t.upper())
                     continue
                 if (t.startswith("'") and t.endswith("'")) or (t.startswith('"') and t.endswith('"')):
                     label = t[1:-1]
@@ -4109,11 +4134,23 @@ class SasTransformer(Transformer):
                     attrs.append(t.upper())
             elif isinstance(item, str):
                 s = item.strip()
+                if s.upper().startswith("STYLE"):
+                    target, attributes = _report_style_parts(s)
+                    if target:
+                        styles[target] = attributes
+                    attrs.append(s.upper())
+                    continue
                 if (s.startswith("'") and s.endswith("'")) or (s.startswith('"') and s.endswith('"')):
                     label = s[1:-1]
                 else:
                     attrs.append(s.upper())
-        return {"action": "define", "name": name, "attrs": attrs, "label": label}
+        return {
+            "action": "define",
+            "name": name,
+            "attrs": attrs,
+            "label": label,
+            "styles": styles,
+        }
 
     def report_def_attr(self, items: list[Any]) -> str:
         parts = [str(t) for t in items if isinstance(t, Token) and str(t) not in ("=",)]

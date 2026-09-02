@@ -100,6 +100,66 @@ class ProcReportDocumentTests(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.steps[0].error, "ODS RTF requires FILE=")
 
+    def test_ods_style_changes_rtf_fonts_and_colors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            default_path = Path(tmp) / "default.rtf"
+            journal_path = Path(tmp) / "journal.rtf"
+            sas = SasInterpreter()
+            sas.create_dataset("sample", pd.DataFrame({"value": [1, 2]}))
+
+            result = sas.execute(
+                f'''
+                ods rtf file="{default_path}" style=default;
+                proc report data=sample; column value; run;
+                ods rtf close;
+                ods rtf file="{journal_path}" style=journal;
+                proc report data=sample; column value; run;
+                ods rtf close;
+                '''
+            )
+
+            self.assertTrue(result.success, result.error)
+            default = default_path.read_text(encoding="ascii")
+            journal = journal_path.read_text(encoding="ascii")
+            self.assertIn("Arial", default)
+            self.assertIn(r"\red68\green114\blue196;", default)
+            self.assertIn("Times New Roman", journal)
+            self.assertNotIn(r"\red68\green114\blue196;", journal)
+            self.assertNotEqual(default, journal)
+
+    def test_proc_report_style_overrides_are_rendered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rtf_path = Path(tmp) / "custom.rtf"
+            sas = SasInterpreter()
+            sas.create_dataset(
+                "sample",
+                pd.DataFrame({"label": ["A"], "value": [10]}),
+            )
+
+            result = sas.execute(
+                f'''
+                ods rtf file="{rtf_path}" style=journal;
+                proc report data=sample
+                    style(report)=[font_face="Courier New" width=75% cellpadding=6pt]
+                    style(header)=[background=#ff0000 foreground=white];
+                  column label value;
+                  define value / display
+                    style(column)={{background=cx00ff00 just=r font_weight=bold width=30%}};
+                run;
+                ods rtf close;
+                '''
+            )
+
+            self.assertTrue(result.success, result.error)
+            rtf = rtf_path.read_text(encoding="ascii")
+            self.assertIn("Courier New", rtf)
+            self.assertIn(r"\red255\green0\blue0;", rtf)
+            self.assertIn(r"\red0\green255\blue0;", rtf)
+            self.assertIn(r"\trpaddl120", rtf)
+            self.assertIn(r"\qr", rtf)
+            self.assertIn(r"\cellx5040", rtf)
+            self.assertIn(r"\cellx7200", rtf)
+
 
 if __name__ == "__main__":
     unittest.main()
