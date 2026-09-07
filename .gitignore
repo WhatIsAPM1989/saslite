@@ -9,3 +9,4 @@ dist/
 .venv/
 .work/
 .saslite-private/
+_local/

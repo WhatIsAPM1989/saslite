@@ -12,11 +12,28 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -e .
 ```
 
-On this workstation the configured Python 3.12 environment is:
+The environment is relative to the checkout root:
 
 ```text
-/path/to/SASLite/.venv
+.venv
 ```
+
+Keep personal paths and project-specific profiles in `.saslite-private/`
+(ignored by Git). The public `example` profile and
+`examples/profile_demo.sas` use synthetic data only. To try them from the
+checkout root:
+
+```bash
+mkdir -p _local/config
+# Copy only when no local setup exists; preserve your existing configuration.
+test -e _local/config/localsetup.sas || cp examples/localsetup.example.sas _local/config/localsetup.sas
+./scripts/run-saslite --profile example --profile-root . examples/profile_demo.sas
+```
+
+The copied setup under `_local/` is ignored and can be customized locally.
+Existing private profiles continue to work with `--profile-file`; the public
+example does not replace them. Share selected Git files, not an archive of
+the working directory, which also contains ignored private files.
 
 ## Run a SAS program
 
