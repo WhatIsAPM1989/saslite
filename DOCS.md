@@ -1,3 +1,7 @@
+> For current downstream coverage and limitations, see [FEATURES.md](FEATURES.md).
+> Installation and execution instructions are in [USAGE.md](USAGE.md).
+> This inherited syntax guide contains historical coverage notes.
+
 # SASLite 使用说明文档
 
 > 轻量级本地 SAS 语言解释器 | 基于 Python + Pandas | 版本 0.1.2

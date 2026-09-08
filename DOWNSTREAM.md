@@ -15,13 +15,11 @@ downstream was created.
 The baseline commit is an exact import of the files in that source
 distribution. Later commits contain downstream changes and regression tests.
 
-## Current downstream changes
+## Downstream releases
 
-- Correct grouped `COUNT(DISTINCT expression)` evaluation.
-- Preserve the requested aggregate alias without leaking an internal `N`
-  column.
-- Add regression tests for duplicate values, missing values, and complex
-  expressions.
+Version 0.5.0 expands language compatibility, statistical procedures, graphics,
+reporting, and local project workflows. See [CHANGELOG.md](CHANGELOG.md) and
+[FEATURES.md](FEATURES.md) for current coverage and limitations.
 
 ## Licensing and trademarks
 
