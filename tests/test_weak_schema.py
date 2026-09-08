@@ -28,25 +28,36 @@ class WeakSchemaTests(unittest.TestCase):
 
     def test_missing_input_variable_is_assumed_without_mutating_source(self) -> None:
         sas = SasInterpreter()
-        sas.create_dataset("adae", pd.DataFrame({"USUBJID": ["TEST-001"]}))
+        sas.session.storage.register("ADAM", MemoryBackend())
+        sas.create_dataset("adae", pd.DataFrame({"USUBJID": ["TEST-001"]}), libref="ADAM")
         log = io.StringIO()
         sas.reporter._stream = log
         sas.reporter.configure(quiet=True)
 
         result = sas.execute(
-            "data result; set adae; selected=(trtemfl='Y'); run;"
+            "data result; set adam.adae; selected=(trtemfl='Y'); run;"
         )
 
         self.assertTrue(result.success, result.error)
-        self.assertEqual(list(sas.get_dataset("WORK", "ADAE").columns), ["USUBJID"])
+        self.assertEqual(list(sas.get_dataset("ADAM", "ADAE").columns), ["USUBJID"])
         self.assertFalse(result.steps[-1].warnings)
         self.assertEqual(len(sas.session.schema_expectations), 1)
         expectation = sas.session.schema_expectations[0]
-        self.assertEqual(expectation.sources, ("WORK.ADAE",))
+        self.assertEqual(expectation.sources, ("ADAM.ADAE",))
         self.assertEqual(expectation.variable, "TRTEMFL")
         self.assertEqual(expectation.contexts, ("DATA STEP",))
-        self.assertIn("WORK.ADAE.TRTEMFL", log.getvalue())
+        self.assertIn("ADAM.ADAE.TRTEMFL", log.getvalue())
         self.assertIn("Validation level: weak", log.getvalue())
+
+    def test_work_is_strict_even_for_imported_datasets(self) -> None:
+        sas = SasInterpreter()
+        self.assertEqual(sas.session.schema_policy_for("work"), "strict")
+        self.assertEqual(sas.session.schema_policy_for("RAW"), "weak")
+        sas.create_dataset("source", pd.DataFrame({"known": [1]}))
+        result = sas.execute("data result; set source; value=unknown; run;")
+        self.assertTrue(result.success, result.error)
+        self.assertFalse(sas.session.schema_expectations)
+        self.assertIn("UNKNOWN", "\n".join(result.steps[-1].warnings).upper())
 
     def test_work_intermediates_report_the_original_source_schema(self) -> None:
         sas = SasInterpreter()

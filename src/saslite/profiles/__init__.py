@@ -46,7 +46,7 @@ def load_profile_file(
         raise ImportError(f"Cannot load compatibility profile: {path}")
 
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     factory = getattr(module, "create_profile", None)
     if not callable(factory):
         raise TypeError(

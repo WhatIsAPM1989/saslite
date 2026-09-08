@@ -65,6 +65,7 @@ where = ["src"]
 saslite = [
     "parser/grammar/*.lark",
     "gui/static/*.html",
+    "gui/static/vendor/codemirror/*",
 ]
 
 [tool.pytest.ini_options]

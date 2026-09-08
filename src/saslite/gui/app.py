@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import re
@@ -9,6 +10,7 @@ import secrets
 import sys
 import threading
 import traceback
+import tokenize
 import webbrowser
 from argparse import ArgumentParser
 from datetime import date, datetime
@@ -19,6 +21,7 @@ import pandas as pd
 from flask import Flask, Response, jsonify, request
 
 from saslite import SasInterpreter
+from saslite.gui.project_profiles import expected_profile
 
 app = Flask(__name__, static_folder="static")
 app.config.setdefault("SAS_FACTORY", SasInterpreter)
@@ -45,6 +48,80 @@ def reset_sas() -> SasInterpreter:
     sas = app.config["SAS_FACTORY"]()
     app.config["SAS_SESSION"] = sas
     return sas
+
+
+def configure_session(settings: dict[str, object]) -> dict[str, object]:
+    """Build a replacement before touching the active session."""
+    options = {}
+    for key in ("profile", "profile_file", "profile_root", "project_file", "work_dir"):
+        value = settings.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"{key} must be a string")
+        value = value.strip() if value else None
+        if value and key != "profile":
+            value = str(Path(value).expanduser().resolve())
+        options[key] = value
+    root = options["profile_root"]
+    if root and not Path(root).is_dir():
+        raise ValueError(f"Project root does not exist: {root}")
+    sas = app.config["SAS_FACTORY"](**options)
+    sas.reporter.configure(color=False)
+    state = {**options, "name": getattr(sas._profile, "name", None)}
+    app.config["SAS_SESSION"] = sas
+    app.config["SAS_PROFILE_STATE"] = state
+    return state
+
+
+@app.route("/api/profile", methods=["GET", "POST"])
+def api_profile():
+    with _sas_lock():
+        if request.method == "GET":
+            return jsonify(app.config.get("SAS_PROFILE_STATE", {"name": None}))
+        body = _json_body()
+        if body is None:
+            return jsonify(success=False, error="Invalid JSON body"), 400
+        try:
+            state = configure_session(body)
+        except Exception as exc:
+            return jsonify(success=False, error=str(exc)), 400
+        return jsonify(success=True, profile=state)
+
+
+@app.route("/api/profile/source", methods=["GET", "POST"])
+def api_profile_source():
+    with _sas_lock():
+        state = app.config.get("SAS_PROFILE_STATE", {})
+        filename = state.get("profile_file")
+        editable = bool(filename)
+        if not filename and state.get("profile") == "example":
+            filename = str(Path(__file__).resolve().parents[1] / "profiles" / "example.py")
+        if not filename:
+            return jsonify(success=False, error="Connect a profile to view its code"), 400
+        try:
+            path = Path(filename)
+            original = path.read_bytes()
+            encoding, _ = tokenize.detect_encoding(io.BytesIO(original).readline)
+            revision = hashlib.sha256(original).hexdigest()
+            if request.method == "POST":
+                body = _json_body()
+                if not editable:
+                    return jsonify(success=False, error="Built-in profiles are read-only; connect a local Python file to edit"), 400
+                if body is None or not isinstance(body.get("content"), str):
+                    return jsonify(success=False, error="Profile content must be a string"), 400
+                if body.get("path") != str(path) or body.get("revision") != revision:
+                    return jsonify(success=False, error="Profile changed outside this editor. Reload its code before saving."), 409
+                content = body["content"]
+                if b"\r\n" in original:
+                    content = content.replace("\r\n", "\n").replace("\n", "\r\n")
+                updated = content.encode(encoding)
+                compile(updated, str(path), "exec")
+                path.write_bytes(updated)
+                revision = hashlib.sha256(updated).hexdigest()
+                original = updated
+            return jsonify(success=True, path=str(path), content=original.decode(encoding),
+                           revision=revision, editable=editable)
+        except Exception as exc:
+            return jsonify(success=False, error=str(exc)), 400
 
 
 def _request_host_name() -> str:
@@ -173,8 +250,9 @@ def api_execute():
             sys.stdout = captured
             sys.stderr = captured
             sas.reporter._stream = captured
+            sas.reporter.configure(color=False)
 
-            result = sas.execute(code)
+            result = sas.execute(code, source_name=body.get("source_path") or "<input>")
             output_text = captured.getvalue()
 
             steps = []
@@ -266,6 +344,7 @@ def api_libraries():
                 "engine": engine,
                 "path": path,
                 "icon": icon,
+                "schema_policy": sas.session.schema_policy_for(libref),
                 "datasets": sorted(ds_list, key=lambda d: d["name"]),
                 "count": len(ds_list),
             })
@@ -340,15 +419,96 @@ def api_open_file():
     if not filepath:
         return jsonify({"success": False, "error": "No file path provided"})
     try:
-        p = Path(filepath)
+        p = Path(filepath).expanduser().resolve()
         if not p.exists():
             return jsonify({"success": False, "error": f"File not found: {filepath}"})
         if not p.suffix.lower() == ".sas":
             return jsonify({"success": False, "error": "Only .sas files are supported"})
         content = p.read_text(encoding="utf-8", errors="replace")
-        return jsonify({"success": True, "content": content, "filename": p.name})
+        with _sas_lock():
+            recommendation = expected_profile(str(p), app.config.get("SAS_PROFILE_STATE", {}))
+        return jsonify(success=True, content=content, filename=p.name, path=str(p),
+                       recommendation=recommendation)
     except Exception as e:
         return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/save-file", methods=["POST"])
+def api_save_file():
+    """Save editor text to a local SAS program."""
+    body = _json_body()
+    if (body is None or not isinstance(body.get("path"), str)
+            or not body["path"].strip() or not isinstance(body.get("content"), str)):
+        return jsonify(success=False, error="A path and text content are required"), 400
+    try:
+        path = Path(body["path"]).expanduser().resolve()
+        if path.suffix.lower() != ".sas":
+            return jsonify(success=False, error="Only .sas files are supported"), 400
+        with _sas_lock():
+            if path.exists() and not body.get("overwrite"):
+                return jsonify(success=False, error="File already exists", exists=True), 409
+            # Write beside the destination so replacement is atomic.
+            import os
+            import tempfile
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="",
+                                                 dir=path.parent, delete=False) as stream:
+                    temporary = Path(stream.name)
+                    stream.write(body["content"])
+                if path.exists():
+                    temporary.chmod(path.stat().st_mode & 0o777)
+                os.replace(temporary, path)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        return jsonify(success=True, path=str(path))
+    except (OSError, ValueError) as exc:
+        return jsonify(success=False, error=str(exc)), 400
+
+
+@app.route("/api/program-profile", methods=["POST"])
+def api_program_profile():
+    body = _json_body()
+    if body is None or not isinstance(body.get("path"), str):
+        return jsonify(success=False, error="A program path is required"), 400
+    try:
+        with _sas_lock():
+            recommendation = expected_profile(body["path"], app.config.get("SAS_PROFILE_STATE", {}))
+            if body.get("create") is True:
+                target = recommendation["settings"].get("profile_file")
+                if recommendation["exists"] or not target:
+                    return jsonify(success=False, error="Profile already exists; reload the recommendation"), 409
+                if target != body.get("expected_profile_file"):
+                    return jsonify(success=False, error="Expected profile changed; reload the recommendation"), 409
+                destination = Path(target)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                # Exclusive creation: never overwrite an existing project profile.
+                with destination.open("x", encoding="utf-8") as output:
+                    output.write(recommendation["template"])
+                recommendation = expected_profile(body["path"], app.config.get("SAS_PROFILE_STATE", {}))
+            return jsonify(success=True, recommendation=recommendation)
+    except Exception as exc:
+        return jsonify(success=False, error=str(exc)), 400
+
+
+@app.route("/api/program-files", methods=["POST"])
+def api_program_files():
+    """Local file chooser retains real paths, unlike a browser upload input."""
+    body = _json_body()
+    if body is None:
+        return jsonify(success=False, error="Invalid JSON body"), 400
+    try:
+        folder = Path(body.get("directory") or Path.cwd()).expanduser().resolve()
+        if not folder.is_dir():
+            raise ValueError("Choose a directory")
+        entries = [dict(name=p.name, path=str(p), directory=p.is_dir())
+                   for p in folder.iterdir()
+                   if not p.name.startswith('.') and (p.is_dir() or p.suffix.lower() == '.sas')]
+        entries.sort(key=lambda item: (not item["directory"], item["name"].casefold()))
+        return jsonify(success=True, directory=str(folder), parent=str(folder.parent), entries=entries)
+    except Exception as exc:
+        return jsonify(success=False, error=str(exc)), 400
 
 
 @app.route("/api/import-data", methods=["POST"])
@@ -450,47 +610,31 @@ def api_upload_data():
 
 @app.route("/api/file-dialog", methods=["POST"])
 def api_file_dialog():
-    """Open a native file dialog and return the selected path.
-
-    Requires pywebview integration; falls back to None if not available.
-    """
+    """Use the desktop window or macOS system picker, preserving the real path."""
     body = _json_body()
     if body is None:
-        return jsonify({"success": False, "error": "Invalid JSON body"}), 400
-    mode = body.get("mode", "open")  # open or import
+        return jsonify(success=False, error="Invalid JSON body"), 400
+    mode = body.get("mode", "open")
+    if mode not in ("open", "import"):
+        return jsonify(success=False, error="Unknown file dialog mode"), 400
     try:
-        import webview
-        window = webview.windows[0] if webview.windows else None
-        if not window:
-            return jsonify({"success": False, "error": "No window available"})
-
-        if mode == "open":
+        webview = sys.modules.get("webview")
+        window = webview.windows[0] if webview and webview.windows else None
+        if window:
+            types = ("SAS Files (*.sas)", "All Files (*.*)") if mode == "open" else (
+                "Data Files (*.sas7bdat;*.xpt;*.csv;*.xlsx;*.xls)", "All Files (*.*)")
             result = window.create_file_dialog(
-                webview.OPEN_DIALOG,
-                directory="",
-                allow_multiple=False,
-                file_types=("SAS Files (*.sas)", "All Files (*.*)"),
+                webview.OPEN_DIALOG, directory="", allow_multiple=False, file_types=types,
             )
-        else:
-            result = window.create_file_dialog(
-                webview.OPEN_DIALOG,
-                directory="",
-                allow_multiple=False,
-                file_types=(
-                    "Data Files (*.sas7bdat;*.xpt;*.csv;*.xlsx;*.xls)",
-                    "SAS7BDAT (*.sas7bdat)",
-                    "XPORT (*.xpt)",
-                    "CSV (*.csv)",
-                    "Excel (*.xlsx;*.xls)",
-                    "All Files (*.*)",
-                ),
-            )
-
-        if result and len(result) > 0:
-            return jsonify({"success": True, "path": result[0]})
-        return jsonify({"success": False, "error": "No file selected"})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+            if result:
+                return jsonify(success=True, path=result[0])
+            return jsonify(success=False, cancelled=True)
+        if sys.platform == "darwin":
+            from saslite.gui.file_dialog import choose_macos_file
+            return jsonify(choose_macos_file(mode))
+        return jsonify(success=False, error="Native file dialog unavailable")
+    except Exception as exc:
+        return jsonify(success=False, error=str(exc))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -506,7 +650,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Start the server without opening a browser tab.",
     )
+    profiles = parser.add_mutually_exclusive_group()
+    profiles.add_argument("--profile", choices=["example"])
+    profiles.add_argument("--profile-file", help="Trusted local Python profile")
+    parser.add_argument("--profile-root", help="Project root directory")
+    parser.add_argument("--project-file", help="Project configuration JSON")
+    parser.add_argument("--workdir", help="DISK library directory")
     args = parser.parse_args(argv)
+    try:
+        configure_session(dict(profile=args.profile, profile_file=args.profile_file,
+                               profile_root=args.profile_root, project_file=args.project_file,
+                               work_dir=args.workdir))
+    except Exception as exc:
+        parser.error(str(exc))
+
+    if sys.platform == "darwin":
+        from saslite.gui.file_dialog import warm_macos_picker
+        threading.Thread(target=warm_macos_picker, daemon=True).start()
 
     url = f"http://{args.host}:{args.port}"
     print("SASLite Web GUI starting...")

@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SASLite</title>
+<link rel="stylesheet" href="/static/vendor/codemirror/codemirror.css">
+<link rel="stylesheet" href="/static/vendor/codemirror/dracula.css">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -32,16 +34,19 @@ body {
 
 /* ── Top Bar ── */
 .topbar {
-  height: 42px;
+  min-height: 42px;
+  flex-wrap: wrap;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
-  padding: 0 16px;
-  gap: 16px;
+  padding: 6px 16px;
+  gap: 8px 16px;
   flex-shrink: 0;
 }
 .topbar .logo {
+  flex-shrink: 0;
+  white-space: nowrap;
   font-weight: 700;
   font-size: 15px;
   color: var(--accent);
@@ -128,6 +133,7 @@ body {
   transform: rotate(90deg);
 }
 .lib-icon {
+  position: relative;
   font-size: 14px;
   flex-shrink: 0;
   width: 18px;
@@ -136,6 +142,14 @@ body {
 .lib-icon.work { color: var(--accent); }
 .lib-icon.disk { color: var(--accent2); }
 .lib-icon.memory { color: var(--warn); }
+.lib-schema-badge {
+  position: absolute;
+  right: -5px;
+  bottom: -4px;
+  font-size: 10px;
+  line-height: 1;
+  pointer-events: none;
+}
 .lib-name {
   flex: 1;
   font-family: var(--font-mono);
@@ -229,15 +243,13 @@ body {
   border-bottom: 1px solid var(--border);
 }
 .editor-toolbar {
-  height: 36px;
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  padding: 0 12px;
   gap: 8px;
-  flex-shrink: 0;
+  min-width: 0;
 }
+.editor-toolbar > * { flex-shrink: 0; }
 .btn-run {
   background: var(--accent2);
   color: #1e1e2e;
@@ -295,20 +307,14 @@ body {
   flex: 1;
   position: relative;
 }
-#editor {
-  width: 100%;
+.editor-wrap { min-height: 0; overflow: hidden; }
+.editor-wrap .CodeMirror {
   height: 100%;
-  background: var(--bg);
-  color: var(--text);
-  border: none;
-  outline: none;
-  resize: none;
-  padding: 12px 16px;
   font-family: var(--font-mono);
   font-size: 14px;
   line-height: 1.6;
-  tab-size: 2;
 }
+.editor-wrap .CodeMirror-lines { padding: 12px 0; }
 
 /* ── Results ── */
 .results-panel {
@@ -339,6 +345,8 @@ body {
 }
 .tab-btn:hover { color: var(--text); }
 .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+.output-count-error { color: var(--error); }
+.output-count-warning { color: #f9e2af; }
 .result-content {
   flex: 1;
   overflow: auto;
@@ -354,6 +362,19 @@ body {
   word-break: break-all;
 }
 .error-line { color: var(--error); }
+.warning-line { color: #f9e2af; }
+.diagnostic-link {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  text-align: left;
+  white-space: pre-wrap;
+  cursor: pointer;
+}
+.diagnostic-link:hover { text-decoration: underline; }
+.diagnostic-link:focus-visible { outline: 1px solid var(--accent); }
 .note-line { color: var(--text-dim); }
 .success-line { color: var(--accent2); }
 .graph-output {
@@ -460,6 +481,17 @@ body {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+dialog.project-dialog { margin:auto; background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:10px; padding:22px; width:min(760px,90vw); max-height:85vh; overflow:auto; }
+dialog.project-dialog::backdrop { background:rgba(0,0,0,.55); }
+.project-dialog h2 { margin:0 0 14px; font-size:18px; }
+.project-dialog p { margin:12px 0; overflow-wrap:anywhere; }
+.project-dialog button, .project-dialog input { padding:8px; background:var(--surface2); color:var(--text); border:1px solid var(--border); border-radius:4px; }
+.project-dialog button { cursor:pointer; }
+.project-dialog .actions { display:flex; gap:10px; margin-top:16px; }
+#programEntries { display:flex; flex-direction:column; gap:4px; max-height:42vh; overflow:auto; margin-top:12px; }
+#programEntries button { text-align:left; }
+#profilePreview { white-space:pre-wrap; font-size:12px; }
 </style>
 </head>
 <body>
@@ -467,7 +499,97 @@ body {
 <!-- Top Bar -->
 <div class="topbar">
   <div class="logo">SASLite <span>Web GUI</span></div>
+  <div class="editor-toolbar">
+    <button class="btn-run" id="btnRun" onclick="runCode()" title="Run (Ctrl+Enter). Select text to run only selected.">
+      &#9654; Run
+    </button>
+    <button class="btn-open" id="btnOpenSas" onclick="openSasFile()" title="Open .sas program file">
+      &#128194; Open .sas
+    </button>
+    <button class="btn-open" id="btnSaveSas" onclick="saveSasFile()" title="Save SAS program (⌘S / Ctrl+S)">Save</button>
+    <span id="saveSasStatus" role="status" style="font-size:12px;color:var(--text-dim)"></span>
+    <button class="btn-import" onclick="importDataFile()" title="Import data file (sas7bdat/xpt/csv/excel)">
+      &#128229; Import Data
+    </button>
+    <button class="btn-clear" onclick="clearEditor()">Clear</button>
+    <select id="exampleSelect" onchange="loadExample(this.value)" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer;">
+      <option value="">-- Examples --</option>
+      <option value="basic">Basic DATA + PRINT</option>
+      <option value="sql">PROC SQL</option>
+      <option value="case_when">CASE WHEN</option>
+      <option value="like_between">LIKE / BETWEEN / IS NULL</option>
+      <option value="lag_dif">LAG / DIF</option>
+      <option value="proc_means">PROC MEANS</option>
+      <option value="proc_print_by">PROC PRINT BY</option>
+      <option value="libname">LIBNAME</option>
+      <option value="macro">Macro System</option>
+      <option value="full">Full Demo</option>
+    </select>
+  </div>
 </div>
+
+<details id="profileDetails" style="flex-shrink:0;max-height:65vh;overflow:auto;padding:10px 16px;background:var(--surface1);border-bottom:1px solid var(--border)">
+  <summary style="cursor:pointer">Profile: <strong id="activeProfile">Loading…</strong></summary>
+  <form id="profileForm" style="display:flex;flex-wrap:wrap;gap:10px;padding-top:10px;align-items:end">
+    <label>Profile type<br><select id="profileType"><option value="">None</option><option value="file">Local Python file</option><option value="example">Example</option></select></label>
+    <label>Profile file (.py)<br><input id="profileFile" size="45" placeholder="/path/to/profile.py"></label>
+    <label>Project root<br><input id="profileRoot" size="40" placeholder="/path/to/project"></label>
+    <label>Project config (optional)<br><input id="projectFile" size="35" placeholder="saslite-project.json"></label>
+    <button type="submit">Apply profile / New session</button>
+    <div style="flex-basis:100%;font-size:12px">Applying starts a new session and clears WORK. Use a trusted Python profile. Project config is discovered under the project root when left blank.</div>
+    <div id="profileError" role="alert" style="color:var(--red)"></div>
+  </form>
+  <div id="profileCodePanel" hidden style="margin-top:12px">
+    <div id="profileCodePath" style="font-size:12px;overflow-wrap:anywhere;margin-bottom:6px"></div>
+    <textarea id="profileCode" aria-label="Profile Python code" spellcheck="false"></textarea>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+      <button type="button" id="saveProfileCode" disabled>Save code</button>
+      <button type="button" id="reloadProfileCode">Reload code</button>
+      <span id="profileCodeStatus" role="status" style="font-size:12px"></span>
+    </div>
+  </div>
+</details>
+
+<dialog id="saveProgramDialog" class="project-dialog">
+  <h2>Save SAS program</h2>
+  <form id="saveProgramForm">
+    <label for="saveProgramPath">File path (.sas)</label>
+    <input id="saveProgramPath" required style="width:100%;margin-top:8px" placeholder="/path/to/program.sas">
+    <p id="saveProgramError" role="alert"></p>
+    <div class="actions">
+      <button type="submit" id="confirmSaveProgram">Save</button>
+      <button type="button" onclick="document.getElementById('saveProgramDialog').close()">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="programDialog" class="project-dialog">
+  <h2>Open local SAS program</h2>
+  <p id="programHint">Choose the original file so its project profile can be detected.</p>
+  <form id="programPathForm" style="display:flex;gap:8px">
+    <input id="programPath" aria-label="Program or folder path" placeholder="Full path to a folder or .sas program" style="flex:1;min-width:0">
+    <button type="submit">Open</button>
+  </form>
+  <div id="programEntries"></div>
+  <p id="programError" role="alert"></p>
+  <div class="actions"><button type="button" onclick="document.getElementById('programDialog').close()">Cancel</button></div>
+</dialog>
+<dialog id="suggestProfileDialog" class="project-dialog">
+  <h2 id="suggestProfileTitle">Connect project profile</h2>
+  <p id="suggestProfileMessage"></p>
+  <p>Expected profile: <strong id="suggestProfilePath"></strong></p>
+  <p>Project root: <strong id="suggestProfileRoot"></strong></p>
+  <p id="suggestProfileOrigin"></p>
+  <p id="suggestProfileCreation">A starter profile will include an existing localsetup.sas. Project-specific macro and path rules still need to be added.</p>
+  <details id="profilePreviewDetails"><summary>Preview new profile</summary><pre id="profilePreview"></pre></details>
+  <p>Connecting starts a new session and clears WORK.</p>
+  <p id="suggestProfileError" role="alert"></p>
+  <div class="actions">
+    <button type="button" id="connectSuggestedProfile">Connect profile</button>
+    <button type="button" onclick="document.getElementById('suggestProfileDialog').close()">Keep current profile</button>
+  </div>
+</dialog>
+<div id="programSource" style="padding:4px 16px;color:var(--text-dim);font-size:12px;overflow-wrap:anywhere">Program: editor text</div>
 
 <!-- Main Layout -->
 <div class="main">
@@ -488,31 +610,6 @@ body {
 
     <!-- Editor -->
     <div class="editor-panel" id="editorPanel">
-      <div class="editor-toolbar">
-        <button class="btn-run" id="btnRun" onclick="runCode()" title="Run (Ctrl+Enter). Select text to run only selected.">
-          &#9654; Run
-        </button>
-        <button class="btn-open" onclick="openSasFile()" title="Open .sas program file">
-          &#128194; Open .sas
-        </button>
-        <button class="btn-import" onclick="importDataFile()" title="Import data file (sas7bdat/xpt/csv/excel)">
-          &#128229; Import Data
-        </button>
-        <button class="btn-clear" onclick="clearEditor()">Clear</button>
-        <select id="exampleSelect" onchange="loadExample(this.value)" style="background:var(--surface2);color:var(--text);border:1px solid var(--border);padding:3px 8px;border-radius:4px;font-size:12px;cursor:pointer;">
-          <option value="">-- Examples --</option>
-          <option value="basic">Basic DATA + PRINT</option>
-          <option value="sql">PROC SQL</option>
-          <option value="case_when">CASE WHEN</option>
-          <option value="like_between">LIKE / BETWEEN / IS NULL</option>
-          <option value="lag_dif">LAG / DIF</option>
-          <option value="proc_means">PROC MEANS</option>
-          <option value="proc_print_by">PROC PRINT BY</option>
-          <option value="libname">LIBNAME</option>
-          <option value="macro">Macro System</option>
-          <option value="full">Full Demo</option>
-        </select>
-      </div>
       <div class="editor-wrap">
         <div class="drop-overlay" id="dropOverlay">Drop file here</div>
         <textarea id="editor" spellcheck="false" placeholder="Enter SAS code here...">/* Enter your SAS code */
@@ -534,7 +631,7 @@ PROC PRINT DATA=employees; RUN;</textarea>
     <!-- Results -->
     <div class="results-panel">
       <div class="result-tabs">
-        <button class="tab-btn active" data-tab="output" onclick="switchTab('output')">Output</button>
+        <button class="tab-btn active" data-tab="output" onclick="switchTab('output')">Output<span id="output-count" aria-live="polite"></span></button>
         <button class="tab-btn" data-tab="data" onclick="switchTab('data')">Data</button>
       </div>
       <div class="result-content">
@@ -545,7 +642,35 @@ PROC PRINT DATA=employees; RUN;</textarea>
   </div>
 </div>
 
+<script src="/static/vendor/codemirror/codemirror.js"></script>
+<script src="/static/vendor/codemirror/sas.js"></script>
 <script>
+// Upstream SAS mode and Dracula theme; no custom syntax rules or token colors.
+const editor = CodeMirror.fromTextArea(document.getElementById('editor'), {
+  mode: 'text/x-sas',
+  theme: 'dracula',
+  lineNumbers: true,
+  indentUnit: 2,
+  tabSize: 2,
+  dragDrop: false, // The existing file-drop handler opens SAS and imports data files.
+  extraKeys: {
+    'Ctrl-Enter': () => runCode(),
+    'Cmd-Enter': () => runCode(),
+    'Tab': cm => cm.replaceSelection('  ', 'end', '+input'),
+  },
+});
+new ResizeObserver(() => editor.refresh()).observe(document.querySelector('.editor-wrap'));
+function restoreEditorFocus() {
+  requestAnimationFrame(() => {
+    if (document.querySelector('dialog[open]')) return;
+    editor.refresh();
+    editor.focus();
+  });
+}
+for (const dialog of document.querySelectorAll('dialog.project-dialog')) {
+  dialog.addEventListener('close', restoreEditorFocus);
+}
+
 // ── API calls ──
 
 const SAS_API_TOKEN = "__SASLITE_API_TOKEN__";
@@ -559,11 +684,152 @@ function apiFetch(url, options = {}) {
   return fetch(url, {...options, headers});
 }
 
-async function apiExecute(code) {
+const profileCodeEditor = CodeMirror.fromTextArea(document.getElementById('profileCode'), {
+  theme: 'dracula', lineNumbers: true, indentUnit: 4, tabSize: 4,
+  extraKeys: {'Tab': cm => cm.replaceSelection('    ', 'end', '+input')},
+});
+profileCodeEditor.setSize('100%', '32vh');
+let profileSource = null;
+let profileCodeDirty = false;
+let profileSourceRequest = 0;
+let profileCodeSaving = false;
+function updateProfileCodeButton() {
+  document.getElementById('saveProfileCode').disabled = profileCodeSaving || !profileSource?.editable || !profileCodeDirty;
+}
+profileCodeEditor.on('change', () => {
+  profileCodeDirty = !!profileSource && profileCodeEditor.getValue() !== profileSource.content;
+  document.getElementById('profileCodeStatus').textContent = profileCodeDirty ? 'Unsaved changes' : '';
+  updateProfileCodeButton();
+});
+async function loadProfileCode() {
+  const request = ++profileSourceRequest;
+  const panel = document.getElementById('profileCodePanel');
+  panel.hidden = false;
+  profileSource = null;
+  profileCodeEditor.setValue('');
+  profileCodeEditor.setOption('readOnly', true);
+  document.getElementById('profileCodePath').textContent = '';
+  document.getElementById('profileCodeStatus').textContent = 'Loading code…';
+  updateProfileCodeButton();
+  try {
+    const response = await apiFetch('/api/profile/source');
+    const result = await response.json();
+    if (request !== profileSourceRequest) return;
+    if (!response.ok) throw new Error(result.error);
+    profileSource = result;
+    profileCodeEditor.setValue(result.content);
+    // CodeMirror normalizes line endings.
+    profileSource.content = profileCodeEditor.getValue();
+    profileCodeDirty = false;
+    profileCodeEditor.clearHistory();
+    profileCodeEditor.setOption('readOnly', !result.editable);
+    document.getElementById('profileCodePath').textContent = result.path;
+    document.getElementById('profileCodeStatus').textContent = result.editable
+      ? 'Save changes, then apply the profile to use them in a new session.'
+      : 'Built-in profile: read-only. Connect a local Python file to edit.';
+    updateProfileCodeButton();
+    requestAnimationFrame(() => profileCodeEditor.refresh());
+  } catch (error) {
+    if (request === profileSourceRequest) document.getElementById('profileCodeStatus').textContent = error.message;
+  }
+}
+document.getElementById('profileDetails').addEventListener('toggle', () => {
+  if (!document.getElementById('profileDetails').open) return;
+  if (!profileSource) loadProfileCode();
+  requestAnimationFrame(() => profileCodeEditor.refresh());
+});
+document.getElementById('reloadProfileCode').addEventListener('click', () => {
+  if (!profileCodeDirty || confirm('Discard unsaved profile changes and reload?')) loadProfileCode();
+});
+document.getElementById('saveProfileCode').addEventListener('click', async () => {
+  const source = profileSource;
+  const content = profileCodeEditor.getValue();
+  profileCodeSaving = true;
+  updateProfileCodeButton();
+  try {
+    const response = await apiFetch('/api/profile/source', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: source.path, revision: source.revision, content}),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error);
+    if (profileSource !== source) return;
+    profileSource = {...result, content};
+    profileCodeDirty = profileCodeEditor.getValue() !== content;
+    document.getElementById('profileCodeStatus').textContent = profileCodeDirty
+      ? 'Saved. Further edits are unsaved.' : 'Saved. Apply profile / New session to activate changes.';
+  } catch (error) {
+    document.getElementById('profileCodeStatus').textContent = error.message;
+  } finally { profileCodeSaving = false; updateProfileCodeButton(); }
+});
+window.addEventListener('beforeunload', event => {
+  if (profileCodeDirty) { event.preventDefault(); event.returnValue = ''; }
+});
+let profileState = {};
+function displayProfile(state) {
+  profileState = state;
+  // Opening a SAS program also refreshes profile metadata; preserve editor drafts.
+  if (!profileCodeDirty) {
+    profileSource = null;
+    ++profileSourceRequest;
+    if (document.getElementById('profileDetails').open) loadProfileCode();
+  }
+  document.getElementById('activeProfile').textContent =
+    (state.name || 'None') + (state.profile_root ? ' · ' + state.profile_root : '');
+  document.getElementById('profileType').value = state.profile_file ? 'file' : (state.profile || '');
+  document.getElementById('profileFile').value = state.profile_file || '';
+  document.getElementById('profileRoot').value = state.profile_root || '';
+  document.getElementById('projectFile').value = state.project_file || '';
+}
+async function refreshProfile() {
+  try {
+    const response = await apiFetch('/api/profile');
+    if (!response.ok) throw new Error('Could not load active profile');
+    displayProfile(await response.json());
+  } catch (error) {
+    document.getElementById('activeProfile').textContent = 'Unavailable';
+    document.getElementById('profileError').textContent = error.message;
+  }
+}
+document.getElementById('profileForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (profileCodeDirty) {
+    document.getElementById('profileError').textContent = 'Save or reload profile code before applying a profile.';
+    return;
+  }
+  const button = event.submitter;
+  button.disabled = true;
+  const type = document.getElementById('profileType').value;
+  document.getElementById('profileError').textContent = '';
+  try {
+    const file = document.getElementById('profileFile').value.trim();
+    if (type === 'file' && !file) throw new Error('Choose a profile file path');
+    const response = await apiFetch('/api/profile', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({profile: type === 'example' ? type : null,
+        profile_file: type === 'file' ? file : null,
+        profile_root: document.getElementById('profileRoot').value,
+        project_file: document.getElementById('projectFile').value,
+        work_dir: profileState.work_dir}),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.success) throw new Error(result.error || 'Profile change failed');
+    displayProfile(result.profile);
+    document.getElementById('tab-data').innerHTML = '<div class="data-empty">New session — select a dataset after running code</div>';
+    document.getElementById('tab-output').textContent = '';
+    updateOutputCount();
+    refreshLibraries();
+  } catch (error) {
+    document.getElementById('profileError').textContent = error.message;
+  } finally { button.disabled = false; }
+});
+refreshProfile();
+
+async function apiExecute(code, executionSource = sourcePath) {
   const res = await apiFetch('/api/execute', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({code}),
+    body: JSON.stringify({code, source_path: executionSource}),
   });
   return res.json();
 }
@@ -612,45 +878,253 @@ async function apiImportData(path) {
 
 // ── File operations ──
 
-async function openSasFile() {
+let sourcePath = null;
+let suggestedProfile = null;
+let chooserDirectory = null;
+const EDITOR_STATE_KEY = 'saslite.editor.v1';
+let editorStateTimer;
+
+function saveEditorState() {
+  clearTimeout(editorStateTimer);
   try {
-    // Try native file dialog first (desktop mode)
-    const dlg = await apiFileDialog('open');
-    if (!dlg.success) {
-      // Fallback: use browser file input (web mode)
-      openSasFileFallback();
-      return;
-    }
-    const result = await apiOpenFile(dlg.path);
-    if (result.success) {
-      document.getElementById('editor').value = result.content;
-      document.getElementById('editor').focus();
-    } else {
-      alert('Failed to open file: ' + result.error);
-    }
-  } catch (e) {
-    openSasFileFallback();
+    const scroll = editor.getScrollInfo();
+    sessionStorage.setItem(EDITOR_STATE_KEY, JSON.stringify({
+      content: editor.getValue(), sourcePath, chooserDirectory,
+      selections: editor.listSelections(),
+      scroll: {left: scroll.left, top: scroll.top},
+    }));
+  } catch (error) {
+    // Storage may be disabled or full; the editor must remain usable.
   }
 }
 
-function openSasFileFallback() {
-  const input = document.createElement('input');
-  input.type = 'file';
-  input.accept = '.sas';
-  input.onchange = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const text = await file.text();
-    document.getElementById('editor').value = text;
-    document.getElementById('editor').focus();
-  };
-  input.click();
+function scheduleEditorStateSave() {
+  clearTimeout(editorStateTimer);
+  editorStateTimer = setTimeout(saveEditorState, 200);
+}
+
+function restoreEditorState() {
+  try {
+    const state = JSON.parse(sessionStorage.getItem(EDITOR_STATE_KEY));
+    if (!state || typeof state.content !== 'string' ||
+        (state.sourcePath !== null && typeof state.sourcePath !== 'string')) return;
+    editor.setValue(state.content);
+    setSourcePath(state.sourcePath);
+    chooserDirectory = typeof state.chooserDirectory === 'string' ? state.chooserDirectory : null;
+    const validPosition = position => position && Number.isInteger(position.line) &&
+      position.line >= 0 && Number.isInteger(position.ch) && position.ch >= 0;
+    if (Array.isArray(state.selections) && state.selections.length &&
+        state.selections.every(selection => selection &&
+          validPosition(selection.anchor) && validPosition(selection.head))) {
+      editor.setSelections(state.selections);
+    }
+    if (state.scroll && Number.isFinite(state.scroll.left) && Number.isFinite(state.scroll.top)) {
+      editor.scrollTo(state.scroll.left, state.scroll.top);
+    }
+  } catch (error) {
+    // Ignore unavailable storage or an invalid saved snapshot.
+  }
+}
+
+function setSourcePath(path) {
+  sourcePath = path;
+  document.getElementById('programSource').textContent = 'Program: ' + (path || 'editor text — project path unknown');
+  scheduleEditorStateSave();
+}
+async function postJson(url, body) {
+  const response = await apiFetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  const result = await response.json();
+  if (!response.ok || !result.success) throw new Error(result.error || 'Request failed');
+  return result;
+}
+function suggestProfile(recommendation) {
+  if (recommendation.matches) return;
+  suggestedProfile = recommendation;
+  document.getElementById('suggestProfileTitle').textContent = recommendation.exists ? 'Connect project profile' : 'Create project profile';
+  document.getElementById('suggestProfileMessage').textContent = profileState.name
+    ? 'The active profile does not match this program’s project.'
+    : 'No profile is connected for this program.';
+  document.getElementById('suggestProfilePath').textContent = recommendation.settings.profile_file || recommendation.settings.profile;
+  document.getElementById('suggestProfileRoot').textContent = recommendation.settings.profile_root;
+  document.getElementById('suggestProfileOrigin').textContent = 'Detected from: ' + recommendation.origin;
+  document.getElementById('suggestProfileCreation').hidden = recommendation.exists;
+  document.getElementById('profilePreviewDetails').hidden = recommendation.exists;
+  document.getElementById('profilePreview').textContent = recommendation.template || '';
+  document.getElementById('connectSuggestedProfile').textContent = recommendation.exists ? 'Connect profile' : 'Create and connect';
+  document.getElementById('suggestProfileError').textContent = '';
+  document.getElementById('suggestProfileDialog').showModal();
+}
+async function openLocalProgram(path) {
+  const result = await postJson('/api/open-file', {path});
+  editor.setValue(result.content);
+  setSourcePath(result.path);
+  chooserDirectory = result.path.slice(0, result.path.lastIndexOf('/'));
+  document.getElementById('programDialog').close();
+  await refreshProfile();
+  suggestProfile(result.recommendation);
+  restoreEditorFocus();
+}
+async function listProgramFiles(directory) {
+  const pathInput = document.getElementById('programPath');
+  const openButton = document.querySelector('#programPathForm button');
+  pathInput.disabled = true;
+  openButton.disabled = true;
+  document.getElementById('programEntries').replaceChildren();
+  try {
+    const result = await postJson('/api/program-files', {directory});
+    chooserDirectory = result.directory;
+    document.getElementById('programPath').value = result.directory;
+    const entries = document.getElementById('programEntries');
+    entries.replaceChildren();
+    for (const entry of [{name:'.. (parent folder)',path:result.parent,directory:true}, ...result.entries]) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = (entry.directory ? '📁 ' : '') + entry.name;
+      button.addEventListener('click', async () => {
+        try {
+          if (entry.directory) await listProgramFiles(entry.path);
+          else await openLocalProgram(entry.path);
+        } catch (error) { document.getElementById('programError').textContent = error.message; }
+      });
+      entries.appendChild(button);
+    }
+    document.getElementById('programError').textContent = '';
+  } catch (error) { document.getElementById('programError').textContent = error.message; }
+  finally { pathInput.disabled = false; openButton.disabled = false; }
+}
+async function openSasFileFallback(hint) {
+  document.getElementById('programHint').textContent = hint || 'Choose the original file so its project profile can be detected.';
+  document.getElementById('programDialog').showModal();
+  await listProgramFiles(chooserDirectory || profileState.profile_root || null);
+}
+document.getElementById('programPathForm').addEventListener('submit', async event => {
+  event.preventDefault();
+  const path = document.getElementById('programPath').value.trim();
+  try {
+    if (/\.sas$/i.test(path)) await openLocalProgram(path);
+    else await listProgramFiles(path);
+  } catch (error) { document.getElementById('programError').textContent = error.message; }
+});
+document.getElementById('connectSuggestedProfile').addEventListener('click', async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    if (!suggestedProfile.exists) {
+      const result = await postJson('/api/program-profile', {path:sourcePath, create:true,
+        expected_profile_file:suggestedProfile.settings.profile_file});
+      suggestedProfile = result.recommendation;
+      button.textContent = 'Connect profile';
+    }
+    const result = await postJson('/api/profile', {...suggestedProfile.settings, work_dir:profileState.work_dir});
+    displayProfile(result.profile);
+    document.getElementById('tab-data').innerHTML = '<div class="data-empty">New session — run the program to see datasets</div>';
+    document.getElementById('tab-output').textContent = '';
+    updateOutputCount();
+    await refreshLibraries();
+    document.getElementById('suggestProfileDialog').close();
+  } catch (error) { document.getElementById('suggestProfileError').textContent = error.message; }
+  finally { button.disabled = false; }
+});
+async function readSaveResponse(response) {
+  if (response.status === 404 || response.status === 405) {
+    throw new Error('The running GUI server does not support Save yet. Restart SASLite GUI, then reload this page. Your editor text is kept in this browser.');
+  }
+  if (response.status === 403) {
+    throw new Error('The GUI session has changed. Reload this page and try saving again.');
+  }
+  const text = await response.text();
+  try {
+    const result = JSON.parse(text);
+    if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error();
+    return result;
+  } catch (_) {
+    throw new Error('The GUI server returned an invalid save response (HTTP ' + response.status + ').');
+  }
+}
+
+let sasSaving = false;
+async function saveSasFile(path = sourcePath, overwrite = Boolean(sourcePath && path === sourcePath)) {
+  if (sasSaving) return;
+  if (!path) {
+    document.getElementById('saveProgramPath').value = (chooserDirectory ? chooserDirectory.replace(/\/$/, '') + '/' : '') + 'Untitled.sas';
+    document.getElementById('saveProgramError').textContent = '';
+    document.getElementById('saveProgramDialog').showModal();
+    document.getElementById('saveProgramPath').focus();
+    return;
+  }
+  saveEditorState();
+  const content = editor.getValue();
+  const originalPath = sourcePath;
+  const status = document.getElementById('saveSasStatus');
+  sasSaving = true;
+  document.getElementById('btnSaveSas').disabled = true;
+  document.getElementById('confirmSaveProgram').disabled = true;
+  status.textContent = 'Saving…';
+  try {
+    let response = await apiFetch('/api/save-file', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path, content, overwrite})});
+    let result = await readSaveResponse(response);
+    if (response.status === 409 && result.exists) {
+      if (!confirm('Replace existing file?\n' + path)) { status.textContent = ''; return; }
+      response = await apiFetch('/api/save-file', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path, content, overwrite:true})});
+      result = await readSaveResponse(response);
+    }
+    if (!response.ok || !result.success) throw new Error(result.error || 'Save failed');
+    if (sourcePath === originalPath) setSourcePath(result.path);
+    saveEditorState();
+    status.textContent = sourcePath === result.path && editor.getValue() === content ? 'Saved' : 'Saved snapshot; editor has changed';
+    document.getElementById('saveProgramDialog').close();
+  } catch (error) {
+    status.textContent = 'Save failed: ' + error.message;
+    document.getElementById('saveProgramError').textContent = error.message;
+  } finally {
+    sasSaving = false;
+    document.getElementById('btnSaveSas').disabled = false;
+    document.getElementById('confirmSaveProgram').disabled = false;
+  }
+}
+document.getElementById('saveProgramForm').addEventListener('submit', event => {
+  event.preventDefault();
+  const path = document.getElementById('saveProgramPath').value.trim();
+  if (path) saveSasFile(path, false);
+});
+editor.on('change', () => { document.getElementById('saveSasStatus').textContent = ''; });
+document.addEventListener('keydown', event => {
+  if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey ||
+      !(event.code === 'KeyS' || event.key.toLowerCase() === 's')) return;
+  event.preventDefault();
+  event.stopPropagation();
+  if (event.repeat) return;
+  if (document.getElementById('saveProgramDialog').open) {
+    document.getElementById('saveProgramForm').requestSubmit();
+  } else if (!document.querySelector('dialog[open]')) {
+    if (profileCodeEditor.hasFocus()) document.getElementById('saveProfileCode').click();
+    else saveSasFile();
+  }
+}, true);
+
+async function openSasFile() {
+  const button = document.getElementById('btnOpenSas');
+  if (button.disabled) return;
+  button.disabled = true;
+  try {
+    let dlg;
+    try { dlg = await apiFileDialog('open'); }
+    catch (error) { /* Use the local chooser if the native service is unavailable. */ }
+    if (dlg?.cancelled) return;
+    if (dlg?.success) {
+      try { await openLocalProgram(dlg.path); }
+      catch (error) { alert('Failed to open file: ' + error.message); }
+      return;
+    }
+    await openSasFileFallback();
+  } finally { button.disabled = false; }
 }
 
 async function importDataFile() {
   try {
     // Try native file dialog first (desktop mode)
     const dlg = await apiFileDialog('import');
+    if (dlg.cancelled) return;
     if (!dlg.success) {
       importDataFileFallback();
       return;
@@ -661,6 +1135,7 @@ async function importDataFile() {
       showDataset('WORK', result.dataset.split('.')[1]);
       const outEl = document.getElementById('tab-output');
       outEl.innerHTML = `<span class="success-line">Imported ${escapeHtml(result.dataset)} (${escapeHtml(String(result.rows))} rows, ${escapeHtml(String(result.columns))} columns)</span>`;
+      updateOutputCount();
     } else {
       alert('Failed to import: ' + result.error);
     }
@@ -694,7 +1169,7 @@ function importDataFileFallback() {
         const colNames = headers.join(' ');
         const dataLines = data.map(r => headers.map(h => r[h]).join(' ')).join('\n');
         const code = `DATA ${datasetName};\n  INPUT ${colNames};\n  DATALINES;\n${dataLines}\n;\nRUN;`;
-        document.getElementById('editor').value = code;
+        editor.setValue(code);
         await runCode();
       } else {
         // For binary formats, upload to server
@@ -721,12 +1196,17 @@ function importDataFileFallback() {
 let running = false;
 
 async function runCode() {
+  if (document.querySelector('dialog[open]')) return;
   if (running) return;
-  const editor = document.getElementById('editor');
-  const selected = editor.value.substring(editor.selectionStart, editor.selectionEnd);
-  const code = selected.trim() ? selected : editor.value;
+  const selected = editor.getSelection();
+  const code = selected.trim() ? selected : editor.getValue();
   if (!code.trim()) return;
 
+  const runContext = {
+    source: sourcePath || 'Untitled.sas',
+    document: editor.getValue(),
+    origin: selected.trim() ? editor.getCursor('from') : {line: 0, ch: 0},
+  };
   running = true;
   const btn = document.getElementById('btnRun');
   btn.disabled = true;
@@ -734,14 +1214,16 @@ async function runCode() {
 
   const outEl = document.getElementById('tab-output');
   outEl.innerHTML = '<span class="note-line">Executing...</span>';
+  updateOutputCount();
 
   try {
-    const result = await apiExecute(code);
-    renderOutput(result);
+    const result = await apiExecute(code, runContext.source);
+    renderOutput(result, runContext);
+    if (!result.success) switchTab('output');
     refreshLibraries();
 
     // Auto-show data for first created dataset
-    if (result.steps) {
+    if (result.success && result.steps) {
       for (const step of result.steps) {
         if (step.success && step.notes) {
           for (const note of step.notes) {
@@ -755,7 +1237,9 @@ async function runCode() {
       }
     }
   } catch (e) {
-    outEl.innerHTML = `<span class="error-line">Network error: ${e.message}</span>`;
+    outEl.innerHTML = `<span class="error-line">Network error: ${escapeHtml(e.message)}</span>`;
+    updateOutputCount(1);
+    switchTab('output');
   }
 
   running = false;
@@ -763,16 +1247,38 @@ async function runCode() {
   btn.innerHTML = '&#9654; Run';
 }
 
-function renderOutput(result) {
+function renderOutput(result, runContext = null) {
   const outEl = document.getElementById('tab-output');
+  const formatLog = text => String(text).split('\n').map(line => formatDiagnostic(line, runContext)).join('\n');
   let html = '';
+  let errors = 0;
+  let warnings = 0;
+  for (const line of (result.output || '').split(/\r?\n/)) {
+    if (/^\s*ERROR:/i.test(line)) errors++;
+    else if (/^\s*WARNING:/i.test(line)) warnings++;
+  }
+  const loggedLines = new Set((result.output || '').split(/\r?\n/).map(diagnosticKey));
+  const appendDiagnostic = (level, message) => {
+    const line = `${level}: ${message}`;
+    if (!loggedLines.has(diagnosticKey(line))) {
+      html += '\n' + formatLog(line);
+      loggedLines.add(diagnosticKey(line));
+      if (level === 'ERROR') errors++;
+      else if (level === 'WARNING') warnings++;
+    }
+  };
 
   if (result.output) {
-    html += escapeHtml(result.output);
+    html += formatLog(result.output);
   }
 
   if (!result.success) {
-    html += `<span class="error-line">\nERROR: ${escapeHtml(result.error || 'Unknown error')}</span>`;
+    if (result.error) {
+      appendDiagnostic('ERROR', result.error);
+    } else if (!(result.steps || []).some(step => step.error) &&
+               ![...loggedLines].some(line => line.startsWith('ERROR:'))) {
+      appendDiagnostic('ERROR', 'Unknown error');
+    }
     if (result.traceback) {
       html += `\n<span class="error-line">${escapeHtml(result.traceback)}</span>`;
     }
@@ -781,10 +1287,10 @@ function renderOutput(result) {
   if (result.steps) {
     for (const step of result.steps) {
       if (step.error) {
-        html += `<span class="error-line">\nERROR: ${escapeHtml(step.error)}</span>`;
+        appendDiagnostic('ERROR', step.error);
       }
       for (const w of (step.warnings || [])) {
-        html += `<span class="note-line">\nWARNING: ${escapeHtml(w)}</span>`;
+        appendDiagnostic('WARNING', w);
       }
       for (const artifact of (step.artifacts || [])) {
         if (artifact.kind === 'image' && artifact.mime_type === 'image/png') {
@@ -802,6 +1308,48 @@ function renderOutput(result) {
   }
 
   outEl.innerHTML = html;
+  updateOutputCount(errors, warnings);
+  diagnosticContext = runContext;
+}
+
+function diagnosticKey(line) {
+  return line.trim().replace(/^(ERROR|WARNING):\s+.*?:\d+:\d+:\s*/i, '$1: ');
+}
+
+function formatDiagnostic(line, context) {
+  const match = line.match(/^(\s*)(ERROR:|WARNING:)(.*)$/i);
+  if (!match) return escapeHtml(line);
+  const className = match[2].toUpperCase() === 'ERROR:' ? 'error-line' : 'warning-line';
+  const formatted = `${escapeHtml(match[1])}<span class="${className}">${escapeHtml(match[2])}</span>${escapeHtml(match[3])}`;
+  if (!context) return formatted;
+  const location = match[3].trimStart().match(/^(.*?):(\d+):(\d+):/);
+  if (!location || location[1] !== context.source) return formatted;
+  const lineIndex = Number(location[2]) - 1;
+  const column = Number(location[3]) - 1;
+  if (lineIndex < 0 || column < 0) return formatted;
+  return `<button type="button" class="diagnostic-link" onclick="focusDiagnostic(${lineIndex}, ${column})" title="Go to source line">${formatted}</button>`;
+}
+
+let diagnosticContext = null;
+function focusDiagnostic(line, column) {
+  const context = diagnosticContext;
+  if (!context || editor.getValue() !== context.document ||
+      (sourcePath || 'Untitled.sas') !== context.source) return;
+  const position = {
+    line: context.origin.line + line,
+    ch: column + (line === 0 ? context.origin.ch : 0),
+  };
+  editor.setCursor(position);
+  editor.scrollIntoView(position, 80);
+  editor.focus();
+}
+
+function updateOutputCount(errors = 0, warnings = 0) {
+  const badge = document.getElementById('output-count');
+  const count = errors || warnings;
+  badge.textContent = count ? `(${count})` : '';
+  badge.className = count ? (errors ? 'output-count-error' : 'output-count-warning') : '';
+  badge.title = count ? `${count} ${errors ? 'errors' : 'warnings'}` : '';
 }
 
 // ── Dataset browser ──
@@ -838,7 +1386,11 @@ async function refreshLibraries() {
       html += `<div class="lib-node" data-libref="${libAttr}">`;
       html += `<div class="lib-header${isOpen ? ' active-lib' : ''}" onclick="toggleLib(${libArg})">`;
       html += `<span class="lib-chevron${isOpen ? ' open' : ''}">&#9654;</span>`;
-      html += `<span class="lib-icon ${iconKey}">${ICONS[iconKey] || ICONS.memory}</span>`;
+      const schemaTitle = lib.schema_policy === 'weak' ? 'Weak schema 😜' :
+                          lib.schema_policy === 'strict' ? 'Strict schema' : '';
+      const schemaBadge = lib.schema_policy === 'weak' ?
+        '<span class="lib-schema-badge" aria-hidden="true">😜</span>' : '';
+      html += `<span class="lib-icon ${iconKey}" title="${escapeAttr(schemaTitle)}" role="img" aria-label="${escapeAttr(schemaTitle || 'Library')}">${ICONS[iconKey] || ICONS.memory}${schemaBadge}</span>`;
       html += `<span class="lib-name">${escapeHtml(libref)}</span>`;
       html += `<span class="lib-count">${escapeHtml(String(lib.count || 0))}</span>`;
       html += `</div>`;
@@ -972,8 +1524,9 @@ function switchTab(tabName) {
 // ── Editor helpers ──
 
 function clearEditor() {
-  document.getElementById('editor').value = '';
-  document.getElementById('editor').focus();
+  setSourcePath(null);
+  editor.setValue('');
+  editor.focus();
 }
 
 const EXAMPLES = {
@@ -1429,10 +1982,11 @@ PROC PRINT DATA=enriched; RUN;`
 
 function loadExample(key) {
   if (!key) return;
+  setSourcePath(null);
   const code = EXAMPLES[key];
   if (code) {
-    document.getElementById('editor').value = code;
-    document.getElementById('editor').focus();
+    editor.setValue(code);
+    editor.focus();
   }
   document.getElementById('exampleSelect').value = '';
 }
@@ -1464,24 +2018,6 @@ function loadExample(key) {
     document.removeEventListener('mouseup', onMouseUp);
   }
 })();
-
-// ── Keyboard shortcut ──
-
-document.getElementById('editor').addEventListener('keydown', e => {
-  // Ctrl+Enter to run
-  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-    e.preventDefault();
-    runCode();
-  }
-  // Tab to insert spaces
-  if (e.key === 'Tab') {
-    e.preventDefault();
-    const ta = e.target;
-    const start = ta.selectionStart;
-    ta.value = ta.value.substring(0, start) + '  ' + ta.value.substring(ta.selectionEnd);
-    ta.selectionStart = ta.selectionEnd = start + 2;
-  }
-});
 
 // ── Drag & Drop ──
 
@@ -1523,8 +2059,9 @@ document.getElementById('editor').addEventListener('keydown', e => {
     if (ext === 'sas') {
       // Load .sas file into editor
       const text = await file.text();
-      document.getElementById('editor').value = text;
-      document.getElementById('editor').focus();
+      editor.setValue(text);
+      setSourcePath(null);
+      await openSasFileFallback('The browser hides the path of dropped files. Select ' + file.name + ' in its original folder to detect its project profile.');
     } else if (['sas7bdat','xpt','csv','xlsx','xls'].includes(ext)) {
       // Import data file
       const formData = new FormData();
@@ -1537,6 +2074,7 @@ document.getElementById('editor').addEventListener('keydown', e => {
           showDataset('WORK', result.dataset.split('.')[1]);
           const outEl = document.getElementById('tab-output');
           outEl.innerHTML = `<span class="success-line">Imported ${escapeHtml(result.dataset)} (${escapeHtml(String(result.rows))} rows, ${escapeHtml(String(result.columns))} columns)</span>`;
+          updateOutputCount();
         } else {
           alert('Import failed: ' + result.error);
         }
@@ -1573,6 +2111,14 @@ function safeDatasetName(filename) {
 
 // ── Init ──
 
+restoreEditorState();
+editor.on('change', scheduleEditorStateSave);
+editor.on('cursorActivity', scheduleEditorStateSave);
+editor.on('scroll', scheduleEditorStateSave);
+window.addEventListener('pagehide', saveEditorState);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveEditorState();
+});
 refreshLibraries();
 </script>
 </body>

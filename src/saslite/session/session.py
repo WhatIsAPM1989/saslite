@@ -105,6 +105,8 @@ class Session:
 
     def schema_policy_for(self, libref: str) -> str:
         """Return the effective schema policy for a library reference."""
+        if str(libref).upper() == "WORK":
+            return "strict"
         return (
             "strict"
             if str(libref).upper() in self.library_metadata
