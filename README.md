@@ -26,7 +26,8 @@ and graphics for local data checks, prototyping, and compatibility testing.
 
 - [Install and run](USAGE.md): CLI, GUI, Python API, and examples.
 - [Feature reference and limitations](FEATURES.md): supported syntax and procedures.
-- [Project setup](NEW_PROJECT.md): local profiles, metadata, schemas, and fixtures (Russian).
+- [Project setup](NEW_PROJECT.md): local profiles, metadata, and schema-only datasets (Russian).
+- [Test data](TEST_DATA.md): dummy CSV fixtures and boundary-case tests (Russian).
 - [ODS compatibility](ODS_COMPATIBILITY.md): output table contracts and RTF styles.
 - [Syntax examples](DOCS.md): extended language guide (Chinese; some inherited sections are historical).
 - [Development](DEVELOPMENT.md) · [Release notes](CHANGELOG.md) · [Example programs](examples/).

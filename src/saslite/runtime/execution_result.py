@@ -36,7 +36,11 @@ class StepResult:
 
 @dataclass
 class RunSummary:
-    """Summary of a full script execution."""
+    """Summary of a full script execution.
+
+    log_lines contains this execution's ordered Reporter output, including
+    PUT/%PUT and diagnostics suppressed from the console by quiet mode.
+    """
     success: bool = True
     steps: list[StepResult] = field(default_factory=list)
     error: str | None = None

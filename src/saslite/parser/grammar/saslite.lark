@@ -35,6 +35,7 @@ statement: data_step
          | proc_mixed
          | proc_icphreg
          | proc_iclifetest
+         | presentation_stmt
          | ods_stmt
          | libname_stmt ";"
          | filename_stmt ";"
@@ -189,7 +190,7 @@ length_item: length_name "$"? (NUMBER "."?)?
 
 attrib_stmt: "ATTRIB"i (attrib_item)+
 attrib_item: NAME (attr_tag)*
-attr_tag: "FORMAT"i "="? format_spec | "LABEL"i "="? STRING | "LENGTH"i "="? NUMBER | "INFORMAT"i "="? NAME
+attr_tag: "FORMAT"i "="? format_spec | "LABEL"i "="? STRING | "LENGTH"i "="? "$"? NUMBER | "INFORMAT"i "="? NAME
 format_spec: "$"? NAME ("." NUMBER?)? | "$"? NUMBER ("." NUMBER?)?
 
 put_stmt: "PUT"i (put_item)+
@@ -378,6 +379,7 @@ proc_sort: "PROC"i "SORT"i (sort_opt)* ";" sort_body ("RUN"i ";")?
 
 sort_opt: "DATA"i "=" dataset_ref
         | "OUT"i "=" dataset_ref
+        | "DUPOUT"i "=" dataset_ref
         | "NODUPKEY"i
         | "NODUPRECS"i
         | "FORCE"i
@@ -418,7 +420,7 @@ means_output_kv: NAME "=" NAME
 
 proc_freq: "PROC"i "FREQ"i (freq_opt)* ";" freq_body ("RUN"i ";")?
 
-freq_opt: "DATA"i "=" dataset_ref -> freq_opt_data
+freq_opt.2: "DATA"i "=" dataset_ref -> freq_opt_data
         | "OUT"i "=" dataset_ref -> freq_opt_out
         | "ORDER"i "=" NAME -> freq_opt_named
         | "NOPRINT"i -> freq_opt_flag
@@ -426,6 +428,7 @@ freq_opt: "DATA"i "=" dataset_ref -> freq_opt_data
         | "NOCOL"i -> freq_opt_flag
         | "NOPERCENT"i -> freq_opt_flag
         | "MISSING"i -> freq_opt_flag
+        | "LIST"i -> freq_opt_flag
         | NAME -> freq_opt_flag
 
 freq_body: freq_stmt+
@@ -567,6 +570,7 @@ proc_datasets: "PROC"i "DATASETS"i (ds_opt)* ";" (ds_stmt)* ("RUN"i ";")? ("QUIT
 
 ds_opt: ("LIBRARY"i | "LIB"i) "=" qualified_name
       | "NOLIST"i                         -> ds_nolist_opt
+      | "NODETAILS"i                      -> ds_nodetails_opt
       | "KILL"i                           -> ds_kill_opt
       | "MEMTYPE"i "=" NAME              -> ds_memtype_opt
 
@@ -708,12 +712,18 @@ report_opt: "DATA"i "=" qualified_name
           | "SPACING"i "=" NUMBER
           | REPORT_STYLE_OPTION
 
-report_stmt: "COLUMN"i name_list ";" -> report_column
-           | "COLUMNS"i name_list ";" -> report_column
+report_stmt: "COLUMN"i report_column_list ";" -> report_column
+           | "COLUMNS"i report_column_list ";" -> report_column
            | "DEFINE"i NAME "/" (report_def_attr)* ";" -> report_define
+           | "COMPUTE"i ("AFTER"i | "BEFORE"i) NAME? ("/" REPORT_COMPUTE_STYLE)? ";" ("LINE"i STRING ";")* "ENDCOMP"i ";" -> report_compute
            | "BY"i name_list ";" -> report_by
            | "BREAK"i ("AFTER"i | "BEFORE"i) NAME "/" report_break_opt* ";" -> report_break
            | "RBREAK"i ("AFTER"i | "BEFORE"i)? "/" report_break_opt* ";" -> report_rbreak
+
+report_column_list: report_column_item+
+?report_column_item: name_list_item
+                   | NAME "=" NAME -> report_column_alias
+                   | "(" STRING report_column_list ")" -> report_column_group
 
 report_def_attr: "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "ACROSS"i | "NOPRINT"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | "STD"i | "MEDIAN"i | STRING | "FORMAT"i "=" format_spec | "WIDTH"i "=" NUMBER | REPORT_STYLE_OPTION
 report_break_opt: "SUMMARIZE"i | "SUPPRESS"i | "SKIP"i | "DOL"i | "DUL"i | "OL"i | "UL"i | "PAGE"i
@@ -873,7 +883,8 @@ case_when: "WHEN"i expr "THEN"i expr
 expr_list: expr ("," expr)*
 // SAS permits either commas or whitespace between values in an IN list.
 in_expr_list: expr ((",")? expr)*
-func_args: func_arg ("," func_arg)*
+func_args: optional_func_arg ("," optional_func_arg)*
+?optional_func_arg: func_arg | -> omitted_func_arg
 func_arg: "*" -> star_arg
         | "DISTINCT"i expr -> distinct_arg
         | "OF"i NAME ("[" "*" "]" | "{" "*" "}") -> of_array_arg
@@ -921,3 +932,13 @@ COMMENT: /(?m)^[ \t]*\*[^;]*;/
 
 %import common.WS
 %ignore WS
+
+// Presentation text is parsed even when there is no active output destination.
+presentation_stmt: PRESENTATION_KEY presentation_part* ";"
+                 | "ODS"i "ESCAPECHAR"i "=" STRING ";"
+                 | "ODS"i "PATH"i ("(" NAME ")")? ods_path_item+ ";"
+ods_path_item: qualified_name ("(" NAME ")")?
+PRESENTATION_KEY: /(?i:TITLE|FOOTNOTE)[0-9]*/
+?presentation_part: STRING | NAME "=" (NAME | STRING | NUMBER) | NUMBER
+
+REPORT_COMPUTE_STYLE: /STYLE\s*=\s*(\{[^}]*\}|\[[^\]]*\])/i

@@ -398,7 +398,7 @@ class DataStepExecutor:
                 for name, attribute, value in stmt.items:
                     dtype = (
                         "character"
-                        if attribute in ("FORMAT", "INFORMAT")
+                        if attribute in ("FORMAT", "INFORMAT", "LENGTH")
                         and str(value).startswith("$")
                         else "numeric"
                     )
@@ -410,8 +410,10 @@ class DataStepExecutor:
                     elif attribute == "LABEL":
                         variable.metadata.label = value
                     elif attribute == "LENGTH":
+                        if str(value).startswith("$"):
+                            variable.metadata.dtype = "character"
                         try:
-                            variable.metadata.length = int(value)
+                            variable.metadata.length = int(str(value).lstrip("$"))
                         except (TypeError, ValueError):
                             pass
             elif isinstance(stmt, FormatResetNode):
@@ -1480,7 +1482,8 @@ class DataStepExecutor:
         if fmt_upper.startswith("Z") or fmt_upper.startswith("ZERO"):
             # Zero-padded numeric
             try:
-                return f"{int(value)}"
+                from saslite.functions.convert_funcs import put_sas
+                return put_sas(value, fmt)
             except (ValueError, TypeError):
                 return str(value)
         return str(value)
@@ -1755,7 +1758,7 @@ class DataStepExecutor:
                     variable.informat = value
                 elif attribute == "LENGTH":
                     try:
-                        variable.length = int(value)
+                        variable.length = int(str(value).lstrip("$"))
                     except (TypeError, ValueError):
                         pass
         return out_ds

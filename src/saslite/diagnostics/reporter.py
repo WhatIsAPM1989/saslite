@@ -54,6 +54,7 @@ class Reporter:
         self.quiet = quiet
         self.stop_on_error = stop_on_error
         self.stop_on_warning = stop_on_warning
+        self.log_lines: list[str] = []
         self._notes: list[str] = []
         self._warnings: list[str] = []
         self._errors: list[str] = []
@@ -136,30 +137,43 @@ class Reporter:
     def note(self, message: str) -> None:
         line = f"NOTE: {message}"
         self._notes.append(line)
+        self.log_lines.append(line)
         if not self.quiet:
             self._print_line(line)
 
     def warning(self, message: str) -> None:
         line = f"WARNING: {message}"
         self._warnings.append(line)
+        self.log_lines.append(line)
         self._print_line(line)
 
     def error(self, message: str) -> None:
         line = f"ERROR: {message}"
         self._errors.append(line)
+        self.log_lines.append(line)
         self._print_line(line)
 
     def success(self, message: str) -> None:
         """Print an explicit successful-run marker, including in quiet mode."""
-        self._print_line(f"SUCCESS: {message}")
+        line = f"SUCCESS: {message}"
+        self.log_lines.append(line)
+        self._print_line(line)
 
     def schema_summary(self, message: str) -> None:
         """Print a schema-audit summary, including in quiet mode."""
         for line in message.splitlines():
+            self.log_lines.append(line)
             self._print_line(line)
 
     def log(self, message: str) -> None:
         lines = message.splitlines()
+        self.log_lines.extend(lines)
+        for line in lines:
+            marker = line.lstrip().upper()
+            if marker.startswith("WARNING:"):
+                self._warnings.append(line)
+            elif marker.startswith("ERROR:"):
+                self._errors.append(line)
         if self.quiet:
             lines = [
                 line for line in lines

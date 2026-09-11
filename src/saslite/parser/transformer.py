@@ -347,9 +347,15 @@ class SasTransformer(Transformer):
                 break
         return FunctionCallNode(name=name.upper(), args=args)
 
+    def presentation_stmt(self, items: list[Any]) -> None:
+        return None
+
     def func_args(self, items: list[Any]) -> list[Any]:
         return [item for item in items
                 if item is not None and not isinstance(item, Token)]
+
+    def omitted_func_arg(self, items: list[Any]) -> LiteralNode:
+        return LiteralNode(value="", literal_type="string")
 
     def star_arg(self, items: list[Any]) -> LiteralNode:
         return LiteralNode(value="*", literal_type="string")
@@ -2235,7 +2241,7 @@ class SasTransformer(Transformer):
             return {}
         key_token = items[0]
         key = _get_text(key_token).upper()
-        if key in ("DATA", "OUT"):
+        if key in ("DATA", "OUT", "DUPOUT"):
             val_items = _non_tokens(items)
             if val_items:
                 val = val_items[0]
@@ -3592,8 +3598,7 @@ class SasTransformer(Transformer):
             val = val.strip("'\"")
             return ("LABEL", val)
         elif keyword == "LENGTH":
-            val = _get_text(non_keyword[0]) if non_keyword else ""
-            return ("LENGTH", val)
+            return ("LENGTH", "".join(_get_text(item) for item in non_keyword))
         elif keyword == "INFORMAT":
             val = _get_name(non_keyword[0]) if non_keyword else ""
             return ("INFORMAT", val)
@@ -3791,6 +3796,9 @@ class SasTransformer(Transformer):
 
     def ds_nolist_opt(self, items: list[Any]) -> dict[str, Any]:
         return {"NOLIST": True}
+
+    def ds_nodetails_opt(self, items: list[Any]) -> dict[str, Any]:
+        return {"NODETAILS": True}
 
     def ds_kill_opt(self, items: list[Any]) -> dict[str, Any]:
         return {"KILL": True}
@@ -4107,8 +4115,30 @@ class SasTransformer(Transformer):
             return result
         return option
 
+    def report_column_list(self, items: list[Any]) -> list[Any]:
+        result = []
+        for item in items:
+            if isinstance(item, list):
+                result.extend(item)
+            else:
+                result.append(item)
+        return result
+
+    def report_column_alias(self, items: list[Any]) -> tuple[str, str]:
+        names = [str(item) for item in items if isinstance(item, Token) and item.type == "NAME"]
+        return (names[0], names[1])
+
+    def report_column_group(self, items: list[Any]) -> list[Any]:
+        return next(item for item in items if isinstance(item, list))
+
+    def report_compute(self, items: list[Any]) -> dict[str, Any]:
+        return {"action": "compute"}
+
     def report_column(self, items: list[Any]) -> dict[str, Any]:
-        return {"action": "column", "names": self._stmt_names(items)}
+        columns = next((item for item in items if isinstance(item, list)), [])
+        return {"action": "column",
+                "names": [item[1] if isinstance(item, tuple) else str(item) for item in columns],
+                "aliases": [item for item in columns if isinstance(item, tuple)]}
 
     def report_define(self, items: list[Any]) -> dict[str, Any]:
         name = ""

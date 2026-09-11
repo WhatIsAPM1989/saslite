@@ -858,6 +858,12 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
     for stmt in proc.statements:
         if isinstance(stmt, dict):
             if stmt.get("action") == "column":
+                for source, alias in stmt.get("aliases", []):
+                    actual = cmap.get(source.upper())
+                    if actual is None:
+                        return StepResult(success=False, error=f"PROC REPORT: variable {source} not found")
+                    df[alias] = df[actual]
+                    cmap[alias.upper()] = alias
                 columns = [c.upper() for c in stmt.get("names", [])]
             elif stmt.get("action") == "define":
                 defines[stmt["name"]] = stmt
@@ -1020,4 +1026,6 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
         rows_affected=len(report_df),
         output_messages=[output],
         notes=destination_notes,
+        warnings=["PROC REPORT COMPUTE presentation blocks were syntax-checked but are not rendered."]
+        if any(isinstance(stmt, dict) and stmt.get("action") == "compute" for stmt in proc.statements) else [],
     )

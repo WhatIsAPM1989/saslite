@@ -316,6 +316,15 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
                 resolved_ascending.extend([direction] * len(matches))
                 continue
             actual = col_map.get(bv.upper())
+            weak_sources = tuple(
+                source for source in working_ds.weak_schema_sources or ()
+                if session.schema_policy_for(source.split(".", 1)[0]) == "weak"
+            )
+            if actual is None and weak_sources:
+                session.record_schema_expectation(bv, weak_sources, "PROC SORT BY")
+                actual = bv.upper()
+                df[actual] = float("nan")
+                col_map[actual] = actual
             if actual:
                 resolved_by.append(actual)
                 resolved_ascending.append(direction)
@@ -337,13 +346,24 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
     nodupkey = proc.options.get("NODUPKEY", False)
     noduprecs = proc.options.get("NODUPRECS", False)
 
-    if nodupkey:
-        sorted_df = sorted_df.drop_duplicates(subset=resolved_by, keep="first").reset_index(drop=True)
-    elif noduprecs:
-        sorted_df = sorted_df.drop_duplicates(keep="first").reset_index(drop=True)
-
-    if "__sas_sort_ord__" in sorted_df.columns:
-        sorted_df = sorted_df.drop(columns="__sas_sort_ord__")
+    sorted_df = sorted_df.drop(columns="__sas_sort_ord__")
+    duplicates = sorted_df.duplicated(
+        subset=resolved_by if nodupkey else None, keep="first"
+    ) if nodupkey or noduprecs else pd.Series(False, index=sorted_df.index)
+    dup_ref = proc.options.get("DUPOUT")
+    if isinstance(dup_ref, DatasetRefNode):
+        metadata = working_ds.metadata.copy()
+        metadata.libref = dup_ref.libref
+        metadata.member_name = dup_ref.name.upper()
+        metadata.row_count = int(duplicates.sum())
+        metadata.sort_keys = list(resolved_by)
+        dup_ds = Dataset(name=dup_ref.name,
+                         data=sorted_df.loc[duplicates].reset_index(drop=True),
+                         metadata=metadata,
+                         weak_schema_sources=working_ds.weak_schema_sources)
+        dup_ds = _apply_export_dataset_options(dup_ds, dup_ref.options, session)
+        session.put_dataset(dup_ref.libref, dup_ref.name, dup_ds)
+    sorted_df = sorted_df.loc[~duplicates].reset_index(drop=True)
 
     # Resolve output libref and name
     out_options: list[Any] = []

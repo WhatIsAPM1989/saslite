@@ -2320,12 +2320,12 @@ class SqlExecutor:
                 return result
             if fn_name == "STRIP" and len(args) == 1:
                 return args[0].astype(str).str.strip()
-            if fn_name == "COMPRESS" and len(args) >= 2:
-                chars = args[1].iloc[0] if len(args) > 1 else ""
-                if isinstance(chars, str) and not args[0].apply(lambda x: isinstance(x, str) and any(c in chars for c in str(x))).any():
-                    # Fast path: no chars to remove
-                    return args[0]
-                return args[0].apply(lambda x: self._fn_compress(x, chars))
+            if fn_name == "COMPRESS" and args:
+                from saslite.functions.char_funcs import compress
+                return pd.Series(
+                    [compress(*(arg.iloc[i] for arg in args)) for i in range(len(df))],
+                    index=df.index,
+                )
             if fn_name == "DATEPART" and len(args) == 1:
                 return args[0].apply(self._fn_datepart)
             if fn_name == "INPUT" and len(args) >= 2:
@@ -2466,16 +2466,8 @@ class SqlExecutor:
     @staticmethod
     def _fn_compress(s, chars="", modifiers=""):
         """Vectorized compress function."""
-        from saslite.functions.char_funcs import _to_str
-        s = _to_str(s)
-        if not chars:
-            return s.replace(" ", "")
-        mod = modifiers.upper() if modifiers else ""
-        if "K" in mod:
-            return "".join(c for c in s if c in chars)
-        for c in chars:
-            s = s.replace(c, "")
-        return s
+        from saslite.functions.char_funcs import compress
+        return compress(s, chars, modifiers)
 
     @staticmethod
     def _fn_datepart(dt):
@@ -2651,7 +2643,7 @@ class SqlExecutor:
         # Process each column (no aggregates)
         result_cols = []
         computed_cols: dict[str, list] = {}  # alias -> [values]
-        for col_node in columns:
+        for column_index, col_node in enumerate(columns):
             if not isinstance(col_node, SelectColumnNode):
                 continue
             # Get the column name from expression (may include table alias prefix like "E.FOLDERNAME")
@@ -2663,7 +2655,7 @@ class SqlExecutor:
                 # Strip table alias prefix: "E.FOLDERNAME" -> "FOLDERNAME"
                 alias = expr_col_name.split(".")[-1] if "." in expr_col_name else expr_col_name
             else:
-                alias = ""
+                alias = f"_COL{column_index + 1}"
 
             # Try to resolve as a simple column reference first
             col_name = expr_col_name

@@ -902,7 +902,7 @@ class MacroExpander:
     def _expand_once(self, source: str) -> str:
         """Expand the first user macro invocation in source order."""
         skip_keywords = {"LET", "MACRO", "MEND", "IF", "THEN", "ELSE", "DO", "END",
-                         "PUT", "INCLUDE", "GOTO", "RETURN", "EVAL", "SYSEVALF",
+                         "PUT", "ABORT", "INCLUDE", "GOTO", "RETURN", "EVAL", "SYSEVALF",
                          "UPCASE", "QUPCASE", "LOWCASE", "SCAN", "QSCAN", "SUBSTR",
                          "QSUBSTR", "LENGTH", "INDEX", "VERIFY", "LEFT", "TRIM",
                          "CMPRES", "QCMPRES", "STR", "NRSTR", "QUOTE", "NRQUOTE",
@@ -1316,15 +1316,19 @@ class MacroExpander:
                 self._session.add_debug_output(f"PUT: {output}")
             return ""
 
-        boundary = self._next_user_macro_invocation(source)
-        if boundary is None:
-            boundary = len(source)
+        boundary = self._macro_execution_boundary(source)
+        abort = re.search(r"%\s*ABORT\s*(?:CANCEL)?\s*;",
+                          self._mask_quoted_text(source[:boundary]), re.IGNORECASE)
+        if abort is not None:
+            boundary = abort.start()
         prefix = re.sub(
             r"%\s*PUT\s+(.*?);",
             replacer,
             source[:boundary],
             flags=re.IGNORECASE | re.DOTALL,
         )
+        if abort is not None:
+            raise RuntimeError("Execution cancelled by %ABORT CANCEL.")
         return prefix + source[boundary:]
 
     def _process_do_loops(self, source: str) -> str:
@@ -1426,7 +1430,8 @@ class MacroExpander:
                 body,
                 flags=re.IGNORECASE,
             )
-            result_parts.append(expanded_body)
+            self._assign_macro_variable(head.group(1), str(value))
+            result_parts.append(self._expand_macro_loop_iteration(expanded_body))
             value += by
 
         return source[:head.start()] + "".join(result_parts) + source[loop_end:]

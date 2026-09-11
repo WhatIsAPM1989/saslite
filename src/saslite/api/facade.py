@@ -110,6 +110,7 @@ class SasInterpreter:
         include_errors: str = "strict",
     ) -> RunSummary:
         """Execute SAS source and report weak-schema assumptions once."""
+        log_start = len(self._reporter.log_lines)
         self._session.clear_schema_expectations()
         summary = self._execute_source(
             source,
@@ -118,8 +119,9 @@ class SasInterpreter:
             include_errors=include_errors,
         )
         expectations = self._session.schema_expectations
-        if expectations:
-            lines = ["Expected source variables (weak schema):"]
+        dataset_expectations = self._session.dataset_expectations
+        if expectations or dataset_expectations:
+            lines = ["Expected source variables (weak schema):"] if expectations else []
             for expectation in expectations:
                 if len(expectation.sources) == 1:
                     label = f"{expectation.sources[0]}.{expectation.variable}"
@@ -130,6 +132,11 @@ class SasInterpreter:
                     )
                 contexts = ", ".join(expectation.contexts)
                 lines.append(f"  {label} ({contexts})")
+            if dataset_expectations:
+                if lines:
+                    lines.append("")
+                lines.append("Expected source datasets (weak schema):")
+                lines.extend(f"  {name}" for name in dataset_expectations)
             count = len(expectations)
             noun = "variable was" if count == 1 else "variables were"
             lines.append("")
@@ -142,7 +149,10 @@ class SasInterpreter:
                 lines.append(
                     f"Validation level: weak; {count} source {noun} assumed."
                 )
+            if dataset_expectations:
+                lines.append(f"Source datasets assumed: {len(dataset_expectations)}.")
             self._reporter.schema_summary("\n".join(lines))
+        summary.log_lines = self._reporter.log_lines[log_start:]
         return summary
 
     def _execute_source(
@@ -240,6 +250,9 @@ class SasInterpreter:
                 try:
                     expanded_chunk = self._macro.expand(chunk)
                 except Exception as exc:
+                    for line in self._macro.put_output:
+                        self._reporter.log(line)
+                    self._macro.put_output.clear()
                     message = self._format_exception(exc)
                     self._reporter.error(message)
                     combined.success = False
@@ -294,6 +307,9 @@ class SasInterpreter:
                     self._reporter.log(line)
                 self._macro.put_output.clear()
             except Exception as exc:
+                for line in self._macro.put_output:
+                    self._reporter.log(line)
+                self._macro.put_output.clear()
                 self._reporter.error(str(exc))
                 combined.success = False
                 combined.error = str(exc)
@@ -453,6 +469,9 @@ class SasInterpreter:
             return dispatcher.run(program)
 
         except Exception as e:
+            for line in self._macro.put_output:
+                self._reporter.log(line)
+            self._macro.put_output.clear()
             message = self._format_exception(e)
             summary = RunSummary(success=False, error=message)
             self._reporter.error(message)

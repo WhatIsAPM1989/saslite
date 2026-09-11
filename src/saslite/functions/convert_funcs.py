@@ -88,6 +88,12 @@ def put_sas(source: Any, format_spec: Any) -> str:
         except Exception:
             return "."
 
+    zero = re.fullmatch(r"Z(\d+)(?:\.(\d+))?", fmt)
+    if zero:
+        width, decimals = int(zero[1]), int(zero[2] or 0)
+        rendered = f"{float(source):0{width}.{decimals}f}"
+        return rendered if len(rendered) <= width else "*" * width
+
     # BEST format
     if fmt.startswith("BEST"):
         try:

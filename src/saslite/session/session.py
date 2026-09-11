@@ -64,6 +64,7 @@ class Session:
         self._schema_expectations: dict[
             tuple[tuple[str, ...], str], set[str]
         ] = {}
+        self._dataset_expectations: set[str] = set()
         self._macro_stack: list[MacroScope] = [MacroScope("_GLOBAL_")]
         self._formats: dict[str, Any] = {}
         self._options: dict[str, Any] = {
@@ -91,6 +92,12 @@ class Session:
     def clear_schema_expectations(self) -> None:
         """Start a fresh source-schema audit for one public execution."""
         self._schema_expectations.clear()
+        self._dataset_expectations.clear()
+
+    @property
+    def dataset_expectations(self) -> list[str]:
+        """Return missing weak source datasets in deterministic order."""
+        return sorted(self._dataset_expectations)
 
     def configure_project(self, config: ProjectConfig) -> None:
         """Apply project defaults and metadata-discovered strict libraries."""
@@ -199,7 +206,10 @@ class Session:
 
     def get_dataset(self, libref: str, name: str) -> Dataset:
         libref_upper = libref.upper()
-        backend, ds_name = self.storage.resolve(libref_upper, name)
+        backend = self.storage.get_backend(libref_upper)
+        ds_name = name.upper()
+        if backend is None and self.schema_policy_for(libref_upper) != "weak":
+            backend, ds_name = self.storage.resolve(libref_upper, name)
         library_schema = self.library_metadata.get(libref_upper)
         dataset_schema = (
             library_schema.datasets.get(ds_name.upper())
@@ -228,7 +238,7 @@ class Session:
                 member=ds_name,
             )
         else:
-            ds = backend.read(ds_name)
+            ds = backend.read(ds_name) if backend is not None else None
         if dataset_schema is not None:
             ds = self._dataset_with_metadata_schema(
                 libref_upper,
@@ -237,7 +247,10 @@ class Session:
                 dataset_schema,
             )
         elif ds is None:
-            raise KeyError(f"Dataset {libref_upper}.{ds_name} does not exist")
+            if self.schema_policy_for(libref_upper) != "weak":
+                raise KeyError(f"Dataset {libref_upper}.{ds_name} does not exist")
+            self._dataset_expectations.add(f"{libref_upper}.{ds_name}")
+            ds = Dataset.from_dataframe(pd.DataFrame(), name=ds_name, libref=libref_upper)
         if ds.weak_schema_sources is None:
             # A dataset first encountered through a storage backend is an
             # input to the local run.  Keep this root name when the data later
