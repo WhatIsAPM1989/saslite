@@ -126,7 +126,7 @@ stop_stmt: "STOP"i
 set_stmt: "SET"i (dataset_ref)+ ("END"i "=" NAME)?
 merge_stmt: "MERGE"i (dataset_ref)+
 by_stmt: "BY"i ("DESCENDING"i)? NAME (("DESCENDING"i)? NAME)*
-array_stmt: "ARRAY"i NAME ("[" (NUMBER | "*") "]" | "{" (NUMBER | "*") "}") ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
+array_stmt: "ARRAY"i NAME ("[" (NUMBER | "*") "]" | "{" (NUMBER | "*") "}" | "(" (NUMBER | "*") ")") ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
 infile_stmt: "INFILE"i (NAME | STRING) (infile_option)*
 infile_option: NAME ("=" (STRING | NAME | NUMBER))?
 input_stmt: "INPUT"i (input_var)* ("$")?
@@ -147,7 +147,7 @@ dataset_option: "KEEP"i "=" name_list
               | "OBS"i "=" NUMBER
 
 assign_stmt: NAME "=" expr
-arr_assign_stmt: NAME ("[" expr "]" | "{" expr "}") "=" expr
+arr_assign_stmt: NAME ("[" expr "]" | "{" expr "}" | "(" expr ")") "=" expr
 sum_stmt: NAME "+" expr
 
 if_stmt: IF_KW expr THEN_KW data_stmt (ELSE_KW data_stmt)?
@@ -193,7 +193,7 @@ attrib_item: NAME (attr_tag)*
 attr_tag: "FORMAT"i "="? format_spec | "LABEL"i "="? STRING | "LENGTH"i "="? "$"? NUMBER | "INFORMAT"i "="? NAME
 format_spec: "$"? NAME ("." NUMBER?)? | "$"? NUMBER ("." NUMBER?)?
 
-put_stmt: "PUT"i (put_item)+
+put_stmt: /(?i:PUTLOG|PUT)\b/ (put_item)+
 put_item: STRING -> put_string
         | NAME "=" -> put_named
         | NAME -> put_variable
@@ -250,7 +250,7 @@ table_factor: qualified_name ("(" (dataset_option)* ")")? ("AS"i)? NAME? -> from
 join_clause: "LEFT"i "JOIN"i table_factor "ON"i expr  -> join_left
            | "RIGHT"i "JOIN"i table_factor "ON"i expr -> join_right
            | "FULL"i "JOIN"i table_factor "ON"i expr  -> join_full
-           | "CROSS"i "JOIN"i table_factor "ON"i expr -> join_cross
+           | "CROSS"i "JOIN"i table_factor           -> join_cross
            | "INNER"i "JOIN"i table_factor "ON"i expr -> join_inner
            | "JOIN"i table_factor "ON"i expr           -> join_inner
 
@@ -404,6 +404,7 @@ means_opt: "DATA"i "=" qualified_name
          | "OUT"i "=" qualified_name
          | "NOPRINT"i
          | "NWAY"i
+         | "MISSING"i
          | "MAXDEC"i "=" NUMBER
          | stat_name
 
@@ -414,7 +415,7 @@ means_stmt: "VAR"i name_list ";"
           | "BY"i name_list ";"
           | "OUTPUT"i ("OUT"i "=" dataset_ref)? (means_output_kv)* ";"
 
-means_output_kv: NAME "=" NAME
+means_output_kv: NAME "=" NAME+
 
 // ─── PROC FREQ ────────────────────────────────────
 

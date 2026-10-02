@@ -219,6 +219,12 @@ class ExpressionEvaluator:
 
     def _eval_func_call(self, node: FunctionCallNode) -> Any:
         name = node.name.upper()
+        # Parenthetical array references have function-call syntax. A declared
+        # DATA-step array takes precedence over a function with the same name.
+        if name in self._array_vars or name in self._arrays:
+            if len(node.args) != 1:
+                raise ExecutionError(f"Array {name} requires one subscript")
+            return self._eval_array_ref(ArrayRefNode(name=name, index=node.args[0]))
         if name == "VLABEL":
             if len(node.args) != 1 or not isinstance(node.args[0], VariableNode):
                 raise ExecutionError("VLABEL requires a variable reference")

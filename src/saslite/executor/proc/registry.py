@@ -488,13 +488,28 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
 
     # If no VAR specified, use all numeric columns
     if not var_cols:
-        var_cols = [c for c in ds.data.columns if pd.api.types.is_numeric_dtype(ds.data[c])]
+        var_cols = [c.upper() for c in ds.data.columns if pd.api.types.is_numeric_dtype(ds.data[c])]
 
     # Case-insensitive column matching
     col_map = {c.upper(): c for c in ds.data.columns}
     valid_cols = [col_map[c] for c in var_cols if c in col_map]
     if not valid_cols:
         return StepResult(success=False, error="No valid numeric variables found")
+
+    # MISSING includes missing CLASS levels; BY groups always include them.
+    # Normalize SAS character blanks so they group with other missing values,
+    # without changing the input dataset or the analysis variables.
+    group_data = ds.data
+    if class_cols:
+        group_data = ds.data.copy()
+        for name in class_cols:
+            if name in col_map:
+                column = col_map[name]
+                blanks = group_data[column].map(
+                    lambda value: isinstance(value, str) and not value.strip()
+                )
+                group_data[column] = group_data[column].mask(blanks, np.nan)
+    dropna_groups = bool(class_cols) and not proc.options.get("MISSING", False)
 
     # Which stats to compute
     q1 = lambda series: series.quantile(0.25)
@@ -516,7 +531,7 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
         # Grouped statistics
         valid_group = [col_map[c] for c in group_cols if c in col_map]
         if valid_group:
-            grouped = ds.data.groupby(valid_group)
+            grouped = group_data.groupby(valid_group, dropna=dropna_groups, observed=True)
             if stat_names:
                 # Named aggregations
                 agg_dict = {}
@@ -570,39 +585,55 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
     if not noprint:
         reporter.log(output)
 
-    # OUTPUT OUT=ds STAT=newname ... statement
+    # OUTPUT OUT=ds STAT=name1 name2 ... statement
     if output_stmt and output_stmt.get("out"):
         stats_kv = output_stmt.get("stats", {})
         if not stats_kv:
-            stats_kv = {"MEAN": "MEAN"}
+            stats_kv = {"MEAN": ["MEAN"]}
+        output_specs = []
+        for stat_name, new_names in stats_kv.items():
+            fn = agg_map.get(stat_name)
+            if fn:
+                # Each output name belongs to the corresponding VAR column.
+                if isinstance(new_names, str):
+                    new_names = [new_names]
+                output_specs.extend(
+                    (new_name, column, fn)
+                    for new_name, column in zip(new_names, valid_cols)
+                )
+
+        def output_statistics(block: pd.DataFrame) -> dict[str, Any]:
+            return {
+                name: fn(block[column]) if callable(fn) else getattr(block[column], fn)()
+                for name, column, fn in output_specs
+            }
+
         rows = []
+        valid_group = [col_map[c] for c in group_cols if c in col_map]
         if group_cols:
-            valid_group = [col_map[c] for c in group_cols if c in col_map]
-            for key, block in ds.data.groupby(valid_group, dropna=False):
+            for key, block in group_data.groupby(valid_group, dropna=dropna_groups, observed=True):
                 if not isinstance(key, tuple):
                     key = (key,)
                 row = dict(zip(valid_group, key))
-                for stat_name, new_name in stats_kv.items():
-                    fn = agg_map.get(stat_name)
-                    if fn:
-                        for vc in valid_cols:
-                            row[new_name] = fn(block[vc]) if callable(fn) else getattr(block[vc], fn)()
+                row.update(output_statistics(block))
                 rows.append(row)
         else:
-            row = {}
-            for stat_name, new_name in stats_kv.items():
-                fn = agg_map.get(stat_name)
-                if fn:
-                    for vc in valid_cols:
-                        row[new_name] = fn(ds.data[vc]) if callable(fn) else getattr(ds.data[vc], fn)()
-            rows.append(row)
+            rows.append(output_statistics(ds.data))
         out_stmt_name = output_stmt["out"]
         if "." in out_stmt_name:
             parts = out_stmt_name.split(".", 1)
             o_libref, o_member = parts[0], parts[1]
         else:
             o_libref, o_member = "WORK", out_stmt_name
-        output_frame = pd.DataFrame(rows)
+        output_columns = list(dict.fromkeys(
+            valid_group + [name for name, _, _ in output_specs]
+        ))
+        output_frame = pd.DataFrame(rows, columns=output_columns)
+        if output_frame.empty:
+            # A zero-row result still declares the columns for later DATA/SQL.
+            for column in output_columns:
+                dtype = group_data[column].dtype if column in valid_group else "float64"
+                output_frame[column] = pd.Series(dtype=dtype)
         for option in output_stmt.get("out_options", []):
             drop_names = option.get("DROP", [])
             if drop_names:
@@ -621,7 +652,7 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
         if group_cols:
             valid_group = [col_map[c] for c in group_cols if c in col_map]
             if valid_group:
-                grouped = ds.data.groupby(valid_group)
+                grouped = group_data.groupby(valid_group, dropna=dropna_groups, observed=True)
                 out_data = grouped[valid_cols].agg(["count", "mean", "sum", "min", "max", "std"]).reset_index()
                 # Flatten column names
                 out_data.columns = [str(c) if not isinstance(c, tuple) else f"{c[0]}_{c[1]}" for c in out_data.columns]

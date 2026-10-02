@@ -624,7 +624,7 @@ class SasTransformer(Transformer):
         return ByNode(variables=names)
 
     def array_stmt(self, items: list[Any]) -> ArrayNode:
-        # ARRAY name[size] / name{size} [var_list] [(init_values)]
+        # ARRAY name[size] / name{size} / name(size) [var_list] [(init_values)]
         name = ""
         size = None
         variables: list[str] = []
@@ -641,10 +641,10 @@ class SasTransformer(Transformer):
                 if not name and getattr(item, "type", "") == "NAME":
                     name = t
                     continue
-                if t in ("[", "{"):
+                if t in ("[", "{", "("):
                     in_bounds = True
                     continue
-                if t in ("]", "}"):
+                if t in ("]", "}", ")"):
                     in_bounds = False
                     continue
                 if t == "$":
@@ -1001,14 +1001,14 @@ class SasTransformer(Transformer):
         return AssignNode(target=target, expr=expr)
 
     def arr_assign_stmt(self, items: list[Any]) -> Any:
-        """arr[index] / arr{index} = expr;"""
+        """arr[index] / arr{index} / arr(index) = expr;"""
         from saslite.ast.data_step import ArrayAssignNode
         name = ""
         exprs: list[Any] = []
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
-                if t in ("[", "]", "{", "}", "="):
+                if t in ("[", "]", "{", "}", "(", ")", "="):
                     continue
                 if not name:
                     name = t.upper()
@@ -3387,7 +3387,7 @@ class SasTransformer(Transformer):
             elif keyword == "OUTPUT":
                 out_name = ""
                 out_options: list[dict[str, Any]] = []
-                stats: dict[str, str] = {}
+                stats: dict[str, list[str]] = {}
                 for item in items[1:]:
                     if isinstance(item, Token):
                         continue
@@ -3401,7 +3401,7 @@ class SasTransformer(Transformer):
                         )
                         out_options = item.options
                     elif isinstance(item, tuple) and len(item) == 2:
-                        stats[item[0].upper()] = item[1].upper()
+                        stats[item[0].upper()] = [name.upper() for name in item[1]]
                 return {
                     "action": "means_output",
                     "out": out_name,
@@ -3410,12 +3410,12 @@ class SasTransformer(Transformer):
                 }
         return first if not isinstance(first, Token) else None
 
-    def means_output_kv(self, items: list[Any]) -> tuple[str, str]:
-        """STAT=newname pair in PROC MEANS OUTPUT statement."""
+    def means_output_kv(self, items: list[Any]) -> tuple[str, list[str]]:
+        """STAT=name1 name2 ... in PROC MEANS OUTPUT, in VAR order."""
         names = [str(t) for t in items if isinstance(t, Token) and str(t) != "="]
         if len(names) >= 2:
-            return (names[0], names[1])
-        return ("", "")
+            return (names[0], names[1:])
+        return ("", [])
 
     def distinct_arg(self, items: list[Any]) -> Any:
         """DISTINCT expr inside an aggregate — mark with a wrapper call."""

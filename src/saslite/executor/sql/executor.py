@@ -949,13 +949,8 @@ class SqlExecutor:
         elif join_node.join_type in ("FULL", "OUTER"):
             how = "outer"
         elif join_node.join_type == "CROSS":
-            left_df = left_df.copy()
-            right_df = right_df.copy()
-            left_df["_key"] = 1
-            right_df["_key"] = 1
-            merged = left_df.merge(right_df, on="_key", how="outer", suffixes=("", "_r"))
-            merged = merged.drop(columns=["_key"])
-            return merged
+            # A Cartesian product is empty when either operand is empty.
+            return left_df.merge(right_df, how="cross", suffixes=("", "_r"))
 
         on_condition = join_node.on_condition
         if on_condition is None:
@@ -1899,6 +1894,11 @@ class SqlExecutor:
         """Evaluate WHERE clause as a boolean mask."""
         from saslite.runtime.types import sas_bool
         from saslite.ast.expressions import ExistsNode, ScalarSubqueryNode
+
+        # An untyped empty Series is interpreted as a column selector by
+        # pandas. Preserve the descriptor when WHERE/ON has no input rows.
+        if df.empty:
+            return pd.Series(False, index=df.index, dtype=bool)
 
         condition = where_node if not hasattr(where_node, "condition") else where_node.condition
         if col_map is None:
