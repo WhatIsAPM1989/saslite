@@ -9,7 +9,7 @@ import pandas as pd
 
 from saslite.ast.data_step import (
     DataStepNode, SetNode, AssignNode, IfNode, DoNode,
-    OutputNode, DeleteNode, StopNode, RetainNode, WhereNode,
+    OutputNode, DeleteNode, StopNode, AbortCancelNode, RetainNode, WhereNode,
     KeepNode, DropNode, RenameNode, DatasetRefNode,
     FormatNode, FormatResetNode, InformatResetNode, LabelNode, MergeNode,
     ArrayNode, InputNode, InfileNode,
@@ -30,6 +30,7 @@ from saslite.runtime.types import is_missing, sas_bool
 from saslite.executor.expression_eval import ExpressionEvaluator
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
+from saslite.diagnostics.errors import ProgramCancelled
 from saslite.diagnostics.schema import referenced_variables
 from saslite.functions import build_default_registry
 
@@ -352,6 +353,8 @@ class DataStepExecutor:
                 ],
             )
 
+        except ProgramCancelled:
+            raise
         except Exception as e:
             return StepResult(success=False, error=str(e))
 
@@ -361,6 +364,8 @@ class DataStepExecutor:
             character_encoding=str(self.session.get_option("ENCODING", "utf-8")),
         )
 
+        self._compiled_array_vars: dict[str, list[str]] = {}
+
         # Add variables from input datasets
         for ds in inputs:
             for logical_name, var_meta in ds.metadata.variables.items():
@@ -368,10 +373,24 @@ class DataStepExecutor:
                     pdv.add_variable(logical_name, deepcopy(var_meta))
                 pdv.mark_produced(logical_name)
 
+        # Declarations compile even inside an untaken IF/DO block. Walk in
+        # source order so a later LABEL cannot create a numeric variable
+        # before an earlier, nested character LENGTH declaration is seen.
+        def compile_statements(statements):
+            for statement in statements:
+                yield statement
+                if isinstance(statement, DoNode):
+                    yield from compile_statements(statement.body)
+                elif isinstance(statement, IfNode):
+                    if statement.then_stmt is not None:
+                        yield from compile_statements([statement.then_stmt])
+                    if statement.else_stmt is not None:
+                        yield from compile_statements([statement.else_stmt])
+
         # Compile declarative statements into the PDV even when the step has
         # no input observations. This is what gives zero-row output data sets
         # their schema and variable attributes.
-        for stmt in step.statements:
+        for stmt in compile_statements(step.statements):
             if isinstance(stmt, SetNode) and stmt.end_var:
                 pdv.ensure_variable(stmt.end_var, dtype="numeric")
                 pdv.mark_produced(stmt.end_var)
@@ -396,24 +415,48 @@ class DataStepExecutor:
                     variable.metadata.label = label
             elif isinstance(stmt, AttribNode):
                 for name, attribute, value in stmt.items:
-                    dtype = (
-                        "character"
-                        if attribute in ("FORMAT", "INFORMAT")
-                        and str(value).startswith("$")
-                        else "numeric"
-                    )
-                    variable = pdv.ensure_variable(name, dtype=dtype)
-                    if attribute == "FORMAT":
-                        variable.metadata.format = value
-                    elif attribute == "INFORMAT":
-                        variable.metadata.informat = value
-                    elif attribute == "LABEL":
-                        variable.metadata.label = value
-                    elif attribute == "LENGTH":
-                        try:
-                            variable.metadata.length = int(value)
-                        except (TypeError, ValueError):
-                            pass
+                    selector = name.upper()
+                    if selector in {"_ALL_", "_CHARACTER_", "_NUMERIC_"}:
+                        selected_dtype = {"_CHARACTER_": "character", "_NUMERIC_": "numeric"}.get(selector)
+                        names = [key for key, variable in pdv.variables.items()
+                                 if key not in {"_N_", "_ERROR_"}
+                                 and (selected_dtype is None or variable.metadata.dtype == selected_dtype)]
+                    else:
+                        names = [name]
+                    for selected_name in names:
+                        dtype = (
+                            "character"
+                            if attribute in ("FORMAT", "INFORMAT", "LENGTH")
+                            and str(value).startswith("$")
+                            else "numeric"
+                        )
+                        variable = pdv.ensure_variable(selected_name, dtype=dtype)
+                        if attribute == "FORMAT":
+                            variable.metadata.format = value
+                        elif attribute == "INFORMAT":
+                            variable.metadata.informat = value
+                        elif attribute == "LABEL":
+                            variable.metadata.label = value
+                        elif attribute == "LENGTH":
+                            if str(value).startswith("$"):
+                                variable.metadata.dtype = "character"
+                            try:
+                                variable.metadata.length = int(str(value).lstrip("$"))
+                            except (TypeError, ValueError):
+                                pass
+            elif isinstance(stmt, ArrayNode):
+                names = []
+                for name in stmt.variables:
+                    selector = name.upper()
+                    if selector in {"_CHARACTER_", "_NUMERIC_", "_ALL_"}:
+                        dtype = {"_CHARACTER_": "character", "_NUMERIC_": "numeric"}.get(selector)
+                        names.extend(key for key, var in pdv.variables.items()
+                                     if key not in {"_N_", "_ERROR_"}
+                                     and (dtype is None or var.metadata.dtype == dtype))
+                    else:
+                        names.append(selector)
+                        pdv.ensure_variable(name, dtype="character" if stmt.is_character else "numeric")
+                self._compiled_array_vars[stmt.name.upper()] = list(dict.fromkeys(names))
             elif isinstance(stmt, FormatResetNode):
                 for variable in pdv.variables.values():
                     variable.metadata.format = None
@@ -661,15 +704,15 @@ class DataStepExecutor:
                 continue
             dtype = "character" if definition.is_character else "numeric"
             for assignment in array_assignments:
-                variables = definition.variables
+                variables = self._compiled_array_vars.get(array_name, definition.variables)
                 if (
                     isinstance(assignment.index, LiteralNode)
                     and assignment.index.literal_type == "number"
                 ):
                     index = int(assignment.index.value) - 1
                     variables = (
-                        [definition.variables[index]]
-                        if 0 <= index < len(definition.variables)
+                        [variables[index]]
+                        if 0 <= index < len(variables)
                         else []
                     )
                 for variable in variables:
@@ -691,7 +734,7 @@ class DataStepExecutor:
         if isinstance(expression, FunctionCallNode):
             character_functions = {
                 "BYTE", "CAT", "CATS", "CATX", "COALESCEC", "COMPBL",
-                "COMPRESS", "IFC", "LEFT", "LOWCASE", "PRXCHANGE",
+                "COMPRESS", "GETOPTION", "IFC", "LEFT", "LOWCASE", "PRXCHANGE",
                 "PROPCASE", "PUT", "PUTC", "PUTN", "REPEAT", "REVERSE",
                 "SCAN", "STRIP", "SUBSTR", "SUBSTRN", "SYMGET", "TRANSLATE",
                 "TRANWRD", "TRIM", "UPCASE", "VLABEL", "VVALUE",
@@ -1271,6 +1314,9 @@ class DataStepExecutor:
             elif isinstance(stmt, StopNode):
                 ctx.pdv.stop_flag = True
 
+            elif isinstance(stmt, AbortCancelNode):
+                raise ProgramCancelled("Execution cancelled by ABORT CANCEL.")
+
             elif isinstance(stmt, PutNode):
                 self._execute_put(stmt, ctx)
 
@@ -1320,6 +1366,8 @@ class DataStepExecutor:
             ctx.pdv.delete_flag = True
         elif isinstance(stmt, StopNode):
             ctx.pdv.stop_flag = True
+        elif isinstance(stmt, AbortCancelNode):
+            raise ProgramCancelled("Execution cancelled by ABORT CANCEL.")
         elif isinstance(stmt, PutNode):
             self._execute_put(stmt, ctx)
         elif isinstance(stmt, CallSymputNode):
@@ -1480,7 +1528,8 @@ class DataStepExecutor:
         if fmt_upper.startswith("Z") or fmt_upper.startswith("ZERO"):
             # Zero-padded numeric
             try:
-                return f"{int(value)}"
+                from saslite.functions.convert_funcs import put_sas
+                return put_sas(value, fmt)
             except (ValueError, TypeError):
                 return str(value)
         return str(value)
@@ -1516,7 +1565,7 @@ class DataStepExecutor:
             ctx.evaluator.register_array(stmt.name, values)
             return
 
-        var_names = [v.upper() for v in stmt.variables]
+        var_names = self._compiled_array_vars.get(stmt.name.upper(), [v.upper() for v in stmt.variables])
         ctx.arrays[stmt.name.upper()] = var_names
         # Register variable list for DIM() and OF arr[*] expansion
         ctx.evaluator.register_array_vars(stmt.name, var_names)
@@ -1629,8 +1678,31 @@ class DataStepExecutor:
             dataset_name=primary_name or None,
             rows_affected=total_rows,
             notes=notes,
-            warnings=[*(warnings or []), *self._schema_warnings.values()],
+            warnings=[
+                *(warnings or []),
+                *self._schema_warnings.values(),
+                *self._uninitialized_declaration_warnings(pdv),
+            ],
         )
+
+    def _uninitialized_declaration_warnings(self, pdv: PDV) -> list[str]:
+        """Diagnose declared variables even when no expression reads them.
+
+        A missing value is initialized when an input descriptor or executable
+        statement supplies the variable. Metadata declarations alone do not
+        supply values. Check the compiled PDV so empty inputs and vectorized
+        execution produce the same diagnostics as the row engine.
+        """
+        return [
+            f"Variable {variable.metadata.name} is uninitialized. It is declared "
+            "in this DATA step but has no input or executable assignment that "
+            "supplies a value; SASLite left it missing. Initialize it explicitly "
+            "if a missing value is intentional."
+            for name, variable in pdv.variables.items()
+            if not pdv.has_compile_time_source(name)
+            and not pdv.has_runtime_diagnostic(f"uninitialized:{name}")
+            and name not in self._pending_data_step_schema
+        ]
 
     def _build_output_dataset(
         self,
@@ -1648,9 +1720,12 @@ class DataStepExecutor:
         elif rows:
             df = pd.DataFrame(rows)
         else:
-            df = pd.DataFrame(columns=[
-                variable.metadata.name for variable in pdv.variables.values()
-            ])
+            df = pd.DataFrame({
+                variable.metadata.name: pd.Series(
+                    dtype="float64" if variable.metadata.dtype == "numeric" else "object"
+                )
+                for variable in pdv.variables.values()
+            })
         if in_flag_names:
             df = df.drop(columns=[
                 column for column in df.columns
@@ -1755,7 +1830,7 @@ class DataStepExecutor:
                     variable.informat = value
                 elif attribute == "LENGTH":
                     try:
-                        variable.length = int(value)
+                        variable.length = int(str(value).lstrip("$"))
                     except (TypeError, ValueError):
                         pass
         return out_ds
@@ -2210,6 +2285,18 @@ class DataStepExecutor:
 
         scaffold_parts = [frame[keys + [occurrence]] for frame in prepared]
         scaffold = pd.concat(scaffold_parts, ignore_index=True).drop_duplicates()
+        if scaffold.empty:
+            # With no observations the output is the union of the input
+            # descriptors. Pandas key coercion is irrelevant and can reject
+            # valid numeric SAS keys held in empty object-backed columns.
+            columns = {}
+            for frame in prepared:
+                for column in frame.columns:
+                    if column != occurrence:
+                        columns.setdefault(str(column).upper(), (column, frame[column].dtype))
+            return pd.DataFrame({
+                name: pd.Series(dtype=dtype) for name, dtype in columns.values()
+            })
         if not scaffold.empty:
             try:
                 scaffold = scaffold.sort_values(

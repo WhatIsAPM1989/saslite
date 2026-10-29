@@ -64,6 +64,7 @@ class Session:
         self._schema_expectations: dict[
             tuple[tuple[str, ...], str], set[str]
         ] = {}
+        self._dataset_expectations: set[str] = set()
         self._macro_stack: list[MacroScope] = [MacroScope("_GLOBAL_")]
         self._formats: dict[str, Any] = {}
         self._options: dict[str, Any] = {
@@ -72,8 +73,10 @@ class Session:
             "FIRSTOBS": 1,
             "OBS": None,
             "MISSING": ".",
-            "NODATE": False,
-            "NONUMBER": False,
+            "DATE": True,
+            "NUMBER": True,
+            "NOTES": True,
+            "SOURCE": True,
             "MPRINT": False,
             "SYMBOLGEN": False,
             "MLOGIC": False,
@@ -81,6 +84,7 @@ class Session:
             # diagnostics use this codec and preserve the full Python value.
             "ENCODING": "utf-8",
         }
+        self._default_options = self._options.copy()
         self._debug_output: list[str] = []
         # Automatic macro variables
         global_scope = self._macro_stack[0]
@@ -91,6 +95,12 @@ class Session:
     def clear_schema_expectations(self) -> None:
         """Start a fresh source-schema audit for one public execution."""
         self._schema_expectations.clear()
+        self._dataset_expectations.clear()
+
+    @property
+    def dataset_expectations(self) -> list[str]:
+        """Return missing weak source datasets in deterministic order."""
+        return sorted(self._dataset_expectations)
 
     def configure_project(self, config: ProjectConfig) -> None:
         """Apply project defaults and metadata-discovered strict libraries."""
@@ -192,14 +202,58 @@ class Session:
         return self.macro_scope.resolve_var(name)
 
     def get_option(self, name: str, default: Any = None) -> Any:
-        return self._options.get(name.upper(), default)
+        key = self._option_name(name)
+        if key.startswith("NO") and isinstance(self._options.get(key[2:]), bool):
+            return not self._options[key[2:]]
+        return self._options.get(key, default)
 
     def set_option(self, name: str, value: Any) -> None:
-        self._options[name.upper()] = value
+        key = self._option_name(name)
+        if key.startswith("NO") and key not in self._options and isinstance(value, bool):
+            key, value = key[2:], not value
+        self._options[key] = value
+
+    @staticmethod
+    def _option_name(name: str) -> str:
+        key = str(name).strip().upper()
+        return {"LS": "LINESIZE", "PS": "PAGESIZE"}.get(key, key)
+
+    def option_text(self, name: Any, *modifiers: Any) -> str:
+        """Return a SAS GETOPTION value, optionally suitable for OPTIONS."""
+        requested = str(name).strip().upper()
+        key = self._option_name(requested)
+        flags = {str(modifier).strip().upper() for modifier in modifiers}
+        supported = {"", "KEYWORD", "DEFAULTVALUE", "STARTUPVALUE"}
+        if flags - supported:
+            unknown = ", ".join(sorted(flags - supported))
+            raise ValueError(f"Unsupported GETOPTION modifier: {unknown}")
+        options = (
+            self._default_options
+            if flags & {"DEFAULTVALUE", "STARTUPVALUE"}
+            else self._options
+        )
+        if key.startswith("NO") and isinstance(options.get(key[2:]), bool):
+            key = key[2:]
+        if key not in options:
+            raise ValueError(f"Unknown system option: {requested}")
+        value = options[key]
+        if isinstance(value, bool):
+            return key if value else f"NO{key}"
+        text = "MAX" if key == "OBS" and value is None else str(value if value is not None else "")
+        if "KEYWORD" in flags:
+            if not text:
+                text = "' '"
+            elif isinstance(value, str):
+                text = "'" + text.replace("'", "''") + "'"
+            return f"{requested}={text}"
+        return text
 
     def get_dataset(self, libref: str, name: str) -> Dataset:
         libref_upper = libref.upper()
-        backend, ds_name = self.storage.resolve(libref_upper, name)
+        backend = self.storage.get_backend(libref_upper)
+        ds_name = name.upper()
+        if backend is None and self.schema_policy_for(libref_upper) != "weak":
+            backend, ds_name = self.storage.resolve(libref_upper, name)
         library_schema = self.library_metadata.get(libref_upper)
         dataset_schema = (
             library_schema.datasets.get(ds_name.upper())
@@ -228,7 +282,7 @@ class Session:
                 member=ds_name,
             )
         else:
-            ds = backend.read(ds_name)
+            ds = backend.read(ds_name) if backend is not None else None
         if dataset_schema is not None:
             ds = self._dataset_with_metadata_schema(
                 libref_upper,
@@ -237,7 +291,10 @@ class Session:
                 dataset_schema,
             )
         elif ds is None:
-            raise KeyError(f"Dataset {libref_upper}.{ds_name} does not exist")
+            if self.schema_policy_for(libref_upper) != "weak":
+                raise KeyError(f"Dataset {libref_upper}.{ds_name} does not exist")
+            self._dataset_expectations.add(f"{libref_upper}.{ds_name}")
+            ds = Dataset.from_dataframe(pd.DataFrame(), name=ds_name, libref=libref_upper)
         if ds.weak_schema_sources is None:
             # A dataset first encountered through a storage backend is an
             # input to the local run.  Keep this root name when the data later

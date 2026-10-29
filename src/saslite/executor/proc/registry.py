@@ -316,6 +316,15 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
                 resolved_ascending.extend([direction] * len(matches))
                 continue
             actual = col_map.get(bv.upper())
+            weak_sources = tuple(
+                source for source in working_ds.weak_schema_sources or ()
+                if session.schema_policy_for(source.split(".", 1)[0]) == "weak"
+            )
+            if actual is None and weak_sources:
+                session.record_schema_expectation(bv, weak_sources, "PROC SORT BY")
+                actual = bv.upper()
+                df[actual] = float("nan")
+                col_map[actual] = actual
             if actual:
                 resolved_by.append(actual)
                 resolved_ascending.append(direction)
@@ -337,13 +346,24 @@ def handle_proc_sort(proc: ProcNode, session: Session, reporter: Reporter) -> St
     nodupkey = proc.options.get("NODUPKEY", False)
     noduprecs = proc.options.get("NODUPRECS", False)
 
-    if nodupkey:
-        sorted_df = sorted_df.drop_duplicates(subset=resolved_by, keep="first").reset_index(drop=True)
-    elif noduprecs:
-        sorted_df = sorted_df.drop_duplicates(keep="first").reset_index(drop=True)
-
-    if "__sas_sort_ord__" in sorted_df.columns:
-        sorted_df = sorted_df.drop(columns="__sas_sort_ord__")
+    sorted_df = sorted_df.drop(columns="__sas_sort_ord__")
+    duplicates = sorted_df.duplicated(
+        subset=resolved_by if nodupkey else None, keep="first"
+    ) if nodupkey or noduprecs else pd.Series(False, index=sorted_df.index)
+    dup_ref = proc.options.get("DUPOUT")
+    if isinstance(dup_ref, DatasetRefNode):
+        metadata = working_ds.metadata.copy()
+        metadata.libref = dup_ref.libref
+        metadata.member_name = dup_ref.name.upper()
+        metadata.row_count = int(duplicates.sum())
+        metadata.sort_keys = list(resolved_by)
+        dup_ds = Dataset(name=dup_ref.name,
+                         data=sorted_df.loc[duplicates].reset_index(drop=True),
+                         metadata=metadata,
+                         weak_schema_sources=working_ds.weak_schema_sources)
+        dup_ds = _apply_export_dataset_options(dup_ds, dup_ref.options, session)
+        session.put_dataset(dup_ref.libref, dup_ref.name, dup_ds)
+    sorted_df = sorted_df.loc[~duplicates].reset_index(drop=True)
 
     # Resolve output libref and name
     out_options: list[Any] = []
@@ -468,13 +488,28 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
 
     # If no VAR specified, use all numeric columns
     if not var_cols:
-        var_cols = [c for c in ds.data.columns if pd.api.types.is_numeric_dtype(ds.data[c])]
+        var_cols = [c.upper() for c in ds.data.columns if pd.api.types.is_numeric_dtype(ds.data[c])]
 
     # Case-insensitive column matching
     col_map = {c.upper(): c for c in ds.data.columns}
     valid_cols = [col_map[c] for c in var_cols if c in col_map]
     if not valid_cols:
         return StepResult(success=False, error="No valid numeric variables found")
+
+    # MISSING includes missing CLASS levels; BY groups always include them.
+    # Normalize SAS character blanks so they group with other missing values,
+    # without changing the input dataset or the analysis variables.
+    group_data = ds.data
+    if class_cols:
+        group_data = ds.data.copy()
+        for name in class_cols:
+            if name in col_map:
+                column = col_map[name]
+                blanks = group_data[column].map(
+                    lambda value: isinstance(value, str) and not value.strip()
+                )
+                group_data[column] = group_data[column].mask(blanks, np.nan)
+    dropna_groups = bool(class_cols) and not proc.options.get("MISSING", False)
 
     # Which stats to compute
     q1 = lambda series: series.quantile(0.25)
@@ -496,7 +531,7 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
         # Grouped statistics
         valid_group = [col_map[c] for c in group_cols if c in col_map]
         if valid_group:
-            grouped = ds.data.groupby(valid_group)
+            grouped = group_data.groupby(valid_group, dropna=dropna_groups, observed=True)
             if stat_names:
                 # Named aggregations
                 agg_dict = {}
@@ -550,39 +585,55 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
     if not noprint:
         reporter.log(output)
 
-    # OUTPUT OUT=ds STAT=newname ... statement
+    # OUTPUT OUT=ds STAT=name1 name2 ... statement
     if output_stmt and output_stmt.get("out"):
         stats_kv = output_stmt.get("stats", {})
         if not stats_kv:
-            stats_kv = {"MEAN": "MEAN"}
+            stats_kv = {"MEAN": ["MEAN"]}
+        output_specs = []
+        for stat_name, new_names in stats_kv.items():
+            fn = agg_map.get(stat_name)
+            if fn:
+                # Each output name belongs to the corresponding VAR column.
+                if isinstance(new_names, str):
+                    new_names = [new_names]
+                output_specs.extend(
+                    (new_name, column, fn)
+                    for new_name, column in zip(new_names, valid_cols)
+                )
+
+        def output_statistics(block: pd.DataFrame) -> dict[str, Any]:
+            return {
+                name: fn(block[column]) if callable(fn) else getattr(block[column], fn)()
+                for name, column, fn in output_specs
+            }
+
         rows = []
+        valid_group = [col_map[c] for c in group_cols if c in col_map]
         if group_cols:
-            valid_group = [col_map[c] for c in group_cols if c in col_map]
-            for key, block in ds.data.groupby(valid_group, dropna=False):
+            for key, block in group_data.groupby(valid_group, dropna=dropna_groups, observed=True):
                 if not isinstance(key, tuple):
                     key = (key,)
                 row = dict(zip(valid_group, key))
-                for stat_name, new_name in stats_kv.items():
-                    fn = agg_map.get(stat_name)
-                    if fn:
-                        for vc in valid_cols:
-                            row[new_name] = fn(block[vc]) if callable(fn) else getattr(block[vc], fn)()
+                row.update(output_statistics(block))
                 rows.append(row)
         else:
-            row = {}
-            for stat_name, new_name in stats_kv.items():
-                fn = agg_map.get(stat_name)
-                if fn:
-                    for vc in valid_cols:
-                        row[new_name] = fn(ds.data[vc]) if callable(fn) else getattr(ds.data[vc], fn)()
-            rows.append(row)
+            rows.append(output_statistics(ds.data))
         out_stmt_name = output_stmt["out"]
         if "." in out_stmt_name:
             parts = out_stmt_name.split(".", 1)
             o_libref, o_member = parts[0], parts[1]
         else:
             o_libref, o_member = "WORK", out_stmt_name
-        output_frame = pd.DataFrame(rows)
+        output_columns = list(dict.fromkeys(
+            valid_group + [name for name, _, _ in output_specs]
+        ))
+        output_frame = pd.DataFrame(rows, columns=output_columns)
+        if output_frame.empty:
+            # A zero-row result still declares the columns for later DATA/SQL.
+            for column in output_columns:
+                dtype = group_data[column].dtype if column in valid_group else "float64"
+                output_frame[column] = pd.Series(dtype=dtype)
         for option in output_stmt.get("out_options", []):
             drop_names = option.get("DROP", [])
             if drop_names:
@@ -601,7 +652,7 @@ def handle_proc_means(proc: ProcNode, session: Session, reporter: Reporter) -> S
         if group_cols:
             valid_group = [col_map[c] for c in group_cols if c in col_map]
             if valid_group:
-                grouped = ds.data.groupby(valid_group)
+                grouped = group_data.groupby(valid_group, dropna=dropna_groups, observed=True)
                 out_data = grouped[valid_cols].agg(["count", "mean", "sum", "min", "max", "std"]).reset_index()
                 # Flatten column names
                 out_data.columns = [str(c) if not isinstance(c, tuple) else f"{c[0]}_{c[1]}" for c in out_data.columns]
@@ -1423,12 +1474,25 @@ def handle_proc_import(proc: ProcNode, session: Session, reporter: Reporter) -> 
         if not os.path.isabs(filepath):
             filepath = os.path.abspath(filepath)
 
+        # DATAROW is a one-based source row. With GETNAMES=YES the first
+        # row still supplies names; skip intervening rows, not that header.
+        datarow = float(proc.options.get("DATAROW", 2 if getnames else 1))
+        minimum = 2 if getnames else 1
+        if not datarow.is_integer() or datarow < minimum:
+            return StepResult(
+                success=False,
+                error=f"DATAROW must be an integer >= {minimum} with "
+                      f"GETNAMES={'YES' if getnames else 'NO'}",
+            )
+        first_data_row = int(datarow)
+        skiprows = range(1, first_data_row - 1) if getnames else first_data_row - 1
+        header = 0 if getnames else None
+
         if dbms == "csv" or dbms == "dlm" or dbms == "tab":
             sep = delimiter if dbms != "tab" else "\t"
-            header = 0 if getnames else None
-            df = pd.read_csv(filepath, sep=sep, header=header)
+            df = pd.read_csv(filepath, sep=sep, header=header, skiprows=skiprows)
         elif dbms == "xlsx" or dbms == "excel":
-            df = pd.read_excel(filepath, header=0 if getnames else None)
+            df = pd.read_excel(filepath, header=header, skiprows=skiprows)
         else:
             return StepResult(success=False, error=f"Unsupported DBMS type: {dbms}")
 

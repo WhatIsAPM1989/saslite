@@ -8,6 +8,46 @@ from saslite.storage.memory import MemoryBackend
 
 
 class WeakSchemaTests(unittest.TestCase):
+    def test_missing_weak_datasets_are_reported_without_being_stored(self) -> None:
+        for registered in (False, True):
+            for source in (
+                "data result; set raw.absent; selected=(flag='Y'); run;",
+                "proc sql; create table result as select flag from raw.absent; quit;",
+                "proc sort data=raw.absent out=result; by flag; run;",
+            ):
+                with self.subTest(registered=registered, source=source):
+                    sas = SasInterpreter()
+                    if registered:
+                        sas.session.storage.register("RAW", MemoryBackend())
+                    log = io.StringIO()
+                    sas.reporter._stream = log
+                    sas.reporter.configure(quiet=True)
+                    result = sas.execute(source)
+                    self.assertTrue(result.success, result.error)
+                    self.assertEqual(sas.session.dataset_expectations, ["RAW.ABSENT"])
+                    self.assertEqual(sas.session.schema_expectations[0].variable, "FLAG")
+                    self.assertEqual(len(sas.get_dataset("WORK", "RESULT")), 0)
+                    self.assertEqual(sas.session.list_datasets("RAW"), [])
+                    self.assertIn("Expected source datasets (weak schema):", log.getvalue())
+                    sas.execute("data other; x=1; run;")
+                    self.assertEqual(sas.session.dataset_expectations, [])
+
+    def test_missing_dataset_without_variables_is_reported_once(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute("data result; set raw.absent raw.absent; run;")
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(sas.session.dataset_expectations, ["RAW.ABSENT"])
+        self.assertFalse(sas.session.schema_expectations)
+        self.assertIn("Expected source datasets", "\n".join(result.log_lines))
+
+    def test_missing_strict_datasets_still_fail(self) -> None:
+        for libref in ("WORK", "RAW"):
+            sas = SasInterpreter()
+            sas.session.schema_policy = "strict"
+            result = sas.execute(f"data result; set {libref}.absent; run;")
+            self.assertFalse(result.success)
+            self.assertEqual(sas.session.dataset_expectations, [])
+
     def test_expectation_keeps_the_more_precise_source_lineage(self) -> None:
         sas = SasInterpreter()
         sas.session.record_schema_expectation(

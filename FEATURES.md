@@ -12,6 +12,9 @@ SASLite includes support for:
 - **DATA step**: `DATA`, `SET`, `MERGE`, `INPUT`, `DATALINES`, `INFILE`, `OUTPUT`,
   `KEEP`, `DROP`, `RENAME`, `WHERE`, `IF/THEN/ELSE`, `DO/END`, `DO WHILE/UNTIL`,
   `BY`, `FIRST.` and `LAST.`, `ARRAY`, `RETAIN`, `LENGTH`, `ATTRIB`
+- **DATA step validation**: `ABORT CANCEL` terminates the submitted program
+  when executed, including within conditional blocks and loops, preserving
+  preceding `PUTLOG` diagnostics.
 - **Additional DATA step support**: `UPDATE`, dataset options, variable lists,
   descriptor metadata, observation limits, and zero-row datasets.
 - **Column-mode INPUT**: Fixed-width data reading with position specifications
@@ -84,6 +87,11 @@ SASLite includes support for:
 - **Macro functions**: `%EVAL`, `%SYSEVALF`, character functions, symbol-table
   queries, and compile-time/runtime quoting (`%STR`, `%NRSTR`, `%BQUOTE`,
   `%NRBQUOTE`, `%SUPERQ`, `%UNQUOTE`, and Q variants)
+- **Percent escapes in macro quoting**: `%STR`/`%NRSTR` and `%QUOTE`/`%NRQUOTE`
+  distinguish `%%` (a literal percent) from percent-marked quotes and parentheses.
+  Marked quotes retain their token roles until code emission or `%UNQUOTE`.
+  A double-quoted filter ending in `%"` is rejected, including on empty
+  input; use `%%"` inside `%STR`, or single-quoted values.
 - **%SYSFUNC / %QSYSFUNC**: Call supported DATA step and dataset functions in
   macro code, with optional output formatting
 - **%INCLUDE**: Compose programs from multiple files
@@ -102,6 +110,11 @@ SASLite includes support for:
 - **Conversion**: `INPUT`, `PUT`, `INPUTN`, `INPUTC`, `PUTN`, `PUTC`
 - **Missing values**: `NMISS`, `CMISS`, `MISSING`, `COALESCE`, `COALESCEC`
 - **Utility**: `N`, `DIM`, `IFN`, `IFERROR`, `LAG`, `DIF`
+- **System options**: `GETOPTION` in DATA steps, PROC SQL, `%SYSFUNC`, and
+  `%QSYSFUNC`; current session values, `KEYWORD` save/restore,
+  `DEFAULTVALUE`/`STARTUPVALUE`, boolean option names, and `LS`/`PS` aliases.
+  Defaults and startup values are the SASLite session defaults. Graphics
+  options and other GETOPTION reporting modifiers are not supported.
 - **Statistical**: `PROBNORM`, `PROBT`, `PROBCHI`, `PROBF`
 
 ### Libraries & I/O

@@ -110,6 +110,7 @@ class SasInterpreter:
         include_errors: str = "strict",
     ) -> RunSummary:
         """Execute SAS source and report weak-schema assumptions once."""
+        log_start = len(self._reporter.log_lines)
         self._session.clear_schema_expectations()
         summary = self._execute_source(
             source,
@@ -118,8 +119,9 @@ class SasInterpreter:
             include_errors=include_errors,
         )
         expectations = self._session.schema_expectations
-        if expectations:
-            lines = ["Expected source variables (weak schema):"]
+        dataset_expectations = self._session.dataset_expectations
+        if expectations or dataset_expectations:
+            lines = ["Expected source variables (weak schema):"] if expectations else []
             for expectation in expectations:
                 if len(expectation.sources) == 1:
                     label = f"{expectation.sources[0]}.{expectation.variable}"
@@ -130,6 +132,11 @@ class SasInterpreter:
                     )
                 contexts = ", ".join(expectation.contexts)
                 lines.append(f"  {label} ({contexts})")
+            if dataset_expectations:
+                if lines:
+                    lines.append("")
+                lines.append("Expected source datasets (weak schema):")
+                lines.extend(f"  {name}" for name in dataset_expectations)
             count = len(expectations)
             noun = "variable was" if count == 1 else "variables were"
             lines.append("")
@@ -142,7 +149,10 @@ class SasInterpreter:
                 lines.append(
                     f"Validation level: weak; {count} source {noun} assumed."
                 )
+            if dataset_expectations:
+                lines.append(f"Source datasets assumed: {len(dataset_expectations)}.")
             self._reporter.schema_summary("\n".join(lines))
+        summary.log_lines = self._reporter.log_lines[log_start:]
         return summary
 
     def _execute_source(
@@ -240,6 +250,9 @@ class SasInterpreter:
                 try:
                     expanded_chunk = self._macro.expand(chunk)
                 except Exception as exc:
+                    for line in self._macro.put_output:
+                        self._reporter.log(line)
+                    self._macro.put_output.clear()
                     message = self._format_exception(exc)
                     self._reporter.error(message)
                     combined.success = False
@@ -294,6 +307,9 @@ class SasInterpreter:
                     self._reporter.log(line)
                 self._macro.put_output.clear()
             except Exception as exc:
+                for line in self._macro.put_output:
+                    self._reporter.log(line)
+                self._macro.put_output.clear()
                 self._reporter.error(str(exc))
                 combined.success = False
                 combined.error = str(exc)
@@ -345,6 +361,8 @@ class SasInterpreter:
     @classmethod
     def _has_later_runtime_macro_reference(cls, source: str) -> bool:
         """Return whether a runtime-assigned macro variable is used later."""
+        if re.search(r"%Q?SYSFUNC\s*\(\s*GETOPTION\s*\(", source, re.IGNORECASE):
+            return True
         if cls._has_later_sql_into_reference(source):
             return True
 
@@ -401,6 +419,17 @@ class SasInterpreter:
             if not expanded.strip():
                 return RunSummary(success=True)
 
+            # An invocation can emit OPTIONS followed by a deferred GETOPTION
+            # even when the submitted source only contained the macro name.
+            if re.search(r"%Q?SYSFUNC\s*\(\s*GETOPTION\s*\(", expanded, re.IGNORECASE):
+                chunks = self._split_into_step_chunks(expanded)
+                if len(chunks) > 1:
+                    return self._execute_staged_macro_source(
+                        expanded,
+                        source_name=source_name,
+                        original_source=original_source,
+                    )
+
             # Step 2: Parse
             program = self._parser.parse(
                 expanded,
@@ -453,18 +482,29 @@ class SasInterpreter:
             return dispatcher.run(program)
 
         except Exception as e:
+            for line in self._macro.put_output:
+                self._reporter.log(line)
+            self._macro.put_output.clear()
             message = self._format_exception(e)
             summary = RunSummary(success=False, error=message)
             self._reporter.error(message)
             return summary
 
     @staticmethod
-    def _split_into_step_chunks(source: str) -> list[str]:
+    def _split_into_step_chunks(source: str, *, split_options: bool = True) -> list[str]:
         """Split source into chunks at top-level RUN;/QUIT; boundaries.
 
         Respects DATALINES blocks, quoted strings, and %MACRO...%MEND
         definitions so a macro body is never split.
         """
+        if split_options and re.search(
+            r"%Q?SYSFUNC\s*\(\s*GETOPTION\s*\(", source, re.IGNORECASE
+        ):
+            return [
+                chunk
+                for part in SasInterpreter._split_option_chunks(source)
+                for chunk in SasInterpreter._split_into_step_chunks(part, split_options=False)
+            ]
         import re as _re
         chunks: list[str] = []
         lines = source.split("\n")
@@ -549,6 +589,71 @@ class SasInterpreter:
 
         if current:
             chunks.append("\n".join(current))
+        return chunks
+
+    @staticmethod
+    def _split_option_chunks(source: str) -> list[str]:
+        """Expose OPTIONS boundaries before expanding later GETOPTION calls."""
+        chunks: list[str] = []
+        start = statement_start = position = 0
+        macro_depth = control_depth = 0
+        visible: list[str] = []
+        while position < len(source):
+            character = source[position]
+            if source.startswith("/*", position):
+                end = source.find("*/", position + 2)
+                position = len(source) if end < 0 else end + 2
+                visible.append(" ")
+                continue
+            if character in ("'", '"'):
+                quote = character
+                position += 1
+                while position < len(source):
+                    if source[position] == quote:
+                        position += 1
+                        if position < len(source) and source[position] == quote:
+                            position += 1
+                            continue
+                        break
+                    position += 1
+                visible.append(" ")
+                continue
+            visible.append(character)
+            position += 1
+            if character != ";":
+                continue
+            statement = "".join(visible).strip()
+            visible = []
+            if statement.startswith("*") or statement.startswith("%*"):
+                statement_start = position
+                continue
+            for token in re.findall(r"%\s*(MACRO|MEND|DO|END)\b", statement, re.IGNORECASE):
+                token = token.upper()
+                if token == "MACRO":
+                    macro_depth += 1
+                elif token == "MEND":
+                    macro_depth = max(0, macro_depth - 1)
+                elif not macro_depth:
+                    control_depth = max(0, control_depth + (1 if token == "DO" else -1))
+            if not macro_depth and not control_depth and re.match(
+                r"OPTIONS?\b", statement, re.IGNORECASE
+            ):
+                # Keep preceding macro assignments separate, so a saved value
+                # is available when OPTIONS references it in the next chunk.
+                if source[start:statement_start].strip():
+                    chunks.append(source[start:statement_start])
+                chunks.append(source[statement_start:position])
+                start = position
+            if not macro_depth and re.match(
+                r"(?:DATALINES4?|CARDS4?|LINES4)\s*;", statement, re.IGNORECASE
+            ):
+                terminator = ";;;;" if "4" in statement else ";"
+                end = re.search(rf"(?m)^\s*{terminator}\s*$", source[position:])
+                if end is not None:
+                    position += end.end()
+            statement_start = position
+        if source[start:].strip():
+            chunks.append(source[start:])
         return chunks
 
     def execute_file(

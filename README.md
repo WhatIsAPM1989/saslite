@@ -4,7 +4,7 @@ SASLite is a local Python interpreter for a practical subset of the SAS
 language. It runs DATA steps, SQL, macros, statistical procedures, reports,
 and graphics for local data checks, prototyping, and compatibility testing.
 
-**Version 0.5.0 · Python 3.10+ · MIT**
+**Version 0.6.0 · Python 3.10+ · MIT**
 
 ## Capabilities
 
@@ -26,7 +26,8 @@ and graphics for local data checks, prototyping, and compatibility testing.
 
 - [Install and run](USAGE.md): CLI, GUI, Python API, and examples.
 - [Feature reference and limitations](FEATURES.md): supported syntax and procedures.
-- [Project setup](NEW_PROJECT.md): local profiles, metadata, schemas, and fixtures (Russian).
+- [Project setup](NEW_PROJECT.md): local profiles, metadata, and schema-only datasets (Russian).
+- [Test data](TEST_DATA.md): dummy CSV fixtures and boundary-case tests (Russian).
 - [ODS compatibility](ODS_COMPATIBILITY.md): output table contracts and RTF styles.
 - [Syntax examples](DOCS.md): extended language guide (Chinese; some inherited sections are historical).
 - [Development](DEVELOPMENT.md) · [Release notes](CHANGELOG.md) · [Example programs](examples/).
@@ -39,6 +40,6 @@ against your target SAS environment. SAS7BDAT files can be read, but writes
 use XPT content even with a `.sas7bdat` extension.
 
 This is an independently maintained downstream of the MIT-licensed SASLite
-0.4.1 PyPI source distribution; see [provenance](DOWNSTREAM.md). Version 0.5.0
+0.4.1 PyPI source distribution; see [provenance](DOWNSTREAM.md). Version 0.6.0
 refers to this repository. SASLite is not affiliated with, endorsed by, or
 supported by SAS Institute Inc. See [LICENSE](LICENSE).

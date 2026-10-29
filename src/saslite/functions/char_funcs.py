@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+import string
 from typing import Any
 
 
@@ -37,25 +38,22 @@ def scan(s: Any, n: int, delimiters: str = " \t\n\r\f.-/,;:!?()[]{}") -> str:
 def compress(s: Any, chars: str = "", modifiers: str = "") -> str:
     """COMPRESS(string [, chars [, modifiers]]) — remove/keep characters."""
     s = _to_str(s)
-    if not chars:
-        # Default: remove blanks
-        return s.replace(" ", "")
-
-    mod = modifiers.upper() if modifiers else ""
-    if "K" in mod:
-        # Keep mode: keep only specified chars
-        result = "".join(c for c in s if c in chars)
-    else:
-        # Remove mode: remove specified chars
-        result = s
-        for c in chars:
-            result = result.replace(c, "")
-
-    if "L" in mod:
-        result = result.lower()
-    elif "U" in mod:
-        result = result.upper()
-    return result
+    mod = _to_str(modifiers).upper()
+    selected = set(_to_str(chars) or (" " if not mod else ""))
+    classes = {"D": string.digits, "A": string.ascii_letters,
+               "L": string.ascii_lowercase, "U": string.ascii_uppercase,
+               "S": string.whitespace, "P": string.punctuation,
+               "N": string.ascii_letters + string.digits + "_"}
+    for flag, values in classes.items():
+        if flag in mod:
+            selected.update(values)
+    if "I" in mod:
+        selected = {c.lower() for c in selected}
+    keep = "K" in mod
+    return "".join(
+        c for c in s
+        if ((c.lower() if "I" in mod else c) in selected) == keep
+    )
 
 
 def upcase(s: Any) -> str:

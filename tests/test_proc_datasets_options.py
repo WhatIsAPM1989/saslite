@@ -23,6 +23,23 @@ class ProcDatasetsOptionsTests(unittest.TestCase):
             [2],
         )
 
+    def test_nodetails_accepts_case_and_option_order_and_preserves_kill(self) -> None:
+        for options in (
+            "library=work kill nolist nodetails",
+            "NoDeTaIlS lib=work nolist kill",
+            "library=work nodetails kill",
+        ):
+            with self.subTest(options=options):
+                sas = SasInterpreter()
+                result = sas.execute(
+                    "data old; value=1; run; "
+                    f"proc datasets {options}; run; "
+                    "data after; value=2; run;"
+                )
+                self.assertTrue(result.success, result.error)
+                self.assertFalse(sas.session.dataset_exists("WORK", "OLD"))
+                self.assertEqual(sas.get_dataset("WORK", "AFTER")["value"].tolist(), [2])
+
     def test_lib_alias_kill_and_run_quit_are_supported(self) -> None:
         sas = SasInterpreter()
         result = sas.execute(

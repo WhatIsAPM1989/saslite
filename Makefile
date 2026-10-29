@@ -6,10 +6,10 @@ LOCAL_PYTHONPATH := $(CURDIR)/src$(if $(PYTHONPATH),:$(PYTHONPATH))
 .PHONY: install test run version
 
 install:
-	$(PYTHON) -m pip install -e .
+	$(PYTHON) -m pip install -e '.[dev]'
 
 test:
-	PYTHONPATH="$(LOCAL_PYTHONPATH)" $(PYTHON) -m unittest discover -s tests -v
+	PYTHONPATH="$(LOCAL_PYTHONPATH)" $(PYTHON) -m pytest -q
 
 run:
 	@test -n "$(PROGRAM)" || (echo "Usage: make run PROGRAM=/path/to/program.sas [WORKDIR=/path/to/work]"; exit 2)

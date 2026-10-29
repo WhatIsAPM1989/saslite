@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import fields, replace
 from typing import Any
 
 from lark import Transformer, Token, Tree
@@ -16,7 +17,7 @@ from saslite.ast.expressions import (
 from saslite.ast.program import ProgramNode, FilenameNode, LibnameNode, OptionsNode
 from saslite.ast.data_step import (
     DataStepNode, SetNode, DatasetRefNode, AssignNode, IfNode, DoNode,
-    OutputNode, DeleteNode, StopNode, RetainNode, WhereNode, KeepNode,
+    OutputNode, DeleteNode, StopNode, AbortCancelNode, RetainNode, WhereNode, KeepNode,
     DropNode, RenameNode, FormatNode, FormatResetNode, InformatResetNode,
     LabelNode, MergeNode, ArrayNode,
     InputNode, InfileNode, SubstrAssignNode, LengthNode, AttribNode, PutNode,
@@ -288,7 +289,8 @@ class SasTransformer(Transformer):
         if (text.startswith("'") and text.endswith("'")) or (
             text.startswith('"') and text.endswith('"')
         ):
-            text = text[1:-1]
+            quote = text[0]
+            text = text[1:-1].replace(quote * 2, quote)
         return LiteralNode(value=text, literal_type="string")
 
     def null_val(self, items: list[Any]) -> LiteralNode:
@@ -347,9 +349,15 @@ class SasTransformer(Transformer):
                 break
         return FunctionCallNode(name=name.upper(), args=args)
 
+    def presentation_stmt(self, items: list[Any]) -> None:
+        return None
+
     def func_args(self, items: list[Any]) -> list[Any]:
         return [item for item in items
                 if item is not None and not isinstance(item, Token)]
+
+    def omitted_func_arg(self, items: list[Any]) -> LiteralNode:
+        return LiteralNode(value="", literal_type="string")
 
     def star_arg(self, items: list[Any]) -> LiteralNode:
         return LiteralNode(value="*", literal_type="string")
@@ -618,7 +626,7 @@ class SasTransformer(Transformer):
         return ByNode(variables=names)
 
     def array_stmt(self, items: list[Any]) -> ArrayNode:
-        # ARRAY name[size] / name{size} [var_list] [(init_values)]
+        # ARRAY name[size] / name{size} / name(size) [var_list] [(init_values)]
         name = ""
         size = None
         variables: list[str] = []
@@ -635,10 +643,10 @@ class SasTransformer(Transformer):
                 if not name and getattr(item, "type", "") == "NAME":
                     name = t
                     continue
-                if t in ("[", "{"):
+                if t in ("[", "{", "("):
                     in_bounds = True
                     continue
-                if t in ("]", "}"):
+                if t in ("]", "}", ")"):
                     in_bounds = False
                     continue
                 if t == "$":
@@ -995,14 +1003,14 @@ class SasTransformer(Transformer):
         return AssignNode(target=target, expr=expr)
 
     def arr_assign_stmt(self, items: list[Any]) -> Any:
-        """arr[index] / arr{index} = expr;"""
+        """arr[index] / arr{index} / arr(index) = expr;"""
         from saslite.ast.data_step import ArrayAssignNode
         name = ""
         exprs: list[Any] = []
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
-                if t in ("[", "]", "{", "}", "="):
+                if t in ("[", "]", "{", "}", "(", ")", "="):
                     continue
                 if not name:
                     name = t.upper()
@@ -1113,6 +1121,30 @@ class SasTransformer(Transformer):
         non_tok = _non_tokens(items)
         condition = non_tok[0] if non_tok else None
         return IfNode(condition=condition, then_stmt=None, else_stmt=None)
+
+    def do_over_block(self, items: list[Any]) -> DoNode:
+        """Lower implicit-array iteration to indexed array access."""
+        from saslite.ast.data_step import ArrayAssignNode
+        name = next(str(item).upper() for item in items
+                    if isinstance(item, Token) and item.type == "NAME")
+        index = VariableNode(name="_I_")
+
+        def lower(value: Any) -> Any:
+            if isinstance(value, VariableNode) and value.name.upper() == name:
+                return ArrayRefNode(name=name, index=index, span=value.span)
+            if isinstance(value, AssignNode) and value.target.upper() == name:
+                return ArrayAssignNode(array_name=name, index=index,
+                                       expr=lower(value.expr), span=value.span)
+            if isinstance(value, Node):
+                return replace(value, **{f.name: lower(getattr(value, f.name))
+                                         for f in fields(value) if f.name != "span"})
+            if isinstance(value, list):
+                return [lower(item) for item in value]
+            return value
+
+        return DoNode(var="_I_", start=LiteralNode(value=1, literal_type="number"),
+                      end=FunctionCallNode(name="DIM", args=[VariableNode(name=name)]),
+                      body=[lower(item) for item in items if isinstance(item, Node)])
 
     def do_block(self, items: list[Any]) -> DoNode:
         # Parse iterative/while/until/simple DO blocks
@@ -1226,6 +1258,9 @@ class SasTransformer(Transformer):
 
     def stop_stmt(self, items: list[Any]) -> StopNode:
         return StopNode()
+
+    def abort_cancel_stmt(self, items: list[Any]) -> AbortCancelNode:
+        return AbortCancelNode()
 
     def retain_stmt(self, items: list[Any]) -> RetainNode:
         items_list = _non_tokens(items)
@@ -2235,7 +2270,7 @@ class SasTransformer(Transformer):
             return {}
         key_token = items[0]
         key = _get_text(key_token).upper()
-        if key in ("DATA", "OUT"):
+        if key in ("DATA", "OUT", "DUPOUT"):
             val_items = _non_tokens(items)
             if val_items:
                 val = val_items[0]
@@ -2510,6 +2545,15 @@ class SasTransformer(Transformer):
         names = [str(item).upper() for item in items
                  if isinstance(item, Token) and str(item) != "="]
         return {names[0]: names[1]} if len(names) >= 2 else {}
+
+    def lifetest_alpha_opt(self, items: list[Any]) -> dict[str, Any]:
+        value = next(item for item in items
+                     if isinstance(item, Token) and item.type == "NUMBER")
+        return {"ALPHA": float(str(value))}
+
+    def lifetest_by_stmt(self, items: list[Any]) -> dict[str, Any]:
+        variables = next((item for item in items if isinstance(item, list)), [])
+        return {"BY": [str(name).upper() for name in variables]}
 
     def lifetest_flag_opt(self, items: list[Any]) -> dict[str, Any]:
         name = next((str(item).upper() for item in items if isinstance(item, Token)), "")
@@ -3381,7 +3425,7 @@ class SasTransformer(Transformer):
             elif keyword == "OUTPUT":
                 out_name = ""
                 out_options: list[dict[str, Any]] = []
-                stats: dict[str, str] = {}
+                stats: dict[str, list[str]] = {}
                 for item in items[1:]:
                     if isinstance(item, Token):
                         continue
@@ -3395,7 +3439,7 @@ class SasTransformer(Transformer):
                         )
                         out_options = item.options
                     elif isinstance(item, tuple) and len(item) == 2:
-                        stats[item[0].upper()] = item[1].upper()
+                        stats[item[0].upper()] = [name.upper() for name in item[1]]
                 return {
                     "action": "means_output",
                     "out": out_name,
@@ -3404,12 +3448,12 @@ class SasTransformer(Transformer):
                 }
         return first if not isinstance(first, Token) else None
 
-    def means_output_kv(self, items: list[Any]) -> tuple[str, str]:
-        """STAT=newname pair in PROC MEANS OUTPUT statement."""
+    def means_output_kv(self, items: list[Any]) -> tuple[str, list[str]]:
+        """STAT=name1 name2 ... in PROC MEANS OUTPUT, in VAR order."""
         names = [str(t) for t in items if isinstance(t, Token) and str(t) != "="]
         if len(names) >= 2:
-            return (names[0], names[1])
-        return ("", "")
+            return (names[0], names[1:])
+        return ("", [])
 
     def distinct_arg(self, items: list[Any]) -> Any:
         """DISTINCT expr inside an aggregate — mark with a wrapper call."""
@@ -3418,9 +3462,6 @@ class SasTransformer(Transformer):
             if not isinstance(item, Token):
                 inner = item
         return FunctionCallNode(name="_DISTINCT_", args=[inner])
-
-    def import_stmt(self, items: list[Any]) -> Any:
-        return items[0] if items else None
 
     def export_stmt(self, items: list[Any]) -> Any:
         for item in items:
@@ -3506,6 +3547,10 @@ class SasTransformer(Transformer):
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
+                # LENGTH accepts a trailing period after the width. It is
+                # punctuation, not a variable name that replaces the target.
+                if t == ".":
+                    continue
                 if t.upper() == "LENGTH":
                     continue
                 if t == "$":
@@ -3592,8 +3637,7 @@ class SasTransformer(Transformer):
             val = val.strip("'\"")
             return ("LABEL", val)
         elif keyword == "LENGTH":
-            val = _get_text(non_keyword[0]) if non_keyword else ""
-            return ("LENGTH", val)
+            return ("LENGTH", "".join(_get_text(item) for item in non_keyword))
         elif keyword == "INFORMAT":
             val = _get_name(non_keyword[0]) if non_keyword else ""
             return ("INFORMAT", val)
@@ -3791,6 +3835,9 @@ class SasTransformer(Transformer):
 
     def ds_nolist_opt(self, items: list[Any]) -> dict[str, Any]:
         return {"NOLIST": True}
+
+    def ds_nodetails_opt(self, items: list[Any]) -> dict[str, Any]:
+        return {"NODETAILS": True}
 
     def ds_kill_opt(self, items: list[Any]) -> dict[str, Any]:
         return {"KILL": True}
@@ -4107,8 +4154,46 @@ class SasTransformer(Transformer):
             return result
         return option
 
+    def report_column_list(self, items: list[Any]) -> list[Any]:
+        result = []
+        for item in items:
+            if isinstance(item, list):
+                result.extend(item)
+            else:
+                result.append(item)
+        return result
+
+    def report_column_alias(self, items: list[Any]) -> tuple[str, str]:
+        names = [str(item) for item in items if isinstance(item, Token) and item.type == "NAME"]
+        return (names[0], names[1])
+
+    def report_column_group(self, items: list[Any]) -> list[Any]:
+        return next(item for item in items if isinstance(item, list))
+
+    def report_compute(self, items: list[Any]) -> dict[str, Any]:
+        return {"action": "compute"}
+
+    def report_computed_attr(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item).upper() for item in items if isinstance(item, Token)]
+        if tokens[0] in {"CHARACTER", "CHAR"}:
+            return {"dtype": "character"}
+        return {"length": int(float(tokens[-1]))}
+
+    def report_computed(self, items: list[Any]) -> dict[str, Any]:
+        name = next(str(item).upper() for item in items
+                    if isinstance(item, Token) and item.type == "NAME")
+        result = {"action": "computed", "name": name, "dtype": "numeric", "length": 8,
+                  "assignments": [item for item in items if isinstance(item, AssignNode)]}
+        for item in items:
+            if isinstance(item, dict):
+                result.update(item)
+        return result
+
     def report_column(self, items: list[Any]) -> dict[str, Any]:
-        return {"action": "column", "names": self._stmt_names(items)}
+        columns = next((item for item in items if isinstance(item, list)), [])
+        return {"action": "column",
+                "names": [item[1] if isinstance(item, tuple) else str(item) for item in columns],
+                "aliases": [item for item in columns if isinstance(item, tuple)]}
 
     def report_define(self, items: list[Any]) -> dict[str, Any]:
         name = ""
