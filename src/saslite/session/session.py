@@ -73,8 +73,10 @@ class Session:
             "FIRSTOBS": 1,
             "OBS": None,
             "MISSING": ".",
-            "NODATE": False,
-            "NONUMBER": False,
+            "DATE": True,
+            "NUMBER": True,
+            "NOTES": True,
+            "SOURCE": True,
             "MPRINT": False,
             "SYMBOLGEN": False,
             "MLOGIC": False,
@@ -82,6 +84,7 @@ class Session:
             # diagnostics use this codec and preserve the full Python value.
             "ENCODING": "utf-8",
         }
+        self._default_options = self._options.copy()
         self._debug_output: list[str] = []
         # Automatic macro variables
         global_scope = self._macro_stack[0]
@@ -199,10 +202,51 @@ class Session:
         return self.macro_scope.resolve_var(name)
 
     def get_option(self, name: str, default: Any = None) -> Any:
-        return self._options.get(name.upper(), default)
+        key = self._option_name(name)
+        if key.startswith("NO") and isinstance(self._options.get(key[2:]), bool):
+            return not self._options[key[2:]]
+        return self._options.get(key, default)
 
     def set_option(self, name: str, value: Any) -> None:
-        self._options[name.upper()] = value
+        key = self._option_name(name)
+        if key.startswith("NO") and key not in self._options and isinstance(value, bool):
+            key, value = key[2:], not value
+        self._options[key] = value
+
+    @staticmethod
+    def _option_name(name: str) -> str:
+        key = str(name).strip().upper()
+        return {"LS": "LINESIZE", "PS": "PAGESIZE"}.get(key, key)
+
+    def option_text(self, name: Any, *modifiers: Any) -> str:
+        """Return a SAS GETOPTION value, optionally suitable for OPTIONS."""
+        requested = str(name).strip().upper()
+        key = self._option_name(requested)
+        flags = {str(modifier).strip().upper() for modifier in modifiers}
+        supported = {"", "KEYWORD", "DEFAULTVALUE", "STARTUPVALUE"}
+        if flags - supported:
+            unknown = ", ".join(sorted(flags - supported))
+            raise ValueError(f"Unsupported GETOPTION modifier: {unknown}")
+        options = (
+            self._default_options
+            if flags & {"DEFAULTVALUE", "STARTUPVALUE"}
+            else self._options
+        )
+        if key.startswith("NO") and isinstance(options.get(key[2:]), bool):
+            key = key[2:]
+        if key not in options:
+            raise ValueError(f"Unknown system option: {requested}")
+        value = options[key]
+        if isinstance(value, bool):
+            return key if value else f"NO{key}"
+        text = "MAX" if key == "OBS" and value is None else str(value if value is not None else "")
+        if "KEYWORD" in flags:
+            if not text:
+                text = "' '"
+            elif isinstance(value, str):
+                text = "'" + text.replace("'", "''") + "'"
+            return f"{requested}={text}"
+        return text
 
     def get_dataset(self, libref: str, name: str) -> Dataset:
         libref_upper = libref.upper()

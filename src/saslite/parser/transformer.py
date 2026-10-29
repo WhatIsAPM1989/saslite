@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import fields, replace
 from typing import Any
 
 from lark import Transformer, Token, Tree
@@ -16,7 +17,7 @@ from saslite.ast.expressions import (
 from saslite.ast.program import ProgramNode, FilenameNode, LibnameNode, OptionsNode
 from saslite.ast.data_step import (
     DataStepNode, SetNode, DatasetRefNode, AssignNode, IfNode, DoNode,
-    OutputNode, DeleteNode, StopNode, RetainNode, WhereNode, KeepNode,
+    OutputNode, DeleteNode, StopNode, AbortCancelNode, RetainNode, WhereNode, KeepNode,
     DropNode, RenameNode, FormatNode, FormatResetNode, InformatResetNode,
     LabelNode, MergeNode, ArrayNode,
     InputNode, InfileNode, SubstrAssignNode, LengthNode, AttribNode, PutNode,
@@ -288,7 +289,8 @@ class SasTransformer(Transformer):
         if (text.startswith("'") and text.endswith("'")) or (
             text.startswith('"') and text.endswith('"')
         ):
-            text = text[1:-1]
+            quote = text[0]
+            text = text[1:-1].replace(quote * 2, quote)
         return LiteralNode(value=text, literal_type="string")
 
     def null_val(self, items: list[Any]) -> LiteralNode:
@@ -1120,6 +1122,30 @@ class SasTransformer(Transformer):
         condition = non_tok[0] if non_tok else None
         return IfNode(condition=condition, then_stmt=None, else_stmt=None)
 
+    def do_over_block(self, items: list[Any]) -> DoNode:
+        """Lower implicit-array iteration to indexed array access."""
+        from saslite.ast.data_step import ArrayAssignNode
+        name = next(str(item).upper() for item in items
+                    if isinstance(item, Token) and item.type == "NAME")
+        index = VariableNode(name="_I_")
+
+        def lower(value: Any) -> Any:
+            if isinstance(value, VariableNode) and value.name.upper() == name:
+                return ArrayRefNode(name=name, index=index, span=value.span)
+            if isinstance(value, AssignNode) and value.target.upper() == name:
+                return ArrayAssignNode(array_name=name, index=index,
+                                       expr=lower(value.expr), span=value.span)
+            if isinstance(value, Node):
+                return replace(value, **{f.name: lower(getattr(value, f.name))
+                                         for f in fields(value) if f.name != "span"})
+            if isinstance(value, list):
+                return [lower(item) for item in value]
+            return value
+
+        return DoNode(var="_I_", start=LiteralNode(value=1, literal_type="number"),
+                      end=FunctionCallNode(name="DIM", args=[VariableNode(name=name)]),
+                      body=[lower(item) for item in items if isinstance(item, Node)])
+
     def do_block(self, items: list[Any]) -> DoNode:
         # Parse iterative/while/until/simple DO blocks
         # Filter out keyword/punctuation tokens from body
@@ -1232,6 +1258,9 @@ class SasTransformer(Transformer):
 
     def stop_stmt(self, items: list[Any]) -> StopNode:
         return StopNode()
+
+    def abort_cancel_stmt(self, items: list[Any]) -> AbortCancelNode:
+        return AbortCancelNode()
 
     def retain_stmt(self, items: list[Any]) -> RetainNode:
         items_list = _non_tokens(items)
@@ -2517,6 +2546,15 @@ class SasTransformer(Transformer):
                  if isinstance(item, Token) and str(item) != "="]
         return {names[0]: names[1]} if len(names) >= 2 else {}
 
+    def lifetest_alpha_opt(self, items: list[Any]) -> dict[str, Any]:
+        value = next(item for item in items
+                     if isinstance(item, Token) and item.type == "NUMBER")
+        return {"ALPHA": float(str(value))}
+
+    def lifetest_by_stmt(self, items: list[Any]) -> dict[str, Any]:
+        variables = next((item for item in items if isinstance(item, list)), [])
+        return {"BY": [str(name).upper() for name in variables]}
+
     def lifetest_flag_opt(self, items: list[Any]) -> dict[str, Any]:
         name = next((str(item).upper() for item in items if isinstance(item, Token)), "")
         return {name: True} if name else {}
@@ -3425,9 +3463,6 @@ class SasTransformer(Transformer):
                 inner = item
         return FunctionCallNode(name="_DISTINCT_", args=[inner])
 
-    def import_stmt(self, items: list[Any]) -> Any:
-        return items[0] if items else None
-
     def export_stmt(self, items: list[Any]) -> Any:
         for item in items:
             if isinstance(item, DatasetRefNode):
@@ -3512,6 +3547,10 @@ class SasTransformer(Transformer):
         for item in items:
             if isinstance(item, Token):
                 t = str(item)
+                # LENGTH accepts a trailing period after the width. It is
+                # punctuation, not a variable name that replaces the target.
+                if t == ".":
+                    continue
                 if t.upper() == "LENGTH":
                     continue
                 if t == "$":
@@ -4133,6 +4172,22 @@ class SasTransformer(Transformer):
 
     def report_compute(self, items: list[Any]) -> dict[str, Any]:
         return {"action": "compute"}
+
+    def report_computed_attr(self, items: list[Any]) -> dict[str, Any]:
+        tokens = [str(item).upper() for item in items if isinstance(item, Token)]
+        if tokens[0] in {"CHARACTER", "CHAR"}:
+            return {"dtype": "character"}
+        return {"length": int(float(tokens[-1]))}
+
+    def report_computed(self, items: list[Any]) -> dict[str, Any]:
+        name = next(str(item).upper() for item in items
+                    if isinstance(item, Token) and item.type == "NAME")
+        result = {"action": "computed", "name": name, "dtype": "numeric", "length": 8,
+                  "assignments": [item for item in items if isinstance(item, AssignNode)]}
+        for item in items:
+            if isinstance(item, dict):
+                result.update(item)
+        return result
 
     def report_column(self, items: list[Any]) -> dict[str, Any]:
         columns = next((item for item in items if isinstance(item, list)), [])

@@ -48,6 +48,38 @@ run;
             ["USUBJID", "SOURCE", "SOURCE_LABEL"],
         )
 
+    def test_output_keep_and_drop_accept_prefix_lists(self) -> None:
+        for empty in (False, True):
+            with self.subTest(empty=empty):
+                sas = SasInterpreter()
+                sas.reporter.configure(quiet=True)
+                source = pd.DataFrame({
+                    "GRPX1": [1, 1], "TERMVAR1": ["Count", "Count"],
+                    "TRT": [1, 2], "VAL": ["10", "20"],
+                })
+                sas.create_dataset("source", source.iloc[:0] if empty else source)
+                result = sas.execute("""
+                    proc transpose data=source out=kept(keep=TERMVAR: GRPX: COL:) prefix=COL;
+                      by GRPX1 TERMVAR1;
+                      id TRT;
+                      var VAL;
+                    run;
+                    proc transpose data=source out=dropped(drop=_NAME_: TERMVAR:) prefix=COL;
+                      by GRPX1 TERMVAR1;
+                      id TRT;
+                      var VAL;
+                    run;
+                """)
+                self.assertTrue(result.success, result.error)
+                self.assertFalse([warning for step in result.steps for warning in step.warnings])
+                cells = [] if empty else ["COL1", "COL2"]
+                self.assertEqual(sas.get_dataset("WORK", "KEPT").columns.tolist(),
+                                 ["GRPX1", "TERMVAR1"] + cells)
+                self.assertEqual(sas.get_dataset("WORK", "DROPPED").columns.tolist(),
+                                 ["GRPX1"] + cells)
+                if not empty:
+                    self.assertEqual(sas.get_dataset("WORK", "KEPT")[cells].iloc[0].tolist(), ["10", "20"])
+
     def test_out_drop_name_option_is_applied(self) -> None:
         sas = SasInterpreter()
         result = sas.execute(

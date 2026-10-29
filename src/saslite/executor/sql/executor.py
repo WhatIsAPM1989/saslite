@@ -1428,9 +1428,9 @@ class SqlExecutor:
                                 series = series.drop_duplicates()
                             agg_result = getattr(series, pandas_agg_name)()
                         else:
-                            agg_result = None
+                            agg_result = 0 if pandas_agg_name == "count" else None
                     else:
-                        agg_result = None
+                        agg_result = 0 if pandas_agg_name == "count" else None
                     agg_results.append(agg_result)
 
                 # Add the aggregated column to result_df
@@ -2020,7 +2020,7 @@ class SqlExecutor:
                 mask.append(sas_bool(result))
             except Exception:
                 mask.append(False)
-        return pd.Series(mask, index=df.index)
+        return pd.Series(mask, index=df.index, dtype=bool)
 
     def _rewrite_agg_expr(self, expr: Any, fn_col_map: dict[tuple[str, str], str],
                           star_map: dict[str, str] | None = None) -> Any:
@@ -2512,7 +2512,17 @@ class SqlExecutor:
         # Check for SELECT *
         for col in columns:
             if isinstance(col, SelectColumnNode) and isinstance(col.expr, VariableNode) and col.expr.name == "*":
-                return df
+                # Aliases belong to the joined query's resolution map, not
+                # the output descriptor. A later DATA step must see GRPX1,
+                # for example, rather than ROWS.GRPX1 after SELECT *.
+                projected = df.rename(columns={
+                    column: str(column).split(".", 1)[-1]
+                    for column in df.columns
+                })
+                # SAS tables have one slot per logical name. Keep the first
+                # contribution when unqualified * exposes duplicate names.
+                unique = ~pd.Index([str(column).upper() for column in projected.columns]).duplicated()
+                return projected.loc[:, unique]
 
         # Check if there are any aggregate functions without GROUP BY
         has_aggregates = False
@@ -2591,7 +2601,13 @@ class SqlExecutor:
                                         else:
                                             result_row[alias] = None
                                     else:
-                                        result_row[alias] = None
+                                        # Weak-schema inputs can be empty without a
+                                        # descriptor for this column. COUNT still
+                                        # returns zero; schema diagnostics above
+                                        # retain the missing-column expectation.
+                                        result_row[alias] = (
+                                            0 if fn_name == "COUNT" and df.empty else None
+                                        )
                                 else:
                                     # Complex expression (e.g., CASE WHEN, function call)
                                     # Evaluate the expression for each row, then aggregate
@@ -2616,7 +2632,9 @@ class SqlExecutor:
                                         else:
                                             result_row[alias] = None
                                     else:
-                                        result_row[alias] = None
+                                        # COUNT(expr) returns zero when every evaluated
+                                        # value is missing, including an empty input.
+                                        result_row[alias] = 0 if fn_name == "COUNT" else None
                         else:
                             result_row[alias] = None
                         if is_missing(result_row.get(alias)) and fallback_expr is not None:

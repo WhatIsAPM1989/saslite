@@ -361,6 +361,8 @@ class SasInterpreter:
     @classmethod
     def _has_later_runtime_macro_reference(cls, source: str) -> bool:
         """Return whether a runtime-assigned macro variable is used later."""
+        if re.search(r"%Q?SYSFUNC\s*\(\s*GETOPTION\s*\(", source, re.IGNORECASE):
+            return True
         if cls._has_later_sql_into_reference(source):
             return True
 
@@ -416,6 +418,17 @@ class SasInterpreter:
 
             if not expanded.strip():
                 return RunSummary(success=True)
+
+            # An invocation can emit OPTIONS followed by a deferred GETOPTION
+            # even when the submitted source only contained the macro name.
+            if re.search(r"%Q?SYSFUNC\s*\(\s*GETOPTION\s*\(", expanded, re.IGNORECASE):
+                chunks = self._split_into_step_chunks(expanded)
+                if len(chunks) > 1:
+                    return self._execute_staged_macro_source(
+                        expanded,
+                        source_name=source_name,
+                        original_source=original_source,
+                    )
 
             # Step 2: Parse
             program = self._parser.parse(
@@ -478,12 +491,20 @@ class SasInterpreter:
             return summary
 
     @staticmethod
-    def _split_into_step_chunks(source: str) -> list[str]:
+    def _split_into_step_chunks(source: str, *, split_options: bool = True) -> list[str]:
         """Split source into chunks at top-level RUN;/QUIT; boundaries.
 
         Respects DATALINES blocks, quoted strings, and %MACRO...%MEND
         definitions so a macro body is never split.
         """
+        if split_options and re.search(
+            r"%Q?SYSFUNC\s*\(\s*GETOPTION\s*\(", source, re.IGNORECASE
+        ):
+            return [
+                chunk
+                for part in SasInterpreter._split_option_chunks(source)
+                for chunk in SasInterpreter._split_into_step_chunks(part, split_options=False)
+            ]
         import re as _re
         chunks: list[str] = []
         lines = source.split("\n")
@@ -568,6 +589,71 @@ class SasInterpreter:
 
         if current:
             chunks.append("\n".join(current))
+        return chunks
+
+    @staticmethod
+    def _split_option_chunks(source: str) -> list[str]:
+        """Expose OPTIONS boundaries before expanding later GETOPTION calls."""
+        chunks: list[str] = []
+        start = statement_start = position = 0
+        macro_depth = control_depth = 0
+        visible: list[str] = []
+        while position < len(source):
+            character = source[position]
+            if source.startswith("/*", position):
+                end = source.find("*/", position + 2)
+                position = len(source) if end < 0 else end + 2
+                visible.append(" ")
+                continue
+            if character in ("'", '"'):
+                quote = character
+                position += 1
+                while position < len(source):
+                    if source[position] == quote:
+                        position += 1
+                        if position < len(source) and source[position] == quote:
+                            position += 1
+                            continue
+                        break
+                    position += 1
+                visible.append(" ")
+                continue
+            visible.append(character)
+            position += 1
+            if character != ";":
+                continue
+            statement = "".join(visible).strip()
+            visible = []
+            if statement.startswith("*") or statement.startswith("%*"):
+                statement_start = position
+                continue
+            for token in re.findall(r"%\s*(MACRO|MEND|DO|END)\b", statement, re.IGNORECASE):
+                token = token.upper()
+                if token == "MACRO":
+                    macro_depth += 1
+                elif token == "MEND":
+                    macro_depth = max(0, macro_depth - 1)
+                elif not macro_depth:
+                    control_depth = max(0, control_depth + (1 if token == "DO" else -1))
+            if not macro_depth and not control_depth and re.match(
+                r"OPTIONS?\b", statement, re.IGNORECASE
+            ):
+                # Keep preceding macro assignments separate, so a saved value
+                # is available when OPTIONS references it in the next chunk.
+                if source[start:statement_start].strip():
+                    chunks.append(source[start:statement_start])
+                chunks.append(source[statement_start:position])
+                start = position
+            if not macro_depth and re.match(
+                r"(?:DATALINES4?|CARDS4?|LINES4)\s*;", statement, re.IGNORECASE
+            ):
+                terminator = ";;;;" if "4" in statement else ";"
+                end = re.search(rf"(?m)^\s*{terminator}\s*$", source[position:])
+                if end is not None:
+                    position += end.end()
+            statement_start = position
+        if source[start:].strip():
+            chunks.append(source[start:])
         return chunks
 
     def execute_file(

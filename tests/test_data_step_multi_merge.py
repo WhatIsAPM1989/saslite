@@ -1,6 +1,8 @@
 import math
 import unittest
 
+import pandas as pd
+
 from saslite import SasInterpreter
 
 
@@ -58,6 +60,30 @@ run;
             frame[["from_first", "from_second", "from_third"]].values.tolist(),
             [[1, 1, 1], [1, 0, 0], [0, 1, 0], [1, 1, 0]],
         )
+
+    def test_empty_merge_uses_descriptors_without_comparing_pandas_key_types(self) -> None:
+        sas = SasInterpreter()
+        sas.reporter.configure(quiet=True)
+        sas.create_dataset("first", pd.DataFrame({
+            "ID": pd.Series(dtype="object"), "left_value": pd.Series(dtype="float64"),
+        }))
+        # Empty pandas storage can be object despite a numeric SAS descriptor.
+        sas.session.get_dataset("WORK", "FIRST").metadata.get_variable("ID").dtype = "numeric"
+        sas.create_dataset("second", pd.DataFrame({
+            "ID": pd.Series(dtype="float64"), "right_value": pd.Series(dtype="float64"),
+        }))
+        result = sas.execute("""
+            data merged;
+              merge first(in=left) second(in=right);
+              by ID;
+            run;
+        """)
+        self.assertTrue(result.success, result.error)
+        self.assertFalse([warning for step in result.steps for warning in step.warnings])
+        output = sas.session.get_dataset("WORK", "MERGED")
+        self.assertEqual(output.data.shape, (0, 3))
+        self.assertEqual(output.data.columns.tolist(), ["ID", "left_value", "right_value"])
+        self.assertEqual(output.metadata.get_variable("ID").dtype, "numeric")
 
     def test_shorter_input_retains_last_row_within_by_group(self) -> None:
         sas = SasInterpreter()

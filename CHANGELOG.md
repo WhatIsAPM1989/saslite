@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.6.0 — 2026-10-29
+
+- Added implicit arrays, `DO OVER`, compile-time declarations in nested blocks,
+  DATA step `ABORT CANCEL`, and diagnostics for uninitialized declarations.
+- Added session-aware `GETOPTION`, runtime macro return handling, and percent
+  escapes in macro quoting.
+- Fixed SQL counts and HAVING on empty inputs, joined wildcard column names,
+  and numeric metadata propagation.
+- Expanded PROC TRANSPOSE prefix and output options, PROC IMPORT DATAROW,
+  PROC REPORT computed columns, and PROC LIFETEST BY groups, ALPHA, and empty
+  output descriptors.
+- Added GitHub issue and PR templates and agent workflow instructions.
+
 - Accept omitted function arguments, character ATTRIB lengths, PROC SORT
   DUPOUT=, and the PROC FREQ LIST option.
 - Evaluate unaliased SQL expressions, including dictionary.columns SELECT INTO.

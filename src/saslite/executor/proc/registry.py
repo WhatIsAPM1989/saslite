@@ -1474,12 +1474,25 @@ def handle_proc_import(proc: ProcNode, session: Session, reporter: Reporter) -> 
         if not os.path.isabs(filepath):
             filepath = os.path.abspath(filepath)
 
+        # DATAROW is a one-based source row. With GETNAMES=YES the first
+        # row still supplies names; skip intervening rows, not that header.
+        datarow = float(proc.options.get("DATAROW", 2 if getnames else 1))
+        minimum = 2 if getnames else 1
+        if not datarow.is_integer() or datarow < minimum:
+            return StepResult(
+                success=False,
+                error=f"DATAROW must be an integer >= {minimum} with "
+                      f"GETNAMES={'YES' if getnames else 'NO'}",
+            )
+        first_data_row = int(datarow)
+        skiprows = range(1, first_data_row - 1) if getnames else first_data_row - 1
+        header = 0 if getnames else None
+
         if dbms == "csv" or dbms == "dlm" or dbms == "tab":
             sep = delimiter if dbms != "tab" else "\t"
-            header = 0 if getnames else None
-            df = pd.read_csv(filepath, sep=sep, header=header)
+            df = pd.read_csv(filepath, sep=sep, header=header, skiprows=skiprows)
         elif dbms == "xlsx" or dbms == "excel":
-            df = pd.read_excel(filepath, header=0 if getnames else None)
+            df = pd.read_excel(filepath, header=header, skiprows=skiprows)
         else:
             return StepResult(success=False, error=f"Unsupported DBMS type: {dbms}")
 

@@ -297,6 +297,8 @@ class ExpressionEvaluator:
             raise ExecutionError(f"DIM: array not found")
 
         fn = self._stateful_functions.get(name) or self._functions.get(name)
+        if name == "GETOPTION" and self._session is not None:
+            fn = self._session.option_text
         if fn is None:
             raise ExecutionError(f"Unknown function: {name}")
         args = []

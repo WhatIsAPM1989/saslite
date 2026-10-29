@@ -27,6 +27,25 @@ run;
         self.assertEqual(metadata.format, "$12.")
         self.assertEqual(metadata.length, 12)
 
+    def test_attrib_all_clears_labels_without_creating_a_variable(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute("""
+            data source;
+              length text $20; text='A'; value=1;
+              label text='Text label' value='Numeric label';
+            run;
+            data copied;
+              set source;
+              attrib _all_ label='';
+            run;
+        """)
+        self.assertTrue(result.success, result.error)
+        self.assertFalse([w for step in result.steps for w in step.warnings])
+        ds = sas.session.get_dataset('WORK', 'COPIED')
+        self.assertEqual(list(ds.data.columns), ['text', 'value'])
+        self.assertEqual(ds.metadata.get_variable('TEXT').label, '')
+        self.assertEqual(ds.metadata.get_variable('VALUE').label, '')
+
     def test_format_and_informat_all_clear_inherited_attributes(self) -> None:
         sas = SasInterpreter()
         result = sas.execute(

@@ -153,7 +153,10 @@ def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) 
                 row[label_col] = metadata.label if metadata and metadata.label else vc
             if id_cols:
                 for _, src in block.iterrows():
-                    col_label = _transpose_id_name([src[column] for column in id_cols])
+                    id_values = [src[column] for column in id_cols]
+                    if "PREFIX" in proc.options:
+                        id_values.insert(0, prefix)
+                    col_label = _transpose_id_name(id_values)
                     row[col_label] = src[vc]
             else:
                 for j, (_, src) in enumerate(block.iterrows(), 1):
@@ -191,6 +194,12 @@ def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) 
 
     out_libref, out_member = _split_name(out_name) if out_name else _split_name(data_name)
     out_ds = Dataset.from_dataframe(result, name=out_member, libref=out_libref)
+
+    def matches_name_list(column, specifications):
+        logical = str(column).upper()
+        return any(logical.startswith(spec[:-1]) if spec.endswith(":") else logical == spec
+                   for spec in specifications)
+
     for option in out_options:
         if not isinstance(option, dict):
             continue
@@ -198,13 +207,13 @@ def handle_proc_transpose(proc: ProcNode, session: Session, reporter: Reporter) 
             keep = {str(column).upper() for column in option["KEEP"]}
             out_ds = out_ds.select_columns([
                 column for column in out_ds.data.columns
-                if str(column).upper() in keep
+                if matches_name_list(column, keep)
             ])
         if "DROP" in option:
             drop = {str(column).upper() for column in option["DROP"]}
             out_ds = out_ds.select_columns([
                 column for column in out_ds.data.columns
-                if str(column).upper() not in drop
+                if not matches_name_list(column, drop)
             ])
         if "RENAME" in option:
             out_ds = out_ds.rename_columns(option["RENAME"])
@@ -871,6 +880,27 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
     if not columns:
         columns = [c.upper() for c in df.columns]
 
+    computed_blocks = {
+        stmt["name"]: stmt for stmt in proc.statements
+        if isinstance(stmt, dict) and stmt.get("action") == "computed"
+    }
+    computed_columns = {
+        name: computed_blocks.get(name, {
+            "name": name, "dtype": "numeric", "length": 8, "assignments": [],
+        })
+        for name, definition in defines.items()
+        if "COMPUTED" in definition.get("attrs", [])
+    }
+    for name in computed_blocks:
+        if name not in computed_columns:
+            return StepResult(success=False, error=f"PROC REPORT: {name} is not defined as COMPUTED")
+    for name, block in computed_columns.items():
+        if block["length"] < 1 or block["length"] > 32767:
+            return StepResult(success=False, error=f"PROC REPORT: invalid computed LENGTH for {name}")
+        df[name] = pd.Series("" if block["dtype"] == "character" else float("nan"),
+                             index=df.index, dtype=object if block["dtype"] == "character" else float)
+        cmap[name] = name
+
     actual_cols = [cmap[c] for c in columns if c in cmap]
     if not actual_cols:
         return StepResult(success=False, error="PROC REPORT: no valid columns")
@@ -954,6 +984,32 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
         else:
             report_df = pd.concat([report_df, summary_frame], ignore_index=True)
 
+    # Compute report values after grouping, in COLUMN order. Values are
+    # materialized in OUT= as well as in listing/RTF destinations.
+    if computed_columns:
+        registry = build_default_registry()
+        for index, row in report_df.iterrows():
+            values = {str(name).upper(): value for name, value in row.items()}
+            evaluator = ExpressionEvaluator(var_getter=lambda name: values.get(name.upper()), session=session)
+            for function_name in registry.names:
+                function = registry.get(function_name)
+                if function is not None:
+                    evaluator.register_function(function_name, function)
+            for name in columns:
+                block = computed_columns.get(name)
+                if block is None:
+                    continue
+                for assignment in block["assignments"]:
+                    target = assignment.target.upper()
+                    if target != name:
+                        return StepResult(success=False, error=
+                            f"PROC REPORT: COMPUTE {name} assignments to {target} are not supported")
+                    value = evaluator.evaluate(assignment.expr)
+                    if block["dtype"] == "character":
+                        value = "" if value is None else str(value)[:block["length"]]
+                    values[target] = value
+                report_df.at[index, name] = values.get(name)
+
     # Apply presentation attributes from DEFINE. NOPRINT columns still take
     # part in grouping/ordering but are excluded from LST and RTF output.
     hidden_columns = {
@@ -1017,6 +1073,11 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
     if out_name:
         out_libref, out_member = _split_name(out_name)
         out_ds = Dataset.from_dataframe(report_df, name=out_member, libref=out_libref)
+        for name, block in computed_columns.items():
+            variable = out_ds.metadata.get_variable(name)
+            if variable is not None:
+                variable.dtype = block["dtype"]
+                variable.length = block["length"]
         session.put_dataset(out_libref, out_member, out_ds)
 
     write_output_tables(session, {"REPORT": report_df}, proc=proc)

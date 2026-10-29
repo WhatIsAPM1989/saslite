@@ -108,9 +108,9 @@ run;
         )
 
         self.assertTrue(result.success, result.error)
-        warnings = result.steps[-1].warnings
-        self.assertFalse(any("V1 is uninitialized" in warning for warning in warnings))
-        self.assertTrue(any("V2 is uninitialized" in warning for warning in warnings))
+        warnings = [warning.casefold() for warning in result.steps[-1].warnings]
+        self.assertFalse(any("v1 is uninitialized" in warning for warning in warnings))
+        self.assertTrue(any("v2 is uninitialized" in warning for warning in warnings))
 
     def test_curly_braces_are_accepted_for_array_subscripts(self) -> None:
         sas = SasInterpreter()

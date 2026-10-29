@@ -28,6 +28,10 @@ class MacroExpander:
     _QUOTED_PERCENT = "\ue001"
     _QUOTED_COMMA = "\ue002"
     _QUOTED_SEMICOLON = "\ue003"
+    _QUOTED_SINGLE_QUOTE = "\ue004"
+    _QUOTED_DOUBLE_QUOTE = "\ue005"
+    _QUOTED_LEFT_PAREN = "\ue006"
+    _QUOTED_RIGHT_PAREN = "\ue007"
     _MACRO_SCOPE_KEYWORDS = (
         # Modern SAS accepts %IF with a following %DO/%END group in open code.
         # Only the following statements inherently require a macro-local
@@ -184,7 +188,7 @@ class MacroExpander:
         # Step 10: Final &var substitution pass
         source = self._substitute_vars(source)
 
-        return self._unquote_macro_value(source)
+        return self._emit_macro_source(source)
 
     def _remove_comments(self, source: str) -> str:
         """Remove /* ... */ block comments, %* ... ; macro comments, and
@@ -567,6 +571,8 @@ class MacroExpander:
         if_match = re.search(r"%\s*IF\b", masked, flags=re.IGNORECASE)
         if if_match is None:
             return source
+        if if_match.start() >= self._pending_option_boundary(source, masked):
+            return source
         invocation = self._next_user_macro_invocation(source)
         if invocation is not None and invocation < if_match.start():
             return source
@@ -868,16 +874,70 @@ class MacroExpander:
             source = expanded
         return source
 
-    @staticmethod
-    def _apply_return_goto(body: str) -> str:
+    def _lower_conditional_returns(self, body: str) -> str:
+        """Keep runtime-dependent RETURN branches structurally balanced.
+
+        A SELECT INTO condition can remain unresolved during invocation. Move
+        its continuation into both branches before applying RETURN, so staged
+        expansion can choose a branch after SQL executes. This also keeps the
+        return confined to its own invocation rather than the caller's tail.
+        """
+        masked = self._mask_quoted_text(body)
+        return_re = re.compile(r"%\s*RETURN\s*;", re.IGNORECASE)
+        if not return_re.search(masked):
+            return body
+        scan_at = 0
+        while True:
+            conditional = re.search(r"%\s*IF\b", masked[scan_at:], re.IGNORECASE)
+            if conditional is None:
+                return body
+            start = scan_at + conditional.start()
+            condition_start = scan_at + conditional.end()
+            then = re.search(r"%\s*THEN\b", masked[condition_start:], re.IGNORECASE)
+            if then is None:
+                return body
+            then_start = condition_start + then.start()
+            then_end = condition_start + then.end()
+            then_body, branch_end = self._parse_macro_conditional_branch(
+                body, masked, then_end
+            )
+            end = self._macro_conditional_end(body, masked, start)
+            if not return_re.search(masked[start:end]):
+                scan_at = end
+                continue
+            else_body = ""
+            else_at = self._skip_whitespace(masked, branch_end)
+            else_match = re.match(r"%\s*ELSE\b", masked[else_at:], re.IGNORECASE)
+            if else_match is not None:
+                else_start = self._skip_whitespace(masked, else_at + else_match.end())
+                if re.match(r"%\s*IF\b", masked[else_start:], re.IGNORECASE):
+                    else_body = body[else_start:end]
+                else:
+                    else_body, _ = self._parse_macro_conditional_branch(
+                        body, masked, else_start
+                    )
+            tail = body[end:]
+            then_body = self._apply_return_goto(then_body + tail)
+            else_body = self._apply_return_goto(else_body + tail)
+            condition = body[condition_start:then_start]
+            return (
+                body[:start]
+                + f"%if {condition} %then %do;\n{then_body}\n%end;"
+                + f"%else %do;\n{else_body}\n%end;"
+            )
+
+    def _apply_return_goto(self, body: str) -> str:
         """Apply %RETURN and %GOTO/%label semantics to an expanded macro body.
 
         %RETURN; truncates the rest of the body. %GOTO name; skips forward
         to the matching %name: label (backward jumps are ignored to avoid
         infinite loops). Remaining label markers are removed.
         """
-        # %RETURN — truncate
-        m = re.search(r"%\s*RETURN\s*;", body, flags=re.IGNORECASE)
+        body = self._lower_conditional_returns(body)
+        # Only an unconditional RETURN may truncate this expansion pass.
+        m = re.search(
+            r"%\s*RETURN\s*;", self._mask_quoted_text(body), flags=re.IGNORECASE
+        )
         if m:
             body = body[:m.start()]
 
@@ -949,6 +1009,9 @@ class MacroExpander:
             if macro_name in skip_keywords or macro_name not in self._macros:
                 search_at = name_end
                 continue
+
+            if start >= self._pending_option_boundary(source, masked):
+                return source
 
             position = name_end
             while position < len(source) and source[position] in " \t\r":
@@ -1093,7 +1156,18 @@ class MacroExpander:
             value_start = search_at + head.end()
             depth = 0
             position = value_start
+            quoting_heads = re.compile(
+                r"%\s*(STR|NRSTR|QUOTE|NRQUOTE)\s*\(", re.IGNORECASE
+            )
             while position < len(prefix):
+                # Percent-marked parentheses in a quoting argument must not
+                # change the enclosing %LET's semicolon boundary.
+                quoting_head = quoting_heads.match(prefix, position)
+                if quoting_head is not None:
+                    quoting_end = self._macro_function_end(prefix, quoting_head, quoting_heads)
+                    if quoting_end is not None:
+                        position = quoting_end
+                        continue
                 character = prefix[position]
                 if character == "(":
                     depth += 1
@@ -1222,7 +1296,7 @@ class MacroExpander:
     def _macro_execution_boundary(self, source: str) -> int:
         """Return the next conditional or user-macro call in open text."""
         masked = self._mask_quoted_text(source)
-        positions: list[int] = []
+        positions: list[int] = [self._pending_option_boundary(source, masked)]
         conditional = re.search(r"%\s*(?:IF|DO)\b", masked, flags=re.IGNORECASE)
         if conditional is not None:
             positions.append(conditional.start())
@@ -1230,6 +1304,18 @@ class MacroExpander:
         if invocation is not None:
             positions.append(invocation)
         return min(positions) if positions else len(source)
+
+    @staticmethod
+    def _pending_option_boundary(source: str, masked: str) -> int:
+        """Leave macro reads after OPTIONS for the interpreter's staged pass."""
+        for match in re.finditer(r"(?:^|;)\s*OPTIONS?\b[^;]*;", masked, re.IGNORECASE):
+            if re.search(
+                r"%Q?SYSFUNC\s*\(\s*GETOPTION\s*\(",
+                source[match.end():],
+                re.IGNORECASE,
+            ):
+                return match.end()
+        return len(source)
 
     def _next_user_macro_invocation(self, source: str) -> int | None:
         masked = self._mask_quoted_text(source)
@@ -1359,6 +1445,8 @@ class MacroExpander:
             for match in (conditional_head, iterative_head)
             if match is not None
         ]
+        if loop_positions and min(loop_positions) >= self._pending_option_boundary(source, masked):
+            return source
         invocation = self._next_user_macro_invocation(source)
         if invocation is not None and loop_positions and invocation < min(loop_positions):
             return source
@@ -1533,7 +1621,7 @@ class MacroExpander:
             source = self._process_conditionals(source)
             source = self._process_put_statements(source)
             source = self._substitute_vars(source)
-            return self._unquote_macro_value(source)
+            return self._emit_macro_source(source)
         finally:
             for name, value in saved_local.items():
                 if value is not missing and name not in self._local_vars:
@@ -1623,29 +1711,9 @@ class MacroExpander:
                 result.append(source[pos:])
                 break
             func = m.group(1).upper()
-            # Find the balanced closing paren
-            depth = 1
-            quote: str | None = None
-            i = m.end()
-            while i < n and depth > 0:
-                character = source[i]
-                if quote is not None:
-                    if character == quote:
-                        if i + 1 < n and source[i + 1] == quote:
-                            i += 2
-                            continue
-                        quote = None
-                    i += 1
-                    continue
-                if character in ("'", '"'):
-                    quote = character
-                elif character == "(":
-                    depth += 1
-                elif character == ")":
-                    depth -= 1
-                i += 1
-            if depth != 0:
-                # Unbalanced — leave the rest untouched
+            i = self._macro_function_end(source, m, head_re)
+            if i is None:
+                # Leave unresolved non-quoting functions for a later pass.
                 result.append(source[pos:])
                 break
             raw_args = source[m.end():i - 1]
@@ -1666,6 +1734,53 @@ class MacroExpander:
             pos = i
         return "".join(result)
 
+    def _macro_function_end(
+        self, source: str, head: re.Match, head_re: re.Pattern,
+    ) -> int | None:
+        """Find a function's closing parenthesis without consuming marked ones."""
+        function = head.group(1).upper()
+        static_quoting = function in {"STR", "NRSTR", "QUOTE", "NRQUOTE"}
+        depth = 1
+        quote = None
+        position = head.end()
+        while position < len(source):
+            character = source[position]
+            if quote is None:
+                nested = head_re.match(source, position)
+                if nested is not None:
+                    nested_end = self._macro_function_end(source, nested, head_re)
+                    if nested_end is None:
+                        return None
+                    position = nested_end
+                    continue
+            if (static_quoting and quote != "'" and character == "%"
+                    and position + 1 < len(source)
+                    and source[position + 1] in "%'\"()"):
+                position += 2
+                continue
+            if quote is not None:
+                if character == quote:
+                    if position + 1 < len(source) and source[position + 1] == quote:
+                        position += 2
+                        continue
+                    quote = None
+            elif character in ("'", '"'):
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    return position + 1
+            position += 1
+        if static_quoting:
+            raise SyntaxError(
+                f"Unclosed %{function} argument. A percent sign before a quote "
+                "or parenthesis marks that delimiter. Use %% for a literal "
+                "percent sign before a closing double quotation mark."
+            )
+        return None
+
     def _eval_macro_function(self, func: str, raw_args: str) -> str | None:
         """Evaluate one macro character function call.
 
@@ -1682,7 +1797,7 @@ class MacroExpander:
             return self._quote_all_macro_triggers(value)
 
         if func in ("STR", "NRSTR"):
-            value = self._quote_macro_punctuation(raw_args)
+            value = self._quote_macro_punctuation(self._mark_macro_escapes(raw_args))
             return self._quote_macro_value(value) if func == "NRSTR" else value
 
         if func == "UNQUOTE":
@@ -1702,6 +1817,8 @@ class MacroExpander:
             return None
 
         if func in ("QUOTE", "BQUOTE", "NRQUOTE", "NRBQUOTE"):
+            if func in ("QUOTE", "NRQUOTE"):
+                raw_args = self._mark_macro_escapes(raw_args)
             value = self._quote_macro_punctuation(raw_args)
             if func.startswith("NR"):
                 value = self._quote_macro_value(value)
@@ -1788,6 +1905,70 @@ class MacroExpander:
         return ""
 
     @classmethod
+    def _mark_macro_escapes(cls, value: str) -> str:
+        """Consume compile-time percent markers, except in single-quoted text.
+
+        Keep marked quotes distinct from string delimiters until emission or
+        explicit %UNQUOTE. Dropping the percent and immediately making the
+        quote ordinary would silently turn the invalid WHERE into a
+        valid comparison against the wrong (percent-less) value.
+        """
+        escapes = {"%": cls._QUOTED_PERCENT, "'": cls._QUOTED_SINGLE_QUOTE,
+                   '"': cls._QUOTED_DOUBLE_QUOTE, "(": cls._QUOTED_LEFT_PAREN,
+                   ")": cls._QUOTED_RIGHT_PAREN}
+        result = []
+        quote = None
+        position = 0
+        while position < len(value):
+            character = value[position]
+            if (quote != "'" and character == "%" and position + 1 < len(value)
+                    and value[position + 1] in escapes):
+                result.append(escapes[value[position + 1]])
+                position += 2
+                continue
+            result.append(character)
+            if character == quote:
+                if position + 1 < len(value) and value[position + 1] == quote:
+                    result.append(value[position + 1])
+                    position += 2
+                    continue
+                quote = None
+            elif quote is None and character in ("'", '"'):
+                quote = character
+            position += 1
+        return "".join(result)
+
+    @classmethod
+    def _emit_macro_source(cls, source: str) -> str:
+        """Unmask generated code while retaining the marked quotes' token roles.
+
+        Within a string a marked quote is content, not its closing delimiter.
+        Render it as a doubled SAS quote so the ordinary parser preserves
+        that distinction. %PUT and %UNQUOTE instead recover the literal text.
+        """
+        marks = {cls._QUOTED_SINGLE_QUOTE: "'", cls._QUOTED_DOUBLE_QUOTE: '"'}
+        result = []
+        quote = None
+        position = 0
+        while position < len(source):
+            character = source[position]
+            if character in marks:
+                literal = marks[character]
+                result.append(literal * 2 if literal == quote else literal)
+            else:
+                result.append(character)
+                if character == quote:
+                    if position + 1 < len(source) and source[position + 1] == quote:
+                        result.append(source[position + 1])
+                        position += 2
+                        continue
+                    quote = None
+                elif quote is None and character in ("'", '"'):
+                    quote = character
+            position += 1
+        return cls._unquote_macro_value("".join(result))
+
+    @classmethod
     def _quote_macro_value(cls, value: str) -> str:
         return str(value).replace("&", cls._QUOTED_AMPERSAND).replace(
             "%",
@@ -1814,6 +1995,10 @@ class MacroExpander:
             .replace(cls._QUOTED_PERCENT, "%")
             .replace(cls._QUOTED_COMMA, ",")
             .replace(cls._QUOTED_SEMICOLON, ";")
+            .replace(cls._QUOTED_SINGLE_QUOTE, "'")
+            .replace(cls._QUOTED_DOUBLE_QUOTE, '"')
+            .replace(cls._QUOTED_LEFT_PAREN, "(")
+            .replace(cls._QUOTED_RIGHT_PAREN, ")")
         )
 
     _sysfunc_registry = None
@@ -1898,6 +2083,13 @@ class MacroExpander:
         if isinstance(result, float) and result.is_integer():
             return str(int(result))
         return str(result)
+
+    # ── Session functions ─────────────────────────────
+
+    def _sysfunc_getoption(self, option_name: Any, *modifiers: Any) -> str:
+        if self._session is None:
+            return ""
+        return self._session.option_text(option_name, *modifiers)
 
     # ── Dataset metadata functions ────────────────────
 

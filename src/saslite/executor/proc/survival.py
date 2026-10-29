@@ -102,6 +102,7 @@ def _km_group(
     frame: pd.DataFrame,
     duration_column: str,
     event_column: str,
+    alpha: float = 0.05,
 ) -> tuple[pd.DataFrame, list[dict[str, float]]]:
     working = frame[[duration_column, event_column]].copy()
     working[duration_column] = pd.to_numeric(
@@ -124,7 +125,7 @@ def _km_group(
     ]
     survival = 1.0
     greenwood = 0.0
-    z_value = float(norm.ppf(0.975))
+    z_value = float(norm.ppf(1.0 - alpha / 2.0))
 
     for time in sorted(working[duration_column].unique()):
         at_risk = int((working[duration_column] >= time).sum())
@@ -309,8 +310,18 @@ def handle_proc_lifetest(
         )
     actual_strata = [column for column in strata_columns if column is not None]
 
-    if actual_strata:
-        group_key: Any = actual_strata[0] if len(actual_strata) == 1 else actual_strata
+    by_names = [str(name).upper() for name in proc.options.get("BY", [])]
+    by_columns = [_column(frame, name) for name in by_names]
+    if any(column is None for column in by_columns):
+        missing = by_names[by_columns.index(None)]
+        return StepResult(success=False, error=f"Variable {missing} not found in dataset")
+    actual_by = [column for column in by_columns if column is not None]
+    group_columns = list(dict.fromkeys([*actual_by, *actual_strata]))
+    alpha = float(proc.options.get("ALPHA", 0.05))
+    if not 0 < alpha < 1:
+        return StepResult(success=False, error="PROC LIFETEST ALPHA must be between 0 and 1")
+    if group_columns:
+        group_key: Any = group_columns[0] if len(group_columns) == 1 else group_columns
         groups = list(frame.groupby(group_key, dropna=False, sort=True))
     else:
         groups = [((), frame)]
@@ -321,12 +332,17 @@ def handle_proc_lifetest(
     if not atrisk_times:
         atrisk_times = [float(value) for value in proc.options.get("TIMELIST", [])]
 
-    for stratum_number, (group_value, group_frame) in enumerate(groups, start=1):
+    stratum_counts: dict[tuple[str, ...], int] = {}
+    for group_value, group_frame in groups:
         values = group_value if isinstance(group_value, tuple) else (group_value,)
-        curve, quartiles = _km_group(group_frame, duration_column, event_column)
-        labels = dict(zip(actual_strata, values))
+        labels = dict(zip(group_columns, values))
+        by_key = tuple(_sas_value_key(labels[column]) for column in actual_by)
+        stratum_number = stratum_counts.get(by_key, 0) + 1
+        stratum_counts[by_key] = stratum_number
+        stratum_label = " ".join(str(labels[column]) for column in actual_strata) or "1"
+        curve, quartiles = _km_group(group_frame, duration_column, event_column, alpha)
         curve["STRATUMNUM"] = stratum_number
-        curve["STRATUM"] = " ".join(str(value) for value in values) if values else "1"
+        curve["STRATUM"] = stratum_label
         for column, value in labels.items():
             curve[column] = value
 
@@ -346,7 +362,7 @@ def handle_proc_lifetest(
                 "CENSORED": float("nan"),
                 "TATRISK": float(at_time),
                 "STRATUMNUM": stratum_number,
-                "STRATUM": " ".join(str(value) for value in values) if values else "1",
+                "STRATUM": stratum_label,
                 **labels,
             }
             curve = pd.concat([curve, pd.DataFrame([risk_row])], ignore_index=True)
@@ -355,8 +371,20 @@ def handle_proc_lifetest(
         for quartile in quartiles:
             quartile_rows.append({**labels, **quartile})
 
-    survival_frame = pd.concat(curve_frames, ignore_index=True) if curve_frames else pd.DataFrame()
-    quartiles_frame = pd.DataFrame(quartile_rows)
+    survival_frame = pd.concat(curve_frames, ignore_index=True) if curve_frames else pd.DataFrame({
+        **{column: frame[column].iloc[:0] for column in group_columns},
+        **{column: pd.Series(dtype=float) for column in (
+            "TIME", "SURVIVAL", "SDF_LCL", "SDF_UCL", "ATRISK", "EVENT",
+            "CENSORED", "TATRISK", "STRATUMNUM",
+        )},
+        "STRATUM": pd.Series(dtype=object),
+    })
+    quartiles_frame = pd.DataFrame(quartile_rows) if quartile_rows else pd.DataFrame({
+        **{column: frame[column].iloc[:0] for column in group_columns},
+        **{column: pd.Series(dtype=float) for column in (
+            "PERCENT", "ESTIMATE", "LOWERLIMIT", "UPPERLIMIT",
+        )},
+    })
     ods_targets = getattr(session, "_ods_output_targets", {})
     if isinstance(ods_targets.get("QUARTILES"), DatasetRefNode):
         _write_dataset(session, ods_targets["QUARTILES"], quartiles_frame)
@@ -386,13 +414,25 @@ def handle_proc_lifetest(
         group_columns = [_column(frame, name) for name in group_names]
         adjustment_columns = [_column(frame, name) for name in adjustment_names]
         if all(column is not None for column in [*group_columns, *adjustment_columns]):
-            homtests = _logrank_test(
-                frame,
-                duration_column,
-                event_column,
-                [column for column in group_columns if column is not None],
-                [column for column in adjustment_columns if column is not None],
-            )
+            if actual_by:
+                by_key = actual_by[0] if len(actual_by) == 1 else actual_by
+                test_blocks = list(frame.groupby(by_key, dropna=False, sort=True))
+            else:
+                test_blocks = [((), frame)]
+            test_frames = []
+            for by_value, block in test_blocks:
+                block_test = _logrank_test(
+                    block,
+                    duration_column,
+                    event_column,
+                    [column for column in group_columns if column is not None],
+                    [column for column in adjustment_columns if column is not None],
+                )
+                by_values = by_value if isinstance(by_value, tuple) else (by_value,)
+                for column, value in zip(actual_by, by_values):
+                    block_test[column] = value
+                test_frames.append(block_test)
+            homtests = _concat_frames(test_frames)
         else:
             homtests = pd.DataFrame(
                 [{"TEST": "Log-Rank", "CHISQ": float("nan"), "DF": 0, "PROBCHISQ": float("nan")}]

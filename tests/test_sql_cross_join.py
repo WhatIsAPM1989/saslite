@@ -112,6 +112,31 @@ class SqlCrossJoinTests(unittest.TestCase):
                     self.assertEqual(output.shape, (0, 2))
                     self.assertEqual(output.columns.tolist(), ["visit", "arm"])
 
+    def test_unqualified_star_join_output_has_flat_column_names(self) -> None:
+        for syntax in ("cross join", ","):
+            for left_size, right_size in ((2, 2), (0, 2), (2, 0), (0, 0)):
+                with self.subTest(syntax=syntax, sizes=(left_size, right_size)):
+                    sas = self.interpreter(
+                        treatments=pd.DataFrame({"arm": pd.Series(range(left_size), dtype="int64")}),
+                        rows=pd.DataFrame({"row": pd.Series(range(right_size), dtype="int64")}),
+                    )
+                    result = sas.execute(f"""
+                        proc sql;
+                          create table grid as select *
+                          from treatments as t {syntax} rows as r;
+                        quit;
+                        data selected;
+                          set grid(where=(row=1));
+                        run;
+                    """)
+                    self.assertTrue(result.success, result.error)
+                    self.assertFalse([warning for step in result.steps for warning in step.warnings])
+                    grid = sas.get_dataset("WORK", "GRID")
+                    self.assertEqual(grid.columns.tolist(), ["arm", "row"])
+                    self.assertEqual(grid.shape, (left_size * right_size, 2))
+                    expected = [{"arm": arm, "row": 1} for arm in range(left_size)] if right_size > 1 else []
+                    self.assertEqual(sas.get_dataset("WORK", "SELECTED").to_dict("records"), expected)
+
     def test_chained_cross_joins_make_three_table_product(self) -> None:
         sas = self.interpreter(
             visits=pd.DataFrame({"visit": [1, 2]}),

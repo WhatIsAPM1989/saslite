@@ -97,6 +97,12 @@ class StopNode(Node):
 
 
 @dataclass
+class AbortCancelNode(Node):
+    """ABORT CANCEL statement: terminate the submitted program."""
+    pass
+
+
+@dataclass
 class RetainNode(Node):
     """RETAIN statement."""
     items: list[tuple[str, Any | None]] = field(default_factory=list)

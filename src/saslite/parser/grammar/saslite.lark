@@ -104,6 +104,7 @@ data_stmt: set_stmt ";"
          | output_stmt ";"
          | delete_stmt ";"
          | stop_stmt ";"
+         | abort_cancel_stmt ";"
          | retain_stmt ";"
          | where_stmt ";"
          | keep_stmt ";"
@@ -122,11 +123,12 @@ data_stmt: set_stmt ";"
 output_stmt: "OUTPUT"i (qualified_name)?
 delete_stmt: "DELETE"i
 stop_stmt: "STOP"i
+abort_cancel_stmt: "ABORT"i "CANCEL"i
 
 set_stmt: "SET"i (dataset_ref)+ ("END"i "=" NAME)?
 merge_stmt: "MERGE"i (dataset_ref)+
 by_stmt: "BY"i ("DESCENDING"i)? NAME (("DESCENDING"i)? NAME)*
-array_stmt: "ARRAY"i NAME ("[" (NUMBER | "*") "]" | "{" (NUMBER | "*") "}" | "(" (NUMBER | "*") ")") ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
+array_stmt: "ARRAY"i NAME ("[" (NUMBER | "*") "]" | "{" (NUMBER | "*") "}" | "(" (NUMBER | "*") ")")? ("$")? (NUMBER)? (name_list)? ("(" expr_list ")")?
 infile_stmt: "INFILE"i (NAME | STRING) (infile_option)*
 infile_option: NAME ("=" (STRING | NAME | NUMBER))?
 input_stmt: "INPUT"i (input_var)* ("$")?
@@ -154,6 +156,7 @@ if_stmt: IF_KW expr THEN_KW data_stmt (ELSE_KW data_stmt)?
        | IF_KW expr ";" -> if_subsetting
 
 do_block: "DO"i ";" (data_stmt)* "END"i ";"
+        | "DO"i "OVER"i NAME ";" (data_stmt)* "END"i ";" -> do_over_block
         | "DO"i NAME "=" expr "TO"i expr ("BY"i expr)? ";" (data_stmt)* "END"i ";"
         | "DO"i NAME "=" expr ("," expr)+ ";" (data_stmt)* "END"i ";" -> do_value_list
         | "DO"i "WHILE"i "(" expr ")" ";" (data_stmt)* "END"i ";"
@@ -453,6 +456,7 @@ lifetest_opt: "DATA"i "=" dataset_ref -> lifetest_data_opt
             | "METHOD"i "=" NAME -> lifetest_named_opt
             | "CONFTYPE"i "=" NAME -> lifetest_named_opt
             | "PLOTS"i "=" lifetest_plot_opt -> lifetest_plots_opt
+            | "ALPHA"i "=" NUMBER -> lifetest_alpha_opt
             | "TIMELIST"i "=" NUMBER+ -> lifetest_timelist_opt
             | NAME -> lifetest_flag_opt
 
@@ -463,6 +467,7 @@ lifetest_stmt: "TIME"i NAME "*" NAME "(" in_expr_list? ")" ";" -> lifetest_time_
              | "STRATA"i name_list ("/" lifetest_strata_opt*)? ";" -> lifetest_strata_stmt
              | "WHERE"i expr ";" -> lifetest_where_stmt
              | "TEST"i name_list ";" -> lifetest_test_stmt
+             | "BY"i name_list ";" -> lifetest_by_stmt
 
 lifetest_strata_opt: NAME ("=" (NAME | "(" name_list ")"))?
 
@@ -596,6 +601,7 @@ import_stmt: "DATAFILE"i "=" STRING ";"
            | "GETNAMES"i "=" ("YES"i | "NO"i) ";"
            | "DELIMITER"i "=" STRING ";"
            | "GUESSINGROWS"i "=" (NAME | NUMBER) ";"
+           | "DATAROW"i "=" NUMBER ";"
            | "REPLACE"i ";" -> import_replace
 
 // ─── PROC EXPORT ──────────────────────────────────
@@ -717,6 +723,7 @@ report_stmt: "COLUMN"i report_column_list ";" -> report_column
            | "COLUMNS"i report_column_list ";" -> report_column
            | "DEFINE"i NAME "/" (report_def_attr)* ";" -> report_define
            | "COMPUTE"i ("AFTER"i | "BEFORE"i) NAME? ("/" REPORT_COMPUTE_STYLE)? ";" ("LINE"i STRING ";")* "ENDCOMP"i ";" -> report_compute
+           | "COMPUTE"i NAME ("/" report_computed_attr*)? ";" (assign_stmt ";")* "ENDCOMP"i ";" -> report_computed
            | "BY"i name_list ";" -> report_by
            | "BREAK"i ("AFTER"i | "BEFORE"i) NAME "/" report_break_opt* ";" -> report_break
            | "RBREAK"i ("AFTER"i | "BEFORE"i)? "/" report_break_opt* ";" -> report_rbreak
@@ -726,7 +733,8 @@ report_column_list: report_column_item+
                    | NAME "=" NAME -> report_column_alias
                    | "(" STRING report_column_list ")" -> report_column_group
 
-report_def_attr: "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "ACROSS"i | "NOPRINT"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | "STD"i | "MEDIAN"i | STRING | "FORMAT"i "=" format_spec | "WIDTH"i "=" NUMBER | REPORT_STYLE_OPTION
+report_computed_attr: "CHARACTER"i | "CHAR"i | "LENGTH"i "=" NUMBER
+report_def_attr: "COMPUTED"i | "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "ACROSS"i | "NOPRINT"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | "STD"i | "MEDIAN"i | STRING | "FORMAT"i "=" format_spec | "WIDTH"i "=" NUMBER | REPORT_STYLE_OPTION
 report_break_opt: "SUMMARIZE"i | "SUPPRESS"i | "SKIP"i | "DOL"i | "DUL"i | "OL"i | "UL"i | "PAGE"i
 
 // ─── PROC REG ─────────────────────────────────────
@@ -921,7 +929,7 @@ NUMBER: /[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?|\.[0-9]+([eE][+-]?[0-9]+)?/
 MISSING_NUMERIC: "."
 DATE_LITERAL.2: /("[^"]*"|'[^']*')(dt|d|t)\b/i
 HEX_LITERAL.2: /("[0-9A-Fa-f]*"|'[0-9A-Fa-f]*')x\b/i
-STRING: /"[^"]*"|'[^']*'/
+STRING: /"(?:[^"]|"")*"|'(?:[^']|'')*'/
 REPORT_STYLE_OPTION.2: /STYLE\s*\(\s*(REPORT|HEADER|COLUMN)\s*\)\s*=\s*(\{[^}]*\}|\[[^\]]*\])/i
 
 // ─── Comments ─────────────────────────────────────

@@ -131,4 +131,10 @@ def _infer_sas_dtype(series: pd.Series) -> str:
         return "numeric"
     if pd.api.types.is_datetime64_any_dtype(series):
         return "datetime"
+    # SET/SQL operations can retain numeric values in pandas object storage.
+    # Numeric-looking strings must still remain SAS character variables.
+    if pd.api.types.infer_dtype(series, skipna=True) in {
+        "integer", "floating", "mixed-integer-float", "decimal", "boolean",
+    }:
+        return "numeric"
     return "character"

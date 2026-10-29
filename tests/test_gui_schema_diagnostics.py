@@ -38,7 +38,7 @@ class GuiSchemaDiagnosticsTests(unittest.TestCase):
         app.config.update(self.saved)
         self.tmp.cleanup()
 
-    def execute(self, *, physical=False, strict=False):
+    def execute(self, *, physical=False, strict=False, schema_policy=None):
         if strict:
             metadata = self.root / 'metadata'
             (metadata / 'raw.csv').write_text(
@@ -51,6 +51,8 @@ class GuiSchemaDiagnosticsTests(unittest.TestCase):
         }, headers=self.headers)
         self.assertEqual(response.status_code, 200, response.get_json())
         sas = app.config['SAS_SESSION']
+        if schema_policy is not None:
+            sas.session.schema_policy = schema_policy
         sas.session.storage.register('RAW', MemoryBackend())
         if physical:
             sas.create_dataset('FR', pd.DataFrame({'FREN': [1]}), libref='RAW')
@@ -59,12 +61,24 @@ class GuiSchemaDiagnosticsTests(unittest.TestCase):
             'data temp2; set temp1; gren=qusen; run;'
         )}, headers=self.headers).get_json()
 
-    def test_missing_weak_dataset_is_a_step_error(self):
+    def test_missing_weak_dataset_reports_assumptions(self):
         result = self.execute()
         libraries = self.client.get('/api/libraries').get_json()['libraries']
         policies = {lib['libref']: lib['schema_policy'] for lib in libraries}
         self.assertEqual(policies['WORK'], 'strict')
         self.assertEqual(policies['RAW'], 'weak')
+        self.assertTrue(result['success'], result)
+        self.assertIsNone(result['error'])
+        self.assertTrue(all(not step['error'] for step in result['steps']))
+        self.assertIn('Expected source datasets (weak schema):', result['output'])
+        self.assertIn('RAW.FR', result['output'])
+        self.assertIn('RAW.FR.QUSEN', result['output'])
+        sas = app.config['SAS_SESSION']
+        self.assertEqual(sas.session.list_datasets('RAW'), [])
+        self.assertTrue(sas.get_dataset('WORK', 'TEMP2').empty)
+
+    def test_missing_strict_dataset_is_a_step_error(self):
+        result = self.execute(schema_policy='strict')
         self.assertFalse(result['success'])
         self.assertIsNone(result['error'])
         self.assertEqual(result['steps'][0]['error'], 'Dataset RAW.FR does not exist')
@@ -84,7 +98,7 @@ class GuiSchemaDiagnosticsTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which('node'), 'Node.js needed to exercise GUI renderer')
     def test_render_errors_once_and_preserve_fallbacks(self):
-        result = self.execute()
+        result = self.execute(schema_policy='strict')
         html = (Path(__file__).resolve().parents[1] /
                 'src/saslite/gui/static/index.html').read_text()
         renderer = html.split('function renderOutput(result, runContext = null) {', 1)[1].split(

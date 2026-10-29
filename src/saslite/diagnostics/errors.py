@@ -48,3 +48,7 @@ class SqlError(ExecutionError):
 
 class ProcError(ExecutionError):
     """PROC specific error."""
+
+
+class ProgramCancelled(ExecutionError):
+    """Explicit cancellation that must stop the whole submitted program."""
