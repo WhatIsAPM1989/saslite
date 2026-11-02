@@ -179,6 +179,14 @@ def lengthc(s: Any) -> int:
     return len(_to_str(s))
 
 
+def lengthn(s: Any) -> int:
+    """LENGTHN(string) — position of the last nonblank character, or zero."""
+    from saslite.runtime.types import is_missing
+    if is_missing(s):
+        return 0
+    return len(str(s).rstrip(" "))
+
+
 def missing(s: Any) -> int:
     """MISSING(var) — test for missing (1=missing, 0=not)."""
     if s is None:

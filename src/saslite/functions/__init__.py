@@ -31,6 +31,7 @@ def build_default_registry() -> FunctionRegistry:
     reg.register("REVERSE", char_funcs.reverse)
     reg.register("LENGTH", char_funcs.length)
     reg.register("LENGTHC", char_funcs.lengthc)
+    reg.register("LENGTHN", char_funcs.lengthn)
     reg.register("MISSING", char_funcs.missing)
     reg.register("COALESCEC", char_funcs.coalescec)
     reg.register("PRXMATCH", char_funcs.prxmatch)
