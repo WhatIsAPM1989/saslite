@@ -1247,13 +1247,69 @@ class SqlExecutor:
 
         grouped = df.groupby(group_cols)
 
+        # A scalar expression around one summary must be evaluated after
+        # that summary, not mistaken for a detail column or an implicit N.
+        # Keep the existing detail-remerge path outside this narrow case.
+        from dataclasses import replace
+
+        wrapped_aggregates = {}
+
+        def is_summary(expression):
+            return (
+                isinstance(expression, FunctionCallNode)
+                and self._sas_agg_to_pandas(expression.name.upper()) is not None
+                and len(expression.args) == 1
+            )
+
+        for column_index, column in enumerate(sel.columns):
+            if not isinstance(column, SelectColumnNode) or is_summary(column.expr):
+                continue
+            alias = column.alias or f"_COL{column_index + 1}"
+            summaries = []
+
+            def replace_summary(expression):
+                if is_summary(expression):
+                    summaries.append(expression)
+                    return VariableNode(name=alias)
+                if isinstance(expression, BinaryOpNode):
+                    return replace(expression, left=replace_summary(expression.left),
+                                   right=replace_summary(expression.right))
+                if isinstance(expression, UnaryOpNode):
+                    return replace(expression, operand=replace_summary(expression.operand))
+                if isinstance(expression, FunctionCallNode):
+                    return replace(expression, args=[replace_summary(arg) for arg in expression.args])
+                return expression
+
+            rewritten = replace_summary(column.expr)
+            if len(summaries) == 1:
+                wrapped_aggregates[id(column)] = (summaries[0], rewritten, alias)
+
+        group_expressions = {self._expr_repr(expr) for expr in sel.group_by}
+        has_detail = any(
+            isinstance(column, SelectColumnNode)
+            and not isinstance(column.expr, LiteralNode)
+            and self._expr_repr(column.expr) not in group_expressions
+            and not is_summary(column.expr)
+            and id(column) not in wrapped_aggregates
+            for column in sel.columns
+        )
+        if has_detail:
+            wrapped_aggregates = {}
+
+        remerge_select = replace(sel, columns=[
+            replace(column, expr=wrapped_aggregates[id(column)][0],
+                    alias=wrapped_aggregates[id(column)][2])
+            if id(column) in wrapped_aggregates else column
+            for column in sel.columns
+        ]) if wrapped_aggregates else sel
+
         # SAS PROC SQL permits detail columns alongside summary functions and
         # GROUP BY. With SELECT * it "remerges" each group summary back onto
         # every contributing detail row instead of collapsing to one row per
         # group. Reporting code uses this to retain COUNT while adding a
         # group-level total such as SUM(COUNT).
         remerged = self._execute_select_grouped_remerge(
-            sel,
+            remerge_select,
             df,
             group_cols,
             source_columns,
@@ -1272,10 +1328,13 @@ class SqlExecutor:
         for col_node in sel.columns:
             if isinstance(col_node, SelectColumnNode):
                 alias = col_node.alias or self._expr_to_column_name(col_node.expr) or ""
+                wrapped = wrapped_aggregates.get(id(col_node))
+                if wrapped:
+                    alias = wrapped[2]
                 # Strip table alias prefix from output column name
                 if "." in alias:
                     alias = alias.split(".", 1)[-1]
-                aggregate_expr = col_node.expr
+                aggregate_expr = wrapped[0] if wrapped else col_node.expr
                 fallback = None
                 has_fallback = False
                 if (
@@ -1323,7 +1382,7 @@ class SqlExecutor:
                                         series.drop_duplicates(), fn
                                     )()
                                 agg_funcs[alias or actual_col] = (actual_col, agg_func)
-                    elif col_node.expr.args:
+                    elif aggregate_expr.args:
                         # Complex case: min(strip(col)), max(datepart(dt)), etc.
                         # Need to evaluate the inner expression for each row, then aggregate
                         pandas_agg = self._sas_agg_to_pandas(fn_name)
@@ -1352,7 +1411,7 @@ class SqlExecutor:
         for col_node in sel.columns:
             if not isinstance(col_node, SelectColumnNode):
                 continue
-            if isinstance(col_node.expr, FunctionCallNode):
+            if isinstance(col_node.expr, FunctionCallNode) or id(col_node) in wrapped_aggregates:
                 continue  # Skip aggregate columns
             alias = col_node.alias or self._expr_to_column_name(col_node.expr) or ""
             if "." in alias:
@@ -1441,6 +1500,11 @@ class SqlExecutor:
             if actual:
                 result_df[actual] = result_df[actual].fillna(fallback)
 
+        for _, expression, alias in wrapped_aggregates.values():
+            result_df[alias] = self._eval_per_row(
+                expression, result_df, self._build_col_map(result_df, False)
+            )
+
         # Handle non-aggregate columns (literals, pass-through)
         for col_node in sel.columns:
             if not isinstance(col_node, SelectColumnNode):
@@ -1463,6 +1527,8 @@ class SqlExecutor:
             if not isinstance(col_node, SelectColumnNode):
                 continue
             name = col_node.alias or self._expr_to_column_name(col_node.expr) or ""
+            if id(col_node) in wrapped_aggregates:
+                name = wrapped_aggregates[id(col_node)][2]
             # An unaliased grouped aggregate is materialized under its input
             # column name above (for example MAX(MONTH) becomes MONTH).  The
             # function expression itself has no direct column name, so recover
