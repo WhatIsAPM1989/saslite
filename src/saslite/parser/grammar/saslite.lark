@@ -871,7 +871,7 @@ ttest_stmt: "VAR"i name_list ";" -> ttest_var
         | "NULL"i -> null_val
         | "CALCULATED"i NAME -> calculated_ref
         | window_func
-        | NAME "(" func_args? ")" -> func_call
+        | FUNCTION_NAME "(" func_args? ")" -> func_call
         | case_expr
         | arr_ref
         | "(" select_stmt ")" -> scalar_subquery
@@ -917,6 +917,8 @@ name_list: name_list_item+
 // ─── Terminals ───────────────────────────────────
 
 NAME: /[A-Za-z_][A-Za-z0-9_]*/
+// NOT followed by parentheses is logical negation, never a function call.
+FUNCTION_NAME: /(?!(?:NOT)(?![A-Za-z0-9_]))[A-Za-z_][A-Za-z0-9_]*/i
 IF_KW.3: /IF(?![A-Za-z0-9_])/i
 THEN_KW.3: /THEN(?![A-Za-z0-9_])/i
 ELSE_KW.3: /ELSE(?![A-Za-z0-9_])/i
