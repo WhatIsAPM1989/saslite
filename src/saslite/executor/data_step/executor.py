@@ -1274,6 +1274,8 @@ class DataStepExecutor:
     def _execute_statements(self, statements: list[Any], ctx: DataStepContext) -> None:
         """Execute all statements in the DATA step body."""
         for stmt in statements:
+            if ctx.pdv.delete_flag:
+                break  # DELETE ends the current observation, including nested blocks.
             if isinstance(stmt, SetNode):
                 continue  # Already handled
 
