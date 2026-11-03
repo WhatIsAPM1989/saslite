@@ -1414,12 +1414,13 @@ class DataStepExecutor:
         elif stmt.while_cond:
             while sas_bool(ctx.evaluator.evaluate(stmt.while_cond)):
                 self._execute_statements(stmt.body, ctx)
-                if ctx.pdv.stop_flag:
+                if ctx.pdv.stop_flag or ctx.pdv.delete_flag:
                     break
         elif stmt.until_cond:
             while True:
                 self._execute_statements(stmt.body, ctx)
-                if ctx.pdv.stop_flag or sas_bool(ctx.evaluator.evaluate(stmt.until_cond)):
+                if (ctx.pdv.stop_flag or ctx.pdv.delete_flag
+                        or sas_bool(ctx.evaluator.evaluate(stmt.until_cond))):
                     break
         else:
             # Simple DO block
