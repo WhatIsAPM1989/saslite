@@ -1492,7 +1492,9 @@ def handle_proc_import(proc: ProcNode, session: Session, reporter: Reporter) -> 
             sep = delimiter if dbms != "tab" else "\t"
             df = pd.read_csv(filepath, sep=sep, header=header, skiprows=skiprows)
         elif dbms == "xlsx" or dbms == "excel":
-            df = pd.read_excel(filepath, header=header, skiprows=skiprows)
+            sheet_name = proc.options.get("SHEET", 0)
+            df = pd.read_excel(filepath, sheet_name=sheet_name,
+                               header=header, skiprows=skiprows)
         else:
             return StepResult(success=False, error=f"Unsupported DBMS type: {dbms}")
 

@@ -598,6 +598,7 @@ import_opt: "DATAFILE"i "=" STRING
 import_stmt: "DATAFILE"i "=" STRING ";"
            | "OUT"i "=" qualified_name ";"
            | "DBMS"i "=" NAME ";"
+           | "SHEET"i "=" STRING ";"
            | "GETNAMES"i "=" ("YES"i | "NO"i) ";"
            | "DELIMITER"i "=" STRING ";"
            | "GUESSINGROWS"i "=" (NAME | NUMBER) ";"
