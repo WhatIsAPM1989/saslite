@@ -1034,7 +1034,8 @@ class SqlExecutor:
 
         For each equality condition, compute keys on both tables using
         expression evaluation, then merge on those computed keys.
-        Non-equality conditions are applied as post-merge filters.
+        Residual ON conditions filter candidate matches before unmatched
+        rows from the preserved side(s) are restored.
         """
         if non_eq_conditions is None:
             non_eq_conditions = []
@@ -1115,6 +1116,22 @@ class SqlExecutor:
             merge_right_on.append(r_name)
 
 
+        # Row identity must survive duplicate keys and duplicate source rows.
+        # An equijoin match rejected by another ON conjunct is still unmatched
+        # for outer-join purposes, rather than a row to remove as with WHERE.
+        outer_filters = bool(filter_exprs) and how in ("left", "right", "outer")
+        row_ids = []
+        if outer_filters:
+            occupied = set(left_merge.columns) | set(right_merge.columns)
+            for frame, stem in ((left_merge, "__join_left_row__"),
+                                (right_merge, "__join_right_row__")):
+                name = stem
+                while name in occupied:
+                    name += "_"
+                occupied.add(name)
+                frame[name] = range(len(frame))
+                row_ids.append(name)
+
         merged = left_merge.merge(
             right_merge,
             left_on=merge_left_on,
@@ -1122,16 +1139,7 @@ class SqlExecutor:
             how=how,
             suffixes=("", "_r"),
         )
-        if len(merged) > 0:
-            k = merge_left_on[0]
 
-        # Drop temp key columns
-        temp_keys = [n for n, _ in left_key_cols] + [n for n, _ in right_key_cols]
-        cols_to_drop = [c for c in temp_keys if c in merged.columns]
-        if cols_to_drop:
-            merged = merged.drop(columns=cols_to_drop)
-
-        # Apply filter conditions (non-equality from ON clause)
         if filter_exprs:
             from saslite.ast.expressions import BinaryOpNode as BON
             combined = filter_exprs[0]
@@ -1140,12 +1148,36 @@ class SqlExecutor:
 
             merged_cm = self._build_col_map(merged, True)
             mask = self._eval_where(combined, merged, col_map=merged_cm)
-            # For LEFT JOIN, also keep rows where right side is all-NULL
-            if how == "left":
-                right_cols = [c for c in merged.columns if c.startswith(f"{right_alias}.")]
-                right_null = merged[right_cols].isna().all(axis=1)
-                mask = mask | right_null
-            merged = merged[mask].reset_index(drop=True)
+            if outer_filters:
+                left_id, right_id = row_ids
+                mask = mask & merged[left_id].notna() & merged[right_id].notna()
+            merged = merged[mask].copy()
+
+            if outer_filters:
+                left_id, right_id = row_ids
+                parts = [merged]
+                if how in ("left", "outer"):
+                    unmatched = left_merge[
+                        ~left_merge[left_id].isin(merged[left_id])]
+                    parts.append(unmatched.reindex(columns=merged.columns))
+                if how in ("right", "outer"):
+                    unmatched = right_merge[
+                        ~right_merge[right_id].isin(merged[right_id])]
+                    # Match pandas' suffix mapping for any overlapping names.
+                    unmatched = unmatched.rename(columns={
+                        c: f"{c}_r" for c in right_merge.columns
+                        if c in left_merge.columns
+                    })
+                    parts.append(unmatched.reindex(columns=merged.columns))
+                merged = pd.concat(parts, ignore_index=True)
+                order = [right_id, left_id] if how == "right" else row_ids
+                merged = merged.sort_values(order, kind="stable")
+            merged = merged.reset_index(drop=True)
+
+        temp_keys = [n for n, _ in left_key_cols] + [n for n, _ in right_key_cols]
+        merged = merged.drop(columns=[
+            c for c in temp_keys + row_ids if c in merged.columns
+        ])
 
         return merged
 
