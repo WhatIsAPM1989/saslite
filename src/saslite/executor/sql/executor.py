@@ -36,6 +36,20 @@ class SqlExecutor:
         self._outobs: int | None = None
         self._schema_warnings: dict[str, str] = {}
 
+    @staticmethod
+    def _sort_order_by_values(
+        frame: pd.DataFrame, columns: list[str], ascending: list[bool],
+    ) -> pd.DataFrame:
+        """Sort SAS missing values below nonmissing values for each key."""
+        # Stable least-significant-key passes permit each ORDER BY key to
+        # place missings according to its own ascending/descending direction.
+        for column, asc in reversed(list(zip(columns, ascending))):
+            frame = frame.sort_values(
+                by=column, ascending=asc, kind="mergesort",
+                na_position="first" if asc else "last",
+            )
+        return frame.reset_index(drop=True)
+
     def _compute_window_functions(self, columns: list, df: pd.DataFrame,
                                   col_map: dict[str, str]):
         """Materialize window-function SELECT columns as DataFrame columns.
@@ -711,7 +725,7 @@ class SqlExecutor:
                             sort_cols.append(actual)
                             ascending.append(item.ascending)
             if sort_cols:
-                df = df.sort_values(by=sort_cols, ascending=ascending).reset_index(drop=True)
+                df = self._sort_order_by_values(df, sort_cols, ascending)
 
         if apply_outobs:
             df = self._apply_outobs(df)
@@ -825,11 +839,9 @@ class SqlExecutor:
             sort_columns.append(temp_name)
             ascending.append(item.ascending)
         if sort_columns:
-            working = working.sort_values(
-                by=sort_columns,
-                ascending=ascending,
-                kind="mergesort",
-            ).reset_index(drop=True)
+            working = self._sort_order_by_values(
+                working, sort_columns, ascending,
+            )
         if temporary:
             working = working.drop(columns=temporary)
         return working
@@ -1609,7 +1621,7 @@ class SqlExecutor:
                         sort_cols.append(actual)
                         ascending.append(item.ascending)
             if sort_cols:
-                result_df = result_df.sort_values(by=sort_cols, ascending=ascending).reset_index(drop=True)
+                result_df = self._sort_order_by_values(result_df, sort_cols, ascending)
 
         if apply_outobs:
             result_df = self._apply_outobs(result_df)
@@ -1822,10 +1834,9 @@ class SqlExecutor:
                     sort_cols.append(actual)
                     ascending.append(item.ascending)
             if sort_cols:
-                result_df = result_df.sort_values(
-                    by=sort_cols,
-                    ascending=ascending,
-                ).reset_index(drop=True)
+                result_df = self._sort_order_by_values(
+                    result_df, sort_cols, ascending,
+                )
 
         if apply_outobs:
             result_df = self._apply_outobs(result_df)
