@@ -1666,7 +1666,8 @@ class DataStepExecutor:
                 pdv,
                 input_datasets,
                 in_flag_names,
-                step.target_options if target_index == 0 else {},
+                step.target_options if target_index == 0
+                else step.extra_target_options.get(target, {}),
             )
             self.session.put_dataset(libref, member, out_ds)
             primary_name = primary_name or full_name
@@ -1736,6 +1737,7 @@ class DataStepExecutor:
             ], errors="ignore")
 
         out_ds = Dataset.from_dataframe(df, name=member, libref=libref)
+        out_ds.metadata.label = output_options.get("LABEL")
         out_ds.weak_schema_sources = tuple(dict.fromkeys(
             source
             for input_ds in input_datasets
