@@ -298,6 +298,25 @@ run;
         self.assertEqual(frame["rendered"].iloc[0], " 33.3")
         self.assertAlmostEqual(frame["percentage"].iloc[0], 33.3)
 
+    def test_put_numeric_width_defaults_to_zero_decimal_places(self) -> None:
+        sas = SasInterpreter()
+        result = sas.execute(
+            """
+data result;
+  do value=12.0, 12.6, -12.6;
+    implicit=put(value,4.);
+    explicit=put(value,4.0);
+    output;
+  end;
+run;
+"""
+        )
+
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset("WORK", "RESULT")
+        self.assertEqual(frame["implicit"].tolist(), ["  12", "  13", " -13"])
+        self.assertEqual(frame["implicit"].tolist(), frame["explicit"].tolist())
+
 
 if __name__ == "__main__":
     unittest.main()
