@@ -735,7 +735,8 @@ report_column_list: report_column_item+
                    | "(" STRING report_column_list ")" -> report_column_group
 
 report_computed_attr: "CHARACTER"i | "CHAR"i | "LENGTH"i "=" NUMBER
-report_def_attr: "COMPUTED"i | "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "ACROSS"i | "NOPRINT"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | "STD"i | "MEDIAN"i | STRING | "FORMAT"i "=" format_spec | "WIDTH"i "=" NUMBER | REPORT_STYLE_OPTION
+report_def_attr: "COMPUTED"i | "GROUP"i | "ANALYSIS"i | "DISPLAY"i | "ORDER"i | "ACROSS"i | "NOPRINT"i | "SUM"i | "MEAN"i | "MIN"i | "MAX"i | "N"i | "STD"i | "MEDIAN"i | STRING | "WIDTH"i "=" NUMBER | REPORT_STYLE_OPTION
+               | "FORMAT"i "=" format_spec -> report_format
                | "ORDER"i "=" "INTERNAL"i -> report_order_internal
 report_break_opt: "SUMMARIZE"i | "SUPPRESS"i | "SKIP"i | "DOL"i | "DUL"i | "OL"i | "UL"i | "PAGE"i
 
