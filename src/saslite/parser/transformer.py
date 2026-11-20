@@ -4241,6 +4241,9 @@ class SasTransformer(Transformer):
         parts = [str(t) for t in items if isinstance(t, Token) and str(t) not in ("=",)]
         return " ".join(parts)
 
+    def report_order_internal(self, _items: list[Any]) -> str:
+        return "ORDER=INTERNAL"
+
     def report_by(self, items: list[Any]) -> ByNode:
         return ByNode(variables=self._stmt_names(items))
 

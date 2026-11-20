@@ -7,6 +7,25 @@ from saslite.runtime.dataset import Dataset
 
 
 class ProcReportTransposeCompatibilityTests(unittest.TestCase):
+    def test_report_internal_order_sorts_numeric_values_within_each_group(self):
+        sas = SasInterpreter()
+        sas.create_dataset('source', pd.DataFrame({
+            'PARENT': ['B', 'A', 'B', 'B', 'A'],
+            'VALUE': [10, 10, 2, 1, 2],
+        }))
+        result = sas.execute('''
+proc report data=source out=reported nowd;
+  column parent value;
+  define parent / order;
+  define value / order order=internal;
+run;
+''')
+        self.assertTrue(result.success, result.error)
+        self.assertEqual([warning for step in result.steps for warning in step.warnings], [])
+        frame = sas.get_dataset('WORK', 'REPORTED')
+        self.assertEqual(frame['PARENT'].tolist(), ['B', 'B', 'B', 'A', 'A'])
+        self.assertEqual(frame['VALUE'].tolist(), [1, 2, 10, 2, 10])
+
     def test_transpose_prefix_with_numeric_id_keeps_character_cells(self):
         sas = SasInterpreter()
         sas.create_dataset('source', pd.DataFrame({'ARM': [1, 2], 'CELL': ['NC', '0']}))

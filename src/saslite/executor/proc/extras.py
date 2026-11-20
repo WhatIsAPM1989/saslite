@@ -964,6 +964,24 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
     else:
         report_df = df[actual_cols]
 
+    internal_order = {
+        cmap[name]
+        for name, definition in defines.items()
+        if name in cmap and "ORDER=INTERNAL" in definition.get("attrs", [])
+    }
+    if internal_order.intersection(grouping_columns):
+        # Keep first-appearance order for existing levels, but sort explicitly
+        # requested levels by their raw values within each parent.
+        sort_keys = report_df[grouping_columns].copy()
+        for level, column in enumerate(grouping_columns):
+            if column not in internal_order:
+                parent_keys = grouping_columns[:level + 1]
+                sort_keys[column] = report_df.groupby(
+                    parent_keys, sort=False, dropna=False
+                ).ngroup()
+        index = sort_keys.sort_values(grouping_columns, na_position="first").index
+        report_df = report_df.loc[index].reset_index(drop=True)
+
     rbreak = next((
         statement for statement in proc.statements
         if isinstance(statement, dict) and statement.get("action") == "rbreak"
