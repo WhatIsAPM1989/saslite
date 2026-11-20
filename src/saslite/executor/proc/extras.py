@@ -16,9 +16,10 @@ from saslite.ast.data_step import DatasetRefNode
 from saslite.executor.expression_eval import ExpressionEvaluator
 from saslite.executor.ods import write_output_tables, write_report_destinations
 from saslite.functions import build_default_registry
+from saslite.functions.convert_funcs import put_sas, putc
 from saslite.runtime.dataset import Dataset
 from saslite.runtime.execution_result import StepResult
-from saslite.runtime.types import sas_bool
+from saslite.runtime.types import is_missing, sas_bool
 from saslite.session.session import Session
 from saslite.diagnostics.reporter import Reporter
 
@@ -847,6 +848,26 @@ def handle_proc_tabulate(proc: ProcNode, session: Session, reporter: Reporter) -
 # ─── PROC REPORT ───────────────────────────────────────
 
 
+def _report_formatted_key(session: Session, value: Any, format_name: str) -> str | None:
+    if is_missing(value):
+        return None
+    if not format_name:
+        if not isinstance(value, numbers.Real):
+            return str(value)
+        format_name = "BEST12."
+    custom_label = apply_custom_format(session, format_name, value)
+    if custom_label is not None:
+        return custom_label
+    best = re.fullmatch(r"BEST(\d*)\.?", format_name, flags=re.IGNORECASE)
+    if best:
+        # Leading blanks in BEST output affect collation.
+        width = int(best[1] or 12)
+        return f"{float(value):>{width}.{width}g}"
+    if format_name.startswith("$"):
+        return putc(value, format_name)
+    return put_sas(value, format_name)
+
+
 def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> StepResult:
     """PROC REPORT — basic COLUMN/DEFINE report with GROUP + ANALYSIS support."""
     data_name = proc.options.get("DATA", "")
@@ -864,6 +885,7 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
 
     columns: list[str] = []
     defines: dict[str, dict[str, Any]] = {}
+    alias_sources: dict[str, str] = {}
     for stmt in proc.statements:
         if isinstance(stmt, dict):
             if stmt.get("action") == "column":
@@ -873,6 +895,7 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
                         return StepResult(success=False, error=f"PROC REPORT: variable {source} not found")
                     df[alias] = df[actual]
                     cmap[alias.upper()] = alias
+                    alias_sources[alias] = alias_sources.get(actual, actual)
                 columns = [c.upper() for c in stmt.get("names", [])]
             elif stmt.get("action") == "define":
                 defines[stmt["name"]] = stmt
@@ -963,6 +986,28 @@ def handle_proc_report(proc: ProcNode, session: Session, reporter: Reporter) -> 
         report_df = df[selected].drop_duplicates(subset=grouping_columns).reset_index(drop=True)
     else:
         report_df = df[actual_cols]
+
+    internal_order = {
+        cmap[name]
+        for name, definition in defines.items()
+        if name in cmap and "ORDER=INTERNAL" in definition.get("attrs", [])
+    }
+    if internal_order.intersection(group_cols):
+        sort_keys = report_df[grouping_columns].copy()
+        for level, column in enumerate(grouping_columns):
+            if column in by_columns:
+                sort_keys[column] = report_df.groupby(
+                    by_columns[:level + 1], sort=False, dropna=False
+                ).ngroup()
+            elif column not in internal_order:
+                definition = defines.get(column.upper(), {})
+                variable = ds.metadata.get_variable(alias_sources.get(column, column))
+                format_name = definition.get("format") or (variable and variable.format) or ""
+                sort_keys[column] = report_df[column].map(
+                    lambda value: _report_formatted_key(session, value, format_name)
+                )
+        index = sort_keys.sort_values(grouping_columns, na_position="first").index
+        report_df = report_df.loc[index].reset_index(drop=True)
 
     rbreak = next((
         statement for statement in proc.statements

@@ -7,6 +7,55 @@ from saslite.runtime.dataset import Dataset
 
 
 class ProcReportTransposeCompatibilityTests(unittest.TestCase):
+    def test_report_internal_order_sorts_numeric_values_within_each_group(self):
+        sas = SasInterpreter()
+        sas.create_dataset('source', pd.DataFrame({
+            'PARENT': ['B', 'A', 'B', 'B', 'A'],
+            'VALUE': [10, 10, 2, 1, 2],
+        }))
+        result = sas.execute('''
+proc report data=source out=reported nowd;
+  column parent value;
+  define parent / order;
+  define value / order order=internal;
+run;
+''')
+        self.assertTrue(result.success, result.error)
+        self.assertEqual([warning for step in result.steps for warning in step.warnings], [])
+        frame = sas.get_dataset('WORK', 'REPORTED')
+        self.assertEqual(frame['PARENT'].tolist(), ['A', 'A', 'B', 'B', 'B'])
+        self.assertEqual(frame['VALUE'].tolist(), [2, 10, 1, 2, 10])
+
+    def test_report_internal_order_uses_formatted_values_for_other_keys(self):
+        sas = SasInterpreter()
+        result = sas.execute('''
+proc format;
+  value phase 1='Later' 2='Earlier';
+run;
+data source;
+  input parent secondary detail;
+  format detail 4.1;
+  datalines;
+1 2 10
+2 1.5 2
+2 2 10
+2 1.5 1
+2 2 1
+;
+run;
+proc report data=source out=reported nowd;
+  column parent secondary detail;
+  define parent / order format=phase.;
+  define secondary / order;
+  define detail / order order=internal;
+run;
+''')
+        self.assertTrue(result.success, result.error)
+        frame = sas.get_dataset('WORK', 'REPORTED')
+        self.assertEqual(frame['PARENT'].tolist(), [2, 2, 2, 2, 1])
+        self.assertEqual(frame['SECONDARY'].tolist(), [2, 2, 1.5, 1.5, 2])
+        self.assertEqual(frame['DETAIL'].tolist(), [1, 10, 1, 2, 10])
+
     def test_transpose_prefix_with_numeric_id_keeps_character_cells(self):
         sas = SasInterpreter()
         sas.create_dataset('source', pd.DataFrame({'ARM': [1, 2], 'CELL': ['NC', '0']}))

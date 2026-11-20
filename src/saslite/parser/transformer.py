@@ -4199,6 +4199,7 @@ class SasTransformer(Transformer):
         name = ""
         attrs: list[str] = []
         label = ""
+        format_name = ""
         styles: dict[str, str] = {}
         for item in items:
             if isinstance(item, Token):
@@ -4229,17 +4230,26 @@ class SasTransformer(Transformer):
                     label = s[1:-1]
                 else:
                     attrs.append(s.upper())
+            elif isinstance(item, tuple):
+                format_name = item[1]
         return {
             "action": "define",
             "name": name,
             "attrs": attrs,
             "label": label,
+            "format": format_name,
             "styles": styles,
         }
+
+    def report_format(self, items: list[Any]) -> tuple[str, str]:
+        return ("format", next(item for item in _non_tokens(items) if isinstance(item, str)))
 
     def report_def_attr(self, items: list[Any]) -> str:
         parts = [str(t) for t in items if isinstance(t, Token) and str(t) not in ("=",)]
         return " ".join(parts)
+
+    def report_order_internal(self, _items: list[Any]) -> str:
+        return "ORDER=INTERNAL"
 
     def report_by(self, items: list[Any]) -> ByNode:
         return ByNode(variables=self._stmt_names(items))
