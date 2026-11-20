@@ -426,6 +426,8 @@ def handle_proc_contents(proc: ProcNode, session: Session, reporter: Reporter) -
     buf.write(f"  PROC CONTENTS: {ds.metadata.libref}.{ds.metadata.member_name}\n")
     buf.write(f"{'=' * 60}\n\n")
     buf.write(f"  Engine:     {ds.metadata.engine}\n")
+    if ds.metadata.label is not None:
+        buf.write(f"  Data Set Label: {ds.metadata.label}\n")
     buf.write(f"  Observations: {ds.nrow}\n")
     buf.write(f"  Variables:    {ds.ncol}\n\n")
 
@@ -1347,6 +1349,7 @@ def handle_proc_append(proc: ProcNode, session: Session, reporter: Reporter) -> 
     new_df = pd.concat([base_ds.data, data_df], ignore_index=True)
     out_ds = Dataset.from_dataframe(new_df, name=base_ds.metadata.member_name,
                                      libref=base_ds.metadata.libref)
+    out_ds.metadata.label = base_ds.metadata.label
 
     if "." in base_name:
         parts = base_name.split(".", 1)

@@ -15,6 +15,7 @@ class DataStepNode(Node):
     target_options: dict[str, Any] = field(default_factory=dict)
     statements: list[Any] = field(default_factory=list)
     extra_targets: list[str] = field(default_factory=list)  # DATA a b c;
+    extra_target_options: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass

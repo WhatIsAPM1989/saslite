@@ -34,6 +34,7 @@ class DatasetMetadata:
     row_count: int = 0
     sort_keys: list[str] = field(default_factory=list)
     variables: dict[str, VariableMetadata] = field(default_factory=dict)
+    label: str | None = None
 
     @property
     def qualified_name(self) -> str:

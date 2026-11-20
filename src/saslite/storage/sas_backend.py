@@ -34,6 +34,7 @@ _MEMBER_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,31}$")
 # Table names: up to 8 characters
 _XPT_COLUMN_NAME_MAX_LENGTH = 32
 _XPT_TABLE_NAME_MAX_LENGTH = 8
+_XPT_FILE_LABEL_MAX_BYTES = 40
 _XPT_NAME_MAP_SUFFIX = ".saslite-columns.json"
 
 
@@ -494,6 +495,7 @@ class SasBackend:
         if aliases:
             df = df.rename(columns=aliases)
         dataset = Dataset.from_dataframe(df, name=member, libref=self._libref)
+        dataset.metadata.label = getattr(metadata, "file_label", None) or None
         labels = getattr(metadata, "column_names_to_labels", {}) or {}
         formats = getattr(metadata, "original_variable_types", {}) or {}
         for column in df.columns:
@@ -545,10 +547,14 @@ class SasBackend:
                 column_labels[str(prepared)] = metadata.label
             if metadata.format:
                 variable_formats[str(prepared)] = metadata.format
+        # XPT stores a fixed 40-byte label. Keep UTF-8 characters intact.
+        label_bytes = (dataset.metadata.label or "").encode("utf-8")
+        file_label = label_bytes[:_XPT_FILE_LABEL_MAX_BYTES].decode("utf-8", errors="ignore")
         pyreadstat.write_xport(
             df,
             str(path),
             table_name=table_name,
+            file_label=file_label or None,
             column_labels=column_labels or None,
             variable_format=variable_formats or None,
         )

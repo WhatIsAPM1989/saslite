@@ -548,7 +548,7 @@ class SasTransformer(Transformer):
     def data_step(self, items: list[Any]) -> DataStepNode:
         # With keep_all_tokens, items include DATA, dataset_target+, ;, data_stmt*, RUN, ;
         targets: list[str] = []
-        target_options: dict[str, Any] = {}
+        target_options: dict[str, dict[str, Any]] = {}
         statements = []
         for item in items:
             if isinstance(item, Token):
@@ -562,9 +562,9 @@ class SasTransformer(Transformer):
                     else item.name
                 )
                 targets.append(qualified)
-                if len(targets) == 1:
-                    for option in item.options:
-                        target_options.update(option)
+                target_options[qualified] = {
+                    key: value for option in item.options for key, value in option.items()
+                }
             elif hasattr(item, '__class__') and item.__class__.__name__ == 'DataStepNode':
                 # Shouldn't happen, but handle it
                 pass
@@ -573,10 +573,15 @@ class SasTransformer(Transformer):
         target = targets[0] if targets else "_NULL_"
         return DataStepNode(
             target=target,
-            target_options=target_options,
+            target_options=target_options.pop(target, {}),
             statements=statements,
             extra_targets=targets[1:],
+            extra_target_options=target_options,
         )
+
+    def output_dataset_label(self, items: list[Any]) -> dict[str, str | None]:
+        label = self.string(items[-1:]).value.rstrip()
+        return {"LABEL": label or None}
 
     def dataset_target(self, items: list[Any]) -> Any:
         name_node = next(

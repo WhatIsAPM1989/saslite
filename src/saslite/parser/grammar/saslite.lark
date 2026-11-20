@@ -81,8 +81,9 @@ option_value: NAME | NUMBER | STRING
 // RUN is optional at the grammar boundary.
 data_step: "DATA"i dataset_target (","? dataset_target)* ";" data_stmt* ("RUN"i ";")?
 
-dataset_target: qualified_name ("(" (dataset_option)* ")")?
+dataset_target: qualified_name ("(" (dataset_option | output_dataset_label)* ")")?
               | "_NULL_"i
+output_dataset_label: "LABEL"i "=" STRING
 
 qualified_name: NAME "." NAME
               | NAME
