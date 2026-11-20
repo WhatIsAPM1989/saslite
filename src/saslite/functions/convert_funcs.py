@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 from typing import Any
 
 from saslite.runtime.types import is_missing
@@ -109,7 +110,12 @@ def put_sas(source: Any, format_spec: Any) -> str:
         decimals = int(numeric[2] or 0)
         try:
             val = float(source)
-            return f"{val:>{width}.{decimals}f}"
+            if not math.isfinite(val):
+                return f"{val:>{width}.{decimals}f}"
+            with localcontext() as context:
+                context.rounding = ROUND_HALF_UP
+                decimal_value = Decimal.from_float(val)
+                return f"{decimal_value:>{width}.{decimals}f}"
         except (ValueError, TypeError):
             return "."
 
