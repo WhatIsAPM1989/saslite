@@ -58,3 +58,31 @@ run;
     dataset = reader.session.get_dataset("SAVED", "EXAMPLE")
     assert dataset.metadata.label == stored_label
     assert dataset.data["ID"].tolist() == [1]
+
+
+@pytest.mark.parametrize("libref", ["WORK", "SAVED"])
+def test_append_preserves_the_base_dataset_label(tmp_path, libref):
+    libname = f'libname saved "{tmp_path}";'
+    sas = SasInterpreter()
+    result = sas.execute(
+        f"""
+{libname}
+data {libref}.base(label='Base label');
+  id=1;
+run;
+data additional(label='Incoming label');
+  id=2;
+run;
+proc append base={libref}.base data=additional;
+run;
+"""
+    )
+    assert result.success, result.error
+    if libref == "SAVED":
+        sas = SasInterpreter()
+        result = sas.execute(libname)
+        assert result.success, result.error
+
+    dataset = sas.session.get_dataset(libref, "BASE")
+    assert dataset.metadata.label == "Base label"
+    assert dataset.data.rename(columns=str.upper)["ID"].tolist() == [1, 2]

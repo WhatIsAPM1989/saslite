@@ -1349,6 +1349,7 @@ def handle_proc_append(proc: ProcNode, session: Session, reporter: Reporter) -> 
     new_df = pd.concat([base_ds.data, data_df], ignore_index=True)
     out_ds = Dataset.from_dataframe(new_df, name=base_ds.metadata.member_name,
                                      libref=base_ds.metadata.libref)
+    out_ds.metadata.label = base_ds.metadata.label
 
     if "." in base_name:
         parts = base_name.split(".", 1)
